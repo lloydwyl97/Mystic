@@ -564,6 +564,35 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
     return out
 
 
+UNFETCHED_RECONCILIATION = "reconciliation not yet fetched"
+_refresh_task: asyncio.Task[Any] | None = None
+
+
+def schedule_reconciliation_refresh(db_path: str) -> bool:
+    """Start one venue reconciliation if none is already running.
+
+    Status and performance stay cache-only. This fills that cache after a
+    process restart without making those requests wait on the exchange.
+    """
+    global _refresh_task
+    task = _refresh_task
+    if task is not None and not task.done():
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+
+    async def _run() -> None:
+        try:
+            await get_reconciliation(db_path)
+        except Exception:
+            logger.warning("PNL_RECONCILIATION_REFRESH_FAILED", exc_info=True)
+
+    _refresh_task = loop.create_task(_run(), name="pnl_reconciliation_refresh")
+    return True
+
+
 async def get_reconciliation(db_path: str, *, force: bool = False, cached_only: bool = False) -> dict[str, Any]:
     """Cached reconciliation. Venue calls are rate limited, so reuse results.
 
@@ -579,7 +608,7 @@ async def get_reconciliation(db_path: str, *, force: bool = False, cached_only: 
         payload["cache_age_sec"] = round(now - float(_cache["at"]), 1)
         return payload
     if cached_only:
-        payload = dict(cached) if cached else LivePnlReconciliation(error="reconciliation not yet fetched").to_dict()
+        payload = dict(cached) if cached else LivePnlReconciliation(error=UNFETCHED_RECONCILIATION).to_dict()
         payload["cached"] = bool(cached)
         payload["stale"] = bool(cached)
         payload["cache_age_sec"] = round(now - float(_cache.get("at") or 0.0), 1) if cached else 0.0
@@ -643,12 +672,21 @@ def presentation_fields(
     reconciliation_adjustment_usd: float | None = None,
 ) -> dict[str, Any]:
     """Separated live economic, completeness, correction and paper figures."""
-    reconciled_ok = bool(recon.get("ok")) and not recon.get("error")
+    unfetched = str(recon.get("error") or "") == UNFETCHED_RECONCILIATION
+    reconciled_ok = bool(recon.get("ok")) and not recon.get("error") and not unfetched
     fill_tape = float(recon.get("live_reconciled_usd") or 0.0) if reconciled_ok else None
-    recorded = float(recon.get("live_recorded_usd") or 0.0)
-    dust = float(recon.get("live_dust_writeoff_usd") or 0.0)
+    if unfetched:
+        recorded = None
+        dust = None
+        paper_realized = None
+        legacy_mixed = None
+    else:
+        recorded = float(recon.get("live_recorded_usd") or 0.0)
+        dust = float(recon.get("live_dust_writeoff_usd") or 0.0)
+        paper_realized = float(recon.get("paper_realized_usd") or 0.0)
+        legacy_mixed = float(recon.get("legacy_mixed_total_usd") or 0.0)
     recon_adj = float(reconciliation_adjustment_usd or 0.0)
-    accounting_correction = dust + recon_adj
+    accounting_correction = None if dust is None else dust + recon_adj
     baseline = forward_baseline_equity if forward_baseline_equity is not None else contributed_principal
     cash_change = None
     if current_equity is not None and baseline is not None:
@@ -692,21 +730,21 @@ def presentation_fields(
         "reconciliation_adjustment_usd": recon_adj,
         "accounting_correction_total_usd": accounting_correction,
         "accounting_correction_label": "ACCOUNTING CORRECTION TOTAL (dust write-off + cash-adoption adjustment; not trading profit)",
-        "paper_realized_usd": float(recon.get("paper_realized_usd") or 0.0),
-        "legacy_mixed_total_usd": float(recon.get("legacy_mixed_total_usd") or 0.0),
+        "paper_realized_usd": paper_realized,
+        "legacy_mixed_total_usd": legacy_mixed,
         "legacy_mixed_total_label": "LEGACY MIXED TOTAL (historical, not live profit)",
         "paper_is_not_live_performance": True,
         "account_execution_mode": "live" if is_live else "paper",
-        "matched_fills": int(recon.get("matched_fills") or 0),
-        "matched_recorded_rows": int(recon.get("matched_recorded_rows") or 0),
-        "id_matched_rows": int(recon.get("id_matched_rows") or 0),
-        "unmatched_recorded_rows": int(recon.get("unmatched_recorded_rows") or 0),
-        "unmatched_venue_fills": int(recon.get("unmatched_venue_fills") or 0),
+        "matched_fills": None if unfetched else int(recon.get("matched_fills") or 0),
+        "matched_recorded_rows": None if unfetched else int(recon.get("matched_recorded_rows") or 0),
+        "id_matched_rows": None if unfetched else int(recon.get("id_matched_rows") or 0),
+        "unmatched_recorded_rows": None if unfetched else int(recon.get("unmatched_recorded_rows") or 0),
+        "unmatched_venue_fills": None if unfetched else int(recon.get("unmatched_venue_fills") or 0),
         "unmatched_records": list(recon.get("unmatched_records") or []),
-        "exchange_fees_quote_usd": float(recon.get("live_venue_fee_quote_usd") or 0.0),
+        "exchange_fees_quote_usd": None if unfetched else float(recon.get("live_venue_fee_quote_usd") or 0.0),
         "reconciliation_window_start": str(recon.get("window_start") or ""),
         "reconciliation_window_end": str(recon.get("window_end") or ""),
-        "qty_coverage_pct": round(float(recon.get("qty_coverage_pct") or 0.0), 2),
+        "qty_coverage_pct": None if unfetched else round(float(recon.get("qty_coverage_pct") or 0.0), 2),
         "unmatched_fill_groups": dict(recon.get("unmatched_fill_groups") or {}),
         "reconciliation_stale": bool(recon.get("stale")),
         "reconciliation_error": str(recon.get("error") or ""),

@@ -589,14 +589,18 @@ async def get_portfolio_performance() -> dict[str, Any]:
         try:
             from backend.services.live_exchange_equity import equity_basis_from_db
             from backend.services.live_pnl_reconciliation import (
+                UNFETCHED_RECONCILIATION,
                 account_basis_for_presentation,
                 get_reconciliation,
                 presentation_fields,
+                schedule_reconciliation_refresh,
             )
 
             # Cache only: /performance must not wait on exchange round trips.
             # The dedicated /pnl-reconciliation poll refreshes the cache.
             _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
+            if str(_recon.get("error") or "") == UNFETCHED_RECONCILIATION:
+                schedule_reconciliation_refresh(str(DATABASE_PATH))
             pnl_presentation = presentation_fields(
                 _recon,
                 is_live=account_execution_mode == "live",
@@ -850,12 +854,16 @@ async def get_portfolio_status() -> dict[str, Any]:
             from backend.database_schema import DATABASE_PATH
             from backend.services.execution_mode_service import is_live_execution_allowed_sync
             from backend.services.live_pnl_reconciliation import (
+                UNFETCHED_RECONCILIATION,
                 account_basis_for_presentation,
                 get_reconciliation,
                 presentation_fields,
+                schedule_reconciliation_refresh,
             )
 
             _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
+            if str(_recon.get("error") or "") == UNFETCHED_RECONCILIATION:
+                schedule_reconciliation_refresh(str(DATABASE_PATH))
             net_liq = status.get("net_liquidatable_equity")
             pnl_presentation = presentation_fields(
                 _recon,

@@ -2572,11 +2572,16 @@ function updateLatency(data) {
     const detailEl = document.getElementById("panel-latency-content");
     if (detailEl && d) {
         const dtem = d.decision_to_execution_ms || {};
+        const ack = d.order_submit_to_ack_ms || {};
+        const fill = d.order_submit_to_fill_ms || {};
+        const show = (v) => (v != null ? v : "--");
         const lines = [
             "health_flag: " + (d.health_flag || "--"),
             "stale_symbol_count: " + (d.stale_symbol_count != null ? d.stale_symbol_count : "--") + " / " + (d.total_symbols != null ? d.total_symbols : "?"),
-            "decision_to_exec avg_ms: " + (dtem.avg != null ? dtem.avg : dtem.rolling_avg != null ? dtem.rolling_avg : "--"),
-            "decision_to_exec p95_ms: " + (dtem.p95 != null ? dtem.p95 : "--"),
+            "signal_to_order avg_ms: " + show(dtem.avg) + (dtem.metric === "unmeasured" ? " (not stored)" : ""),
+            "signal_to_order p95_ms: " + show(dtem.p95),
+            "submit_to_ack avg_ms: " + show(ack.avg) + " p95: " + show(ack.p95) + " n: " + show(ack.samples),
+            "submit_to_fill avg_ms: " + show(fill.avg) + " p95: " + show(fill.p95) + " n: " + show(fill.samples),
         ];
         detailEl.textContent = lines.join("\n");
     }

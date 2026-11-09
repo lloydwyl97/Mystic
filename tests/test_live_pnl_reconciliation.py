@@ -321,6 +321,52 @@ def test_cached_only_never_hits_the_venue(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert out["error"], "an unfetched reconciliation must not read as a real zero result"
 
 
+def test_unfetched_reconciliation_is_not_presented_as_zero() -> None:
+    """A cold cache must not paint recorded P&L, fees, or match counts as zero."""
+    import backend.services.live_pnl_reconciliation as mod
+
+    recon = mod.LivePnlReconciliation(error=mod.UNFETCHED_RECONCILIATION).to_dict()
+    fields = presentation_fields(
+        recon,
+        is_live=True,
+        current_equity=992.62,
+        forward_baseline_equity=1046.64,
+    )
+    assert fields["primary_result_usd"] is None
+    assert fields["live_recorded_usd"] is None
+    assert fields["live_dust_writeoff_usd"] is None
+    assert fields["paper_realized_usd"] is None
+    assert fields["legacy_mixed_total_usd"] is None
+    assert fields["matched_fills"] is None
+    assert fields["exchange_fees_quote_usd"] is None
+    assert fields["qty_coverage_pct"] is None
+    assert fields["forward_cash_change_usd"] == pytest.approx(992.62 - 1046.64)
+    assert fields["reconciliation_error"] == mod.UNFETCHED_RECONCILIATION
+
+
+def test_schedule_reconciliation_refresh_runs_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import backend.services.live_pnl_reconciliation as mod
+
+    monkeypatch.setattr(mod, "_refresh_task", None)
+    called = {"n": 0}
+
+    async def fake(db_path: str, *, force: bool = False, cached_only: bool = False) -> dict:
+        called["n"] += 1
+        return {"ok": True, "db": db_path}
+
+    monkeypatch.setattr(mod, "get_reconciliation", fake)
+
+    async def run() -> None:
+        assert mod.schedule_reconciliation_refresh("/tmp/mystic.db") is True
+        assert mod.schedule_reconciliation_refresh("/tmp/mystic.db") is False
+        task = mod._refresh_task
+        assert task is not None
+        await task
+
+    asyncio.run(run())
+    assert called["n"] == 1
+
+
 def test_production_trailing_buy_timeout_is_900() -> None:
     """The 14400 value was an unproven strategy change and is reverted."""
     env = (REPO / "deploy" / "core_only_local.env").read_text()

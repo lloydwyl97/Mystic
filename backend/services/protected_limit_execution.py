@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import json
 import logging
+import math
+import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -860,6 +863,88 @@ def execution_latency_fields(order: dict[str, Any] | None) -> dict[str, Any]:
     if submit_ts and fill_ts:
         out["submit_to_fill_ms"] = (fill_ts - float(submit_ts)) * 1000.0
     return out
+
+
+_LATENCY_MS_MIN = -2_000.0
+_LATENCY_MS_MAX = 120_000.0
+
+
+def _finite_latency_ms(value: Any) -> float | None:
+    try:
+        measured = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(measured):
+        return None
+    if measured < _LATENCY_MS_MIN or measured > _LATENCY_MS_MAX:
+        return None
+    return measured
+
+
+def _latency_stats(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"avg": None, "p50": None, "p95": None, "p99": None, "max": None, "samples": 0}
+    ordered = sorted(values)
+
+    def pick(q: float) -> float:
+        idx = round(q * (len(ordered) - 1))
+        return ordered[max(0, min(len(ordered) - 1, idx))]
+
+    return {
+        "avg": round(sum(ordered) / len(ordered), 1),
+        "p50": round(pick(0.50), 1),
+        "p95": round(pick(0.95), 1),
+        "p99": round(pick(0.99), 1),
+        "max": round(ordered[-1], 1),
+        "samples": len(ordered),
+    }
+
+
+def summarize_live_fill_latency(db_path: str, *, limit: int = 200) -> dict[str, Any]:
+    """Submit-to-ack and submit-to-fill from recent stored live orders.
+
+    Reads only the newest ``limit`` identity rows. An empty window is reported
+    as nulls with ``samples=0``, never as a stand-in constant.
+    """
+    window = max(1, int(limit))
+    acks: list[float] = []
+    fills: list[float] = []
+    rows: list[Any] = []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                """
+                SELECT raw_json FROM live_exchange_fills
+                WHERE id > (SELECT COALESCE(MAX(id), 0) FROM live_exchange_fills) - ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (window, window),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.debug("LIVE_FILL_LATENCY_READ_FAILED", exc_info=True)
+    for row in rows:
+        raw = row[0] if row else None
+        try:
+            order = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            continue
+        fields = execution_latency_fields(order if isinstance(order, dict) else None)
+        ack = _finite_latency_ms(fields.get("submit_to_ack_ms"))
+        fill = _finite_latency_ms(fields.get("submit_to_fill_ms"))
+        if ack is not None:
+            acks.append(ack)
+        if fill is not None:
+            fills.append(fill)
+    return {
+        "order_submit_to_ack_ms": _latency_stats(acks),
+        "order_submit_to_fill_ms": _latency_stats(fills),
+        "source": "live_exchange_fills",
+        "rows_read": len(rows),
+    }
 
 
 async def execute_protected_limit_live(

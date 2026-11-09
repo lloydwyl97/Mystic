@@ -27048,8 +27048,9 @@ class PortfolioEngine:
         except Exception as e:
             logger.warning(f"Failed to get market data freshness from Redis: {e}")
 
-        # Get execution latency from audit (approximation)
-        decision_to_exec_ms = await self._get_execution_latency()
+        # Measured submit/fill clocks from stored live orders. Signal-to-decision
+        # is not one stored clock, so it stays unmeasured instead of a constant.
+        execution_latency = await self._get_execution_latency()
 
         # Health flags
         stale_count = sum(1 for s in symbol_freshness.values() if s.get("stale", True))
@@ -27062,8 +27063,18 @@ class PortfolioEngine:
 
         return {
             "symbol_freshness": symbol_freshness,
-            "decision_to_execution_ms": decision_to_exec_ms,
-            "order_submit_to_fill_ms": {"avg": 0, "p95": 0},  # Paper mode - instant
+            "decision_to_execution_ms": {
+                "avg": None,
+                "p50": None,
+                "p95": None,
+                "p99": None,
+                "max": None,
+                "samples": 0,
+                "metric": "unmeasured",
+                "source": "not_stored",
+            },
+            "order_submit_to_ack_ms": execution_latency["order_submit_to_ack_ms"],
+            "order_submit_to_fill_ms": execution_latency["order_submit_to_fill_ms"],
             "health_flag": health_flag,
             "stale_symbol_count": stale_count,
             "total_symbols": len(TRADING_SYMBOLS),
@@ -27071,10 +27082,10 @@ class PortfolioEngine:
         }
 
     async def _get_execution_latency(self) -> dict:
-        """Get rolling execution latency metrics"""
-        # In paper mode, execution is instant
-        # This is a placeholder for live mode metrics
-        return {"avg": 5, "p95": 15, "samples": 0}
+        """Rolling submit-to-ack and submit-to-fill from stored live orders."""
+        from backend.services.protected_limit_execution import summarize_live_fill_latency
+
+        return await asyncio.to_thread(summarize_live_fill_latency, self.db_path)
 
     async def get_audit_export(self, hours: int = 24) -> list[dict]:
         """Export audit records for last N hours"""
