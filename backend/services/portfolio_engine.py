@@ -2979,6 +2979,10 @@ class PortfolioEngine:
 
             # LIVE_BOOTSTRAP_RECONCILE: Binance is canonical. Align DB to exchange before invariants.
             if self._live_execution_enabled and self._live_service:
+                try:
+                    await self._recover_strategy_order_intents()
+                except Exception:
+                    logger.exception("STRATEGY_INTENT_RECOVERY_FAILED")
                 await self._live_bootstrap_reconcile()
 
             # CRITICAL: Sync with PaperTradingService to remove stale/dead positions
@@ -9308,6 +9312,10 @@ class PortfolioEngine:
             open_rows,
             position_owned,
         )
+        from backend.services.strategy_order_intent import intent_by_trade, materialize_buy_custody
+
+        with contextlib.suppress(Exception):
+            materialize_buy_custody(self.db_path)
 
         booked = 0
         for row in open_rows(self.db_path):
@@ -9327,11 +9335,15 @@ class PortfolioEngine:
                     ensure_canonical_buy_row(self.db_path, row)
                     mark(self.db_path, engine_id=engine_id, trade_id=trade_id, status=RECOVERED_ACTIVE_LOT, cash_applied=1)
                     continue
+                intent = intent_by_trade(self.db_path, trade_id, "BUY")
+                entry_time = time.time()
+                if intent and float(intent.get("created_at") or 0.0) > 0:
+                    entry_time = float(intent["created_at"])
                 position = OpenPosition(
                     symbol=str(row["symbol"]),
                     quantity=float(row["quantity"]),
                     entry_price=float(row["fill_price"]),
-                    entry_time=time.time(),
+                    entry_time=entry_time,
                     trade_id=trade_id,
                     stop_price=0.0,
                     take_profit_1_price=0.0,
@@ -9342,6 +9354,8 @@ class PortfolioEngine:
                     original_position_cost=float(row["cash_debit"] or 0.0),
                     entry_order_id=str(row["exchange_order_id"] or ""),
                     entry_client_order_id=str(row["client_order_id"] or ""),
+                    entry_decision_id=str((intent or {}).get("decision_id") or ""),
+                    entry_thesis=str((intent or {}).get("setup") or ""),
                     engine_id=engine_id,
                     status="ACTIVE",
                 )
@@ -9389,6 +9403,39 @@ class PortfolioEngine:
                     exc_info=True,
                 )
         return booked
+
+    async def _recover_strategy_order_intents(self) -> int:
+        """Find venue orders for intents that died before a fill was stored, then book them once."""
+        from backend.services.strategy_order_intent import apply_venue_order, intents_to_probe, mark_intent_absent
+
+        if self._live_service is None:
+            return 0
+        probed = 0
+        for intent in intents_to_probe(self.db_path):
+            cid = str(intent.get("client_order_id") or "")
+            symbol = str(intent.get("symbol") or "")
+            absent = 0
+            found = False
+            for suffix in ("-i", "-g"):
+                try:
+                    res = await self._live_service.fetch_order("binanceus", f"{cid}{suffix}", symbol)
+                except Exception:
+                    logger.warning("STRATEGY_INTENT_PROBE_FAILED trade=%s", intent.get("trade_id"), exc_info=True)
+                    break
+                if str(res.get("status") or "") == "success" and isinstance(res.get("order"), dict):
+                    apply_venue_order(self.db_path, res["order"])
+                    found = True
+                    probed += 1
+                    break
+                if str(res.get("code") or "") == "-2013":
+                    absent += 1
+            if not found and absent == 2:
+                mark_intent_absent(self.db_path, cid)
+        booked = await self.restore_filled_asset_custody()
+        if booked:
+            await self._load_positions_from_sqlite()
+            await self._load_ledger_from_sqlite()
+        return probed + booked
 
     async def _load_positions_from_sqlite(self, *, allow_mutations: bool = True, during_sell: bool = False) -> int:
         """Load positions from SQLite. Returns count loaded.
@@ -10952,12 +10999,28 @@ class PortfolioEngine:
                 preflight.protected_limit_price,
                 opportunity_id,
             )
+            from backend.services.strategy_order_intent import allocate_intent
+
+            trade_id = f"scalp_v2_{exchange_sym}_{self._now_ms()}"
+            scalp_client_id = allocate_intent(
+                self.db_path,
+                engine_id=SCALP_V2_ENGINE_ID,
+                trade_id=trade_id,
+                decision_id=decision_key,
+                symbol=norm,
+                side="BUY",
+                quantity=float(quantity),
+                limit_price=float(preflight.protected_limit_price or price or 0.0),
+                setup=str(setup_name or ""),
+                regime=str((adaptive_decision or {}).get("regime") or ""),
+            )
             live_order = await execute_protected_limit_live(
                 self._live_service,
                 symbol=exchange_sym,
                 side="buy",
                 quantity=quantity,
                 limit_price=preflight.protected_limit_price,
+                client_order_id=scalp_client_id,
             )
             if not live_order:
                 release_claim(
@@ -10972,6 +11035,12 @@ class PortfolioEngine:
                 return None
 
             live_order = live_order if isinstance(live_order, dict) else {}
+            _scalp_order_id = str(live_order.get("id") or "")
+            if _scalp_order_id:
+                with contextlib.suppress(Exception):
+                    from backend.services.strategy_order_intent import mark_exchange_order
+
+                    mark_exchange_order(self.db_path, scalp_client_id, _scalp_order_id, status="ACKED")
             try:
                 live_order = await self._verify_order_fill(live_order, exchange_sym, "buy")
             except Exception:
@@ -10988,7 +11057,6 @@ class PortfolioEngine:
             filled_qty = gross_qty
             fee = 0.0
             now_ts = datetime.now(timezone.utc).isoformat()
-            trade_id = f"scalp_v2_{exchange_sym}_{self._now_ms()}"
             client_order_id = str(live_order.get("clientOrderId") or (live_order.get("info") or {}).get("clientOrderId") or "")
             try:
                 from backend.services.live_fill_economics import apply_live_buy_economics, extract_live_commission
@@ -11086,6 +11154,10 @@ class PortfolioEngine:
                     self._available_balance = max(0.0, new_cash)
                     self._positions_value = new_pv
                     self._total_equity = new_eq
+                with contextlib.suppress(Exception):
+                    from backend.services.strategy_order_intent import complete_intent
+
+                    complete_intent(self.db_path, trade_id=str(trade_id), side="BUY", exchange_order_id=str(order_id or ""), status="COMMITTED")
                 # Canonical exchange-fill ledger (never reverses ownership on failure).
                 await _asyncio.to_thread(
                     self._scalp_v2_record_buy_fill_identity,
@@ -12493,6 +12565,21 @@ class PortfolioEngine:
                     preflight.protected_limit_price,
                 )
 
+                from backend.services.strategy_order_intent import allocate_intent
+
+                client_order_id = allocate_intent(
+                    self.db_path,
+                    engine_id=str(fill_engine_id or "DAY_V2"),
+                    trade_id=str(trade_id),
+                    decision_id=str(decision_id or ""),
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=float(quantity),
+                    limit_price=float(preflight.protected_limit_price or price or 0.0),
+                    setup=str(getattr(explainability, "setup_type", "") or ""),
+                    regime=str(getattr(explainability, "regime", "") or ""),
+                    feature_version=str(getattr(explainability, "feature_version", "") or ""),
+                )
                 live_order_buy = await execute_protected_limit_live(
                     self._live_service,
                     symbol=exchange_symbol,
@@ -12525,6 +12612,12 @@ class PortfolioEngine:
                     return None
 
                 live_order_buy = live_order_buy if isinstance(live_order_buy, dict) else {}
+                _acked_order_id = str(live_order_buy.get("id") or "")
+                if _acked_order_id and client_order_id:
+                    with contextlib.suppress(Exception):
+                        from backend.services.strategy_order_intent import mark_exchange_order
+
+                        mark_exchange_order(self.db_path, str(client_order_id), _acked_order_id, status="ACKED")
                 live_order_buy = await self._verify_order_fill(live_order_buy, exchange_symbol, "buy")
                 filled_qty = live_order_buy.get("filled")
                 avg_price = live_order_buy.get("average")
@@ -12995,6 +13088,10 @@ class PortfolioEngine:
                     return None
             if live_order_buy and _mark_custody is not None and not _unbooked_order:
                 _mark_custody(self.db_path, engine_id=str(position.engine_id or ""), trade_id=trade_id, status=RECOVERED_ACTIVE_LOT, cash_applied=1)
+                with contextlib.suppress(Exception):
+                    from backend.services.strategy_order_intent import complete_intent
+
+                    complete_intent(self.db_path, trade_id=str(trade_id), side="BUY", status="COMMITTED")
             if not _unbooked_order:
                 with contextlib.suppress(Exception):
                     from backend.services.entry_fill_telemetry import (
@@ -14239,17 +14336,43 @@ class PortfolioEngine:
                     "(strategy exit authority)" if strategy_authority_sell else "(emergency bypass)",
                 )
             from backend.services.protected_limit_execution import stamp_preflight
+            from backend.services.strategy_order_intent import allocate_intent, mark_exchange_order, recovered_sell_order
 
-            return stamp_preflight(
-                await execute_protected_limit_live(
-                    self._live_service,
-                    symbol=_to_api_symbol(symbol),
-                    side="sell",
-                    quantity=qty,
-                    limit_price=pf.protected_limit_price,
-                ),
-                pf,
+            prior = recovered_sell_order(self.db_path, str(getattr(position, "trade_id", "") or ""), requested_qty=float(qty))
+            if prior is not None:
+                logger.warning(
+                    "SELL_REUSED_RECOVERED_FILL symbol=%s trade=%s order=%s qty=%.8f",
+                    symbol,
+                    getattr(position, "trade_id", ""),
+                    prior.get("id"),
+                    float(prior.get("filled") or 0.0),
+                )
+                return stamp_preflight(prior, pf)
+            sell_client_id = ""
+            if str(getattr(position, "trade_id", "") or ""):
+                sell_client_id = allocate_intent(
+                    self.db_path,
+                    engine_id=str(getattr(position, "engine_id", "") or "DAY_V2"),
+                    trade_id=str(position.trade_id),
+                    decision_id=str(getattr(position, "entry_decision_id", "") or ""),
+                    symbol=symbol,
+                    side="SELL",
+                    quantity=float(qty),
+                    limit_price=float(pf.protected_limit_price or 0.0),
+                    setup=str(getattr(position, "entry_thesis", "") or ""),
+                )
+            order = await execute_protected_limit_live(
+                self._live_service,
+                symbol=_to_api_symbol(symbol),
+                side="sell",
+                quantity=qty,
+                limit_price=pf.protected_limit_price,
+                client_order_id=sell_client_id or None,
             )
+            if isinstance(order, dict) and order.get("id") and sell_client_id:
+                with contextlib.suppress(Exception):
+                    mark_exchange_order(self.db_path, sell_client_id, str(order.get("id") or ""), status="ACKED")
+            return stamp_preflight(order, pf)
 
         hold_time_seconds = time.time() - position.entry_time
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -15255,6 +15378,7 @@ class PortfolioEngine:
         from backend.services.live_close_integrity import claim_economic_close, live_order_has_venue_fill, persist_pending_close_event
 
         live_expected = bool(is_live_execution_allowed_sync() or self._live_execution_enabled)
+        oid = ""
         if live_expected:
             if not live_order_has_venue_fill(live_order_sell):
                 persist_pending_close_event(
@@ -15287,22 +15411,26 @@ class PortfolioEngine:
                 mystic_trade_id=str(getattr(position, "trade_id", "") or ""),
                 symbol=normalized_symbol,
             ):
-                logger.warning(
-                    "LIVE_SELL_IDEMPOTENT_SKIP symbol=%s order=%s",
-                    normalized_symbol,
-                    oid,
-                )
-                persist_pending_close_event(
-                    self.db_path,
-                    symbol=normalized_symbol,
-                    event_type="LIVE_CLOSE_DUPLICATE_VENUE_FILL",
-                    exit_trigger=str(exit_trigger or ""),
-                    quantity=float(actual_sold_qty or 0.0),
-                    price_snapshot=float(price or 0.0),
-                    exchange_order_id=oid,
-                    detail="venue fill already attributed",
-                )
-                return None
+                from backend.services.strategy_order_intent import sell_order_already_booked
+
+                if sell_order_already_booked(self.db_path, oid):
+                    logger.warning(
+                        "LIVE_SELL_IDEMPOTENT_SKIP symbol=%s order=%s",
+                        normalized_symbol,
+                        oid,
+                    )
+                    persist_pending_close_event(
+                        self.db_path,
+                        symbol=normalized_symbol,
+                        event_type="LIVE_CLOSE_DUPLICATE_VENUE_FILL",
+                        exit_trigger=str(exit_trigger or ""),
+                        quantity=float(actual_sold_qty or 0.0),
+                        price_snapshot=float(price or 0.0),
+                        exchange_order_id=oid,
+                        detail="venue fill already attributed",
+                    )
+                    return None
+                logger.warning("LIVE_SELL_FINISH_UNCOMMITTED_CLOSE symbol=%s order=%s", normalized_symbol, oid)
 
         # =================================================================
         # Phase 4: Recompute all money math AFTER final quantity is known
@@ -15868,6 +15996,7 @@ class PortfolioEngine:
                 exit_price=float(price),
                 sell_trade_id=str(sell_trade_id) or None,
                 detail=f"exit_trigger={exit_trigger};exit_type={exit_type.value};buy_trade_id={position.trade_id or ''}",
+                event_key=f"live-close:{oid}" if oid else None,
             )
         _cprov = getattr(position, "_close_provenance", None)
         if isinstance(_cprov, dict):
@@ -15886,7 +16015,18 @@ class PortfolioEngine:
                 fill_found=True,
                 exit_reporting=exit_reporting,
                 actual_net_pct=float(pnl_pct_net),
+                event_key=f"live-close:{oid}" if oid else None,
             )
+            if oid:
+                from backend.services.strategy_order_intent import complete_intent
+
+                complete_intent(
+                    self.db_path,
+                    trade_id=str(getattr(position, "trade_id", "") or ""),
+                    side="SELL",
+                    exchange_order_id=oid,
+                    status="CLOSED",
+                )
 
         with contextlib.suppress(Exception):
             self._record_trade_pattern_memory(

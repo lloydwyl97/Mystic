@@ -37,6 +37,25 @@ def test_forming_bar_is_excluded_and_exact_close_is_included(tmp_path) -> None:
         assert forming_open not in epochs, interval
 
 
+def test_tolerance_boundaries_stop_at_two_seconds(tmp_path) -> None:
+    sec = INTERVAL_SEC["15m"]
+    opens = {
+        "minus_2": AS_OF - 2 - sec,
+        "minus_1": AS_OF - 1 - sec,
+        "exact": AS_OF - sec,
+        "plus_1": AS_OF + 1 - sec,
+        "plus_2": AS_OF + 2 - sec,
+        "plus_3": AS_OF + 3 - sec,
+        "next_candle": AS_OF,
+    }
+    path = _db(tmp_path, "15m", list(opens.values()))
+    epochs = {b["ts_epoch"] for b in load_closed_bars(path, "BTCUSDT", "15m", 20, as_of=AS_OF)}
+    for name in ("minus_2", "minus_1", "exact", "plus_1", "plus_2"):
+        assert opens[name] in epochs, name
+    assert opens["plus_3"] not in epochs
+    assert opens["next_candle"] not in epochs
+
+
 def test_two_second_close_tolerance_does_not_admit_the_next_bar(tmp_path) -> None:
     sec = INTERVAL_SEC["15m"]
     # Closes 1s after the decision: inside the 2s clock tolerance.

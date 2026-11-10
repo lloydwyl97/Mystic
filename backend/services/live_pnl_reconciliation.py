@@ -380,6 +380,7 @@ def _ccxt_fill(trade: dict[str, Any]) -> dict[str, Any]:
         "ts": int(trade.get("timestamp") or 0),
         "fee_cost": float(fee.get("cost") or 0.0),
         "fee_ccy": str(fee.get("currency") or "").upper(),
+        "client_order_id": str(trade.get("clientOrderId") or (trade.get("info") or {}).get("clientOrderId") or ""),
     }
 
 
@@ -545,6 +546,7 @@ def _reconcile_symbol(symbol: str, recorded: dict[str, list[dict[str, Any]]], ve
                         "unmatched_quantity": leftover,
                         "price": (f["cost"] / f["qty"]) if f["qty"] else 0.0,
                         "exchange_order_id": f.get("order") or "",
+                        "client_order_id": f.get("client_order_id") or "",
                         "venue_trade_id": f.get("id") or "",
                         "local_record_id": "",
                         "dollar_discrepancy": leftover * ((f["cost"] / f["qty"]) if f["qty"] else 0.0),

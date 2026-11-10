@@ -1,0 +1,660 @@
+"""Durable strategy identity for a live order, written before the venue can fill.
+
+Binance.US client order ids are at most 36 characters. The id stored here is 32
+hex characters so the execution layer can append its ``-i`` / ``-g`` attempt
+suffix. The same engine, trade id, and side always mint the same id.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import time
+from typing import Any
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS strategy_order_intents (
+    client_order_id TEXT PRIMARY KEY,
+    engine_id TEXT NOT NULL,
+    trade_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL DEFAULT '',
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    limit_price REAL NOT NULL DEFAULT 0,
+    setup TEXT NOT NULL DEFAULT '',
+    regime TEXT NOT NULL DEFAULT '',
+    feature_version TEXT NOT NULL DEFAULT '',
+    exchange_order_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    filled_qty REAL NOT NULL DEFAULT 0,
+    filled_cost REAL NOT NULL DEFAULT 0,
+    filled_fee REAL NOT NULL DEFAULT 0,
+    fill_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+)
+"""
+
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute(_SCHEMA)
+    # One trade can have a later remainder order. The client id is the idempotency key.
+    conn.execute("DROP INDEX IF EXISTS ux_strategy_intent_trade")
+    return conn
+
+
+def client_order_id_for(*, engine_id: str, trade_id: str, side: str, attempt: int = 0) -> str:
+    """32-char hex id. Stable for one strategy order attempt. Fits under the 36-char venue limit."""
+    raw = f"{engine_id}|{trade_id}|{side}|{int(attempt)}".encode()
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def allocate_intent(
+    db_path: str,
+    *,
+    engine_id: str,
+    trade_id: str,
+    decision_id: str = "",
+    symbol: str,
+    side: str,
+    quantity: float,
+    limit_price: float = 0.0,
+    setup: str = "",
+    regime: str = "",
+    feature_version: str = "",
+) -> str:
+    """Persist strategy identity before submit. An in-flight order keeps its client id.
+
+    A later order for the same trade, after the first one has a fill, gets a new id.
+    Repeating the call before any fill returns the original id.
+    """
+    now = time.time()
+    side_u = str(side).upper()
+    conn = _connect(db_path)
+    try:
+        existing = conn.execute(
+            """
+            SELECT client_order_id, status, filled_qty
+            FROM strategy_order_intents
+            WHERE engine_id=? AND trade_id=? AND side=?
+            ORDER BY created_at
+            """,
+            (str(engine_id), str(trade_id), side_u),
+        ).fetchall()
+        for prior in existing:
+            if float(prior["filled_qty"] or 0.0) <= 0.0 and str(prior["status"] or "") in {"PENDING", "ACKED"}:
+                return str(prior["client_order_id"])
+        cid = client_order_id_for(engine_id=engine_id, trade_id=trade_id, side=side_u, attempt=len(existing))
+        conn.execute(
+            """
+            INSERT INTO strategy_order_intents (
+                client_order_id, engine_id, trade_id, decision_id, symbol, side,
+                quantity, limit_price, setup, regime, feature_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(client_order_id) DO NOTHING
+            """,
+            (
+                cid,
+                str(engine_id),
+                str(trade_id),
+                str(decision_id or ""),
+                str(symbol),
+                side_u,
+                float(quantity),
+                float(limit_price or 0.0),
+                str(setup or ""),
+                str(regime or ""),
+                str(feature_version or ""),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return cid
+
+
+def mark_exchange_order(db_path: str, client_order_id: str, exchange_order_id: str, *, status: str) -> None:
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE strategy_order_intents
+            SET exchange_order_id=?, status=?, updated_at=?
+            WHERE client_order_id=?
+            """,
+            (str(exchange_order_id or ""), str(status), time.time(), normalize_client_order_id(client_order_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def normalize_client_order_id(raw: str) -> str:
+    """Strip the execution layer's ``-i`` / ``-g`` attempt suffix."""
+    text = str(raw or "")
+    if text.endswith("-i") or text.endswith("-g"):
+        return text[:-2]
+    return text
+
+
+def intent_by_client(db_path: str, client_order_id: str) -> dict[str, Any] | None:
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM strategy_order_intents WHERE client_order_id=?",
+            (normalize_client_order_id(client_order_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def _fill_ids(raw: str) -> set[str]:
+    try:
+        return {str(x) for x in json.loads(raw or "[]")}
+    except (TypeError, ValueError):
+        return set()
+
+
+def adopt_venue_fill(
+    db_path: str,
+    *,
+    client_order_id: str,
+    exchange_order_id: str,
+    fill_id: str,
+    quantity: float,
+    price: float,
+    fee: float = 0.0,
+) -> dict[str, Any]:
+    """Apply one venue fill to its pre-submit strategy intent. The same fill id is a no-op.
+
+    A BUY ends as exactly one paper row whose quantity is the cumulative fill.
+    A SELL records the cumulative filled quantity on the intent for the close.
+    """
+    from backend.services.filled_asset_custody import ensure_canonical_buy_row
+
+    cid = normalize_client_order_id(client_order_id)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT * FROM strategy_order_intents WHERE client_order_id=?", (cid,)).fetchone()
+        if row is None:
+            return {"adopted": False, "reason": "NO_INTENT"}
+        seen = _fill_ids(str(row["fill_ids_json"] or "[]"))
+        fid = str(fill_id or "")
+        aggregate = fid.startswith("order:")
+        per_trade_seen = any(item and not item.startswith("order:") for item in seen)
+        aggregate_seen = any(item.startswith("order:") for item in seen)
+        # An order-level snapshot and the venue's per-trade legs count the same coins once.
+        if (aggregate and per_trade_seen) or (fid and not aggregate and aggregate_seen) or (fid and fid in seen):
+            return {"adopted": False, "reason": "DUPLICATE_FILL", "trade_id": row["trade_id"], "filled_qty": float(row["filled_qty"])}
+        qty = float(quantity or 0.0)
+        px = float(price or 0.0)
+        if qty <= 0 or px <= 0:
+            return {"adopted": False, "reason": "EMPTY_FILL"}
+        if aggregate:
+            filled_qty = qty
+            filled_cost = qty * px
+            filled_fee = float(fee or 0.0)
+        else:
+            filled_qty = float(row["filled_qty"] or 0.0) + qty
+            filled_cost = float(row["filled_cost"] or 0.0) + qty * px
+            filled_fee = float(row["filled_fee"] or 0.0) + float(fee or 0.0)
+        seen.add(fid or f"{exchange_order_id}:{filled_qty}")
+        vwap = filled_cost / filled_qty
+        conn.execute(
+            """
+            UPDATE strategy_order_intents
+            SET exchange_order_id=?, status='FILLED', filled_qty=?, filled_cost=?, filled_fee=?,
+                fill_ids_json=?, updated_at=?
+            WHERE client_order_id=?
+            """,
+            (str(exchange_order_id or row["exchange_order_id"] or ""), filled_qty, filled_cost, filled_fee, json.dumps(sorted(seen)), time.time(), cid),
+        )
+        conn.commit()
+        intent = dict(row)
+    finally:
+        conn.close()
+    if str(intent["side"]).upper() == "BUY":
+        ensure_canonical_buy_row(
+            db_path,
+            {
+                "trade_id": intent["trade_id"],
+                "exchange_order_id": str(exchange_order_id or ""),
+                "symbol": intent["symbol"],
+                "quantity": filled_qty,
+                "fill_price": vwap,
+                "fee": filled_fee,
+                "engine_id": intent["engine_id"],
+                "decision_id": intent["decision_id"],
+            },
+        )
+        # Keep the canonical row aligned if a later partial arrives.
+        fix = sqlite3.connect(db_path, timeout=15)
+        try:
+            cols = {str(r[1]) for r in fix.execute("PRAGMA table_info(paper_trades)")}
+            sets = ["quantity=?", "price=?"]
+            params: list[Any] = [filled_qty, vwap]
+            if "remaining_position" in cols:
+                sets.append("remaining_position=CASE WHEN ABS(COALESCE(remaining_position, quantity) - quantity) < 1e-8 THEN ? ELSE remaining_position END")
+                params.append(filled_qty)
+            if "fees_paid" in cols:
+                sets.append("fees_paid=?")
+                params.append(filled_fee)
+            if "order_id" in cols:
+                sets.append("order_id=?")
+                params.append(str(exchange_order_id or ""))
+            if "decision_id" in cols and intent.get("decision_id"):
+                sets.append("decision_id=COALESCE(NULLIF(decision_id, ''), ?)")
+                params.append(str(intent["decision_id"]))
+            if "explainability_json" in cols:
+                sets.append("explainability_json=CASE WHEN COALESCE(explainability_json, '') = '' THEN ? ELSE explainability_json END")
+                params.append(
+                    json.dumps(
+                        {
+                            "trade_id": intent["trade_id"],
+                            "setup_type": intent.get("setup") or "",
+                            "regime": intent.get("regime") or "",
+                            "feature_version": intent.get("feature_version") or "",
+                            "decision_id": intent.get("decision_id") or "",
+                            "engine_id": intent.get("engine_id") or "",
+                            "source": "strategy_order_intent",
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            params.append(intent["trade_id"])
+            fix.execute(f"UPDATE paper_trades SET {', '.join(sets)} WHERE trade_id=? AND UPPER(side)='BUY'", params)
+            fix.commit()
+        finally:
+            fix.close()
+    return {
+        "adopted": True,
+        "trade_id": intent["trade_id"],
+        "engine_id": intent["engine_id"],
+        "decision_id": intent["decision_id"],
+        "setup": intent["setup"],
+        "regime": intent["regime"],
+        "feature_version": intent["feature_version"],
+        "filled_qty": filled_qty,
+        "vwap": vwap,
+        "fee": filled_fee,
+    }
+
+
+def intent_by_trade(db_path: str, trade_id: str, side: str) -> dict[str, Any] | None:
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM strategy_order_intents
+            WHERE trade_id=? AND side=?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (str(trade_id), str(side).upper()),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def intent_by_exchange_order(db_path: str, exchange_order_id: str, side: str = "") -> dict[str, Any] | None:
+    oid = str(exchange_order_id or "").strip()
+    if not oid:
+        return None
+    conn = _connect(db_path)
+    try:
+        if side:
+            row = conn.execute(
+                "SELECT * FROM strategy_order_intents WHERE exchange_order_id=? AND side=? ORDER BY created_at DESC LIMIT 1",
+                (oid, str(side).upper()),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM strategy_order_intents WHERE exchange_order_id=? ORDER BY created_at DESC LIMIT 1",
+                (oid,),
+            ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def complete_intent(db_path: str, *, trade_id: str, side: str, exchange_order_id: str = "", status: str = "COMMITTED") -> None:
+    conn = _connect(db_path)
+    try:
+        if exchange_order_id:
+            conn.execute(
+                """
+                UPDATE strategy_order_intents
+                SET status=?, updated_at=?
+                WHERE trade_id=? AND side=? AND exchange_order_id=?
+                """,
+                (status, time.time(), str(trade_id), str(side).upper(), str(exchange_order_id)),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE strategy_order_intents
+                SET status=?, updated_at=?
+                WHERE trade_id=? AND side=? AND status NOT IN ('NO_VENUE_ORDER', 'CLOSED')
+                """,
+                (status, time.time(), str(trade_id), str(side).upper()),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def claim_strategy_fill(
+    db_path: str,
+    *,
+    exchange_order_id: str,
+    client_order_id: str = "",
+    fill_id: str,
+    quantity: float,
+    price: float,
+    fee: float = 0.0,
+    side: str = "",
+) -> dict[str, Any]:
+    """Adopt a venue fill when a pre-submit intent owns it. Otherwise leave it unclassified."""
+    intent = intent_by_client(db_path, client_order_id) if client_order_id else None
+    if intent is None:
+        intent = intent_by_exchange_order(db_path, exchange_order_id, side)
+    if intent is None:
+        return {"adopted": False, "reason": "NO_INTENT"}
+    if side and str(intent.get("side") or "").upper() != str(side).upper():
+        return {"adopted": False, "reason": "NO_INTENT"}
+    return adopt_venue_fill(
+        db_path,
+        client_order_id=str(intent["client_order_id"]),
+        exchange_order_id=str(exchange_order_id or intent.get("exchange_order_id") or ""),
+        fill_id=fill_id,
+        quantity=quantity,
+        price=price,
+        fee=fee,
+    )
+
+
+def apply_venue_order(db_path: str, order: dict[str, Any]) -> dict[str, Any]:
+    """Apply a fetched venue order to the intent named by its client id."""
+    cid = str(order.get("clientOrderId") or order.get("client_order_id") or "")
+    oid = str(order.get("id") or "")
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    trades = order.get("trades") or info.get("fills") or []
+    last: dict[str, Any] = {"adopted": False, "reason": "NO_FILL"}
+    if trades:
+        for index, trade in enumerate(trades):
+            if not isinstance(trade, dict):
+                continue
+            qty = float(trade.get("qty") or trade.get("amount") or 0.0)
+            px = float(trade.get("price") or 0.0)
+            fee_raw = trade.get("fee") if isinstance(trade.get("fee"), dict) else {}
+            fee = float(trade.get("commission") or fee_raw.get("cost") or 0.0)
+            fid = str(trade.get("tradeId") or trade.get("id") or f"{oid}:{index}")
+            last = adopt_venue_fill(db_path, client_order_id=cid, exchange_order_id=oid, fill_id=fid, quantity=qty, price=px, fee=fee)
+        return last
+    filled = float(order.get("filled") or 0.0)
+    average = float(order.get("average") or order.get("price") or 0.0)
+    if filled > 0 and average > 0 and oid:
+        fee_raw = order.get("fee") if isinstance(order.get("fee"), dict) else {}
+        return adopt_venue_fill(
+            db_path,
+            client_order_id=cid,
+            exchange_order_id=oid,
+            fill_id=f"order:{oid}",
+            quantity=filled,
+            price=average,
+            fee=float(fee_raw.get("cost") or 0.0),
+        )
+    if oid and cid:
+        mark_exchange_order(db_path, normalize_client_order_id(cid), oid, status="ACKED")
+    return last
+
+
+def intents_to_probe(db_path: str, *, max_age_sec: float = 172800, limit: int = 16) -> list[dict[str, Any]]:
+    """Recent orders with no fill yet. The venue is the only place their result can be."""
+    cutoff = time.time() - float(max_age_sec)
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM strategy_order_intents
+            WHERE status IN ('PENDING', 'ACKED') AND filled_qty <= 0 AND created_at >= ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (cutoff, int(limit)),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def mark_intent_absent(db_path: str, client_order_id: str) -> None:
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE strategy_order_intents SET status='NO_VENUE_ORDER', updated_at=? WHERE client_order_id=? AND filled_qty <= 0",
+            (time.time(), normalize_client_order_id(client_order_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _buy_was_closed(conn: sqlite3.Connection, trade_id: str) -> bool:
+    tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "paper_trades" not in tables:
+        return False
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_trades)")}
+    if "remaining_position" not in cols:
+        return False
+    row = conn.execute(
+        "SELECT quantity, remaining_position FROM paper_trades WHERE trade_id=? AND UPPER(side)='BUY' LIMIT 1",
+        (str(trade_id),),
+    ).fetchone()
+    if row is None:
+        return False
+    return abs(float(row[1] or 0.0)) <= 1e-12 and float(row[0] or 0.0) > 0
+
+
+def recover_recorded_fills(db_path: str) -> int:
+    """Adopt fills already written to the fill ledger when their intent never reached custody.
+
+    Only intents that are still open are considered, so a reconciliation pass does
+    not walk the historical fill tape.
+    """
+    open_conn = _connect(db_path)
+    try:
+        pending = open_conn.execute(
+            """
+            SELECT trade_id, exchange_order_id, client_order_id, side
+            FROM strategy_order_intents
+            WHERE filled_qty <= 0 AND status IN ('PENDING', 'ACKED')
+            """
+        ).fetchall()
+    finally:
+        open_conn.close()
+    if not pending:
+        return 0
+    order_ids = [str(row["exchange_order_id"]) for row in pending if str(row["exchange_order_id"] or "")]
+    trade_ids = [str(row["trade_id"]) for row in pending if str(row["trade_id"] or "")]
+    conn = sqlite3.connect(db_path, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "live_exchange_fills" not in tables:
+            return 0
+        clauses = []
+        params: list[Any] = []
+        if order_ids:
+            clauses.append(f"exchange_order_id IN ({', '.join('?' for _ in order_ids)})")
+            params.extend(order_ids)
+        if trade_ids:
+            clauses.append(f"mystic_trade_id IN ({', '.join('?' for _ in trade_ids)})")
+            params.extend(trade_ids)
+        if not clauses:
+            return 0
+        rows = conn.execute(
+            f"""
+            SELECT exchange_order_id, client_order_id, side, executed_qty, avg_fill_price,
+                   fee_amount, venue_trade_ids_json, mystic_trade_id
+            FROM live_exchange_fills
+            WHERE {" OR ".join(clauses)}
+            """,
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    adopted = 0
+    for raw in rows:
+        row = dict(raw)
+        side = str(row.get("side") or "").upper()
+        intent = intent_by_client(db_path, str(row.get("client_order_id") or "")) if row.get("client_order_id") else None
+        if intent is None:
+            intent = intent_by_exchange_order(db_path, str(row.get("exchange_order_id") or ""), side)
+        if intent is None and row.get("mystic_trade_id"):
+            intent = intent_by_trade(db_path, str(row["mystic_trade_id"]), side)
+        if intent is None or str(intent.get("side") or "").upper() != side:
+            continue
+        executed = float(row.get("executed_qty") or 0.0)
+        if executed <= 0 or float(intent.get("filled_qty") or 0.0) + 1e-12 >= executed:
+            continue
+        try:
+            trade_ids = [str(item) for item in json.loads(row.get("venue_trade_ids_json") or "[]") if str(item)]
+        except (TypeError, ValueError):
+            trade_ids = []
+        fill_id = trade_ids[0] if len(trade_ids) == 1 else f"order:{row.get('exchange_order_id')}"
+        result = adopt_venue_fill(
+            db_path,
+            client_order_id=str(intent["client_order_id"]),
+            exchange_order_id=str(row.get("exchange_order_id") or ""),
+            fill_id=fill_id,
+            quantity=executed,
+            price=float(row.get("avg_fill_price") or 0.0),
+            fee=float(row.get("fee_amount") or 0.0),
+        )
+        if result.get("adopted"):
+            adopted += 1
+    return adopted
+
+
+def materialize_buy_custody(db_path: str) -> int:
+    """Write custody for an adopted BUY that never reached the open transaction.
+
+    A lot whose paper row was already reduced to zero is closed and is not reopened.
+    """
+    from backend.services.filled_asset_custody import remember
+
+    recover_recorded_fills(db_path)
+
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM strategy_order_intents
+            WHERE side='BUY' AND filled_qty > 0 AND status NOT IN ('COMMITTED', 'CLOSED', 'NO_VENUE_ORDER')
+            """
+        ).fetchall()
+        staged = [dict(row) for row in rows]
+    finally:
+        conn.close()
+    written = 0
+    for intent in staged:
+        check = sqlite3.connect(db_path, timeout=15)
+        try:
+            tables = {str(row[0]) for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            owned = False
+            if "portfolio_engine_positions" in tables:
+                owned = (
+                    check.execute(
+                        "SELECT 1 FROM portfolio_engine_positions WHERE trade_id=? AND IFNULL(quantity, 0) > 0",
+                        (intent["trade_id"],),
+                    ).fetchone()
+                    is not None
+                )
+            closed = _buy_was_closed(check, str(intent["trade_id"]))
+        finally:
+            check.close()
+        if owned:
+            complete_intent(db_path, trade_id=str(intent["trade_id"]), side="BUY", status="COMMITTED")
+            continue
+        if closed:
+            complete_intent(db_path, trade_id=str(intent["trade_id"]), side="BUY", status="CLOSED")
+            continue
+        qty = float(intent["filled_qty"] or 0.0)
+        cost = float(intent["filled_cost"] or 0.0)
+        price = cost / qty if qty else 0.0
+        remember(
+            db_path,
+            engine_id=str(intent["engine_id"]),
+            symbol=str(intent["symbol"]),
+            trade_id=str(intent["trade_id"]),
+            quantity=qty,
+            fill_price=price,
+            fee=float(intent["filled_fee"] or 0.0),
+            cash_debit=cost,
+            client_order_id=str(intent["client_order_id"]),
+            exchange_order_id=str(intent["exchange_order_id"] or ""),
+        )
+        written += 1
+    return written
+
+
+def sell_order_already_booked(db_path: str, exchange_order_id: str) -> bool:
+    oid = str(exchange_order_id or "").strip()
+    if not oid:
+        return False
+    conn = sqlite3.connect(db_path, timeout=15)
+    try:
+        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "paper_trades" not in tables:
+            return False
+        cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_trades)")}
+        if "order_id" not in cols:
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM paper_trades WHERE order_id=? AND UPPER(side)='SELL' LIMIT 1",
+            (oid,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
+def recovered_sell_order(db_path: str, trade_id: str, *, requested_qty: float) -> dict[str, Any] | None:
+    """The venue order that already sold this quantity, if the close was not booked."""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM strategy_order_intents
+            WHERE trade_id=? AND side='SELL' AND filled_qty > 0 AND exchange_order_id != ''
+            ORDER BY created_at
+            """,
+            (str(trade_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        intent = dict(row)
+        qty = float(intent["filled_qty"] or 0.0)
+        if qty + 1e-9 < float(requested_qty or 0.0):
+            continue
+        if sell_order_already_booked(db_path, str(intent["exchange_order_id"])):
+            continue
+        cost = float(intent["filled_cost"] or 0.0)
+        return {
+            "id": str(intent["exchange_order_id"]),
+            "filled": qty,
+            "average": (cost / qty) if qty else 0.0,
+            "status": "closed",
+            "clientOrderId": str(intent["client_order_id"]),
+            "_mystic_recovered_fill": True,
+        }
+    return None

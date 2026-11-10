@@ -7,6 +7,7 @@ contributed principal. Lifetime owner deposits remain UNKNOWN.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from decimal import Decimal
 from typing import Any
@@ -19,6 +20,8 @@ from backend.services.live_account_basis import (
     load_operational_json,
     persist_operational_json,
 )
+
+logger = logging.getLogger(__name__)
 
 FORWARD_BASELINE_CASH = TRAILING_BUY_ANCHOR_EQUITY
 FORWARD_BASELINE_SHA = TRAILING_BUY_ANCHOR_SHA
@@ -361,9 +364,14 @@ def backfill_exchange_reconciled_orders(
     unmatched: list[dict[str, Any]],
     known_order_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Write EXCHANGE_RECONCILED identity for full unmatched venue orders only."""
+    """Write EXCHANGE_RECONCILED identity for full unmatched venue orders only.
+
+    A fill whose client id or exchange order id matches a pre-submit strategy
+    intent is adopted as that strategy lot instead. It is not labeled external.
+    """
     from backend.services.live_order_identity import record_exchange_reconciled
     from backend.services.live_pnl_reconciliation import classify_unmatched_venue_fills
+    from backend.services.strategy_order_intent import claim_strategy_fill, materialize_buy_custody
 
     known = {str(x) for x in (known_order_ids or set()) if str(x).strip()}
     groups = classify_unmatched_venue_fills(unmatched, known_order_ids=known)
@@ -371,6 +379,20 @@ def backfill_exchange_reconciled_orders(
     for row in groups["full_buys_lacking_local"] + groups["full_sells_lacking_local"]:
         oid = str(row.get("exchange_order_id") or "").strip()
         if not oid or oid in known:
+            continue
+        claimed = claim_strategy_fill(
+            db_path,
+            exchange_order_id=oid,
+            client_order_id=str(row.get("client_order_id") or ""),
+            fill_id=str(row.get("venue_trade_id") or f"order:{oid}"),
+            quantity=float(row.get("unmatched_quantity") or row.get("quantity") or 0.0),
+            price=float(row.get("price") or 0.0),
+            fee=float(row.get("fee") or 0.0),
+            side=str(row.get("side") or ""),
+        )
+        if claimed.get("adopted") or claimed.get("reason") == "DUPLICATE_FILL":
+            written.append({"symbol": row.get("symbol"), "side": row.get("side"), "exchange_order_id": oid, "source": "STRATEGY_INTENT", "trade_id": claimed.get("trade_id") or ""})
+            known.add(oid)
             continue
         ok = record_exchange_reconciled(
             db_path,
@@ -391,6 +413,10 @@ def backfill_exchange_reconciled_orders(
         if ok:
             written.append({"symbol": row.get("symbol"), "side": row.get("side"), "exchange_order_id": oid, "source": "EXCHANGE_RECONCILED"})
             known.add(oid)
+    try:
+        materialize_buy_custody(db_path)
+    except Exception:
+        logger.debug("strategy intent custody materialize skipped", exc_info=True)
     return written
 
 
