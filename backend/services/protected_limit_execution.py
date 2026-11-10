@@ -756,13 +756,13 @@ async def run_protected_preflight(
     return res
 
 
-async def _enrich_live_order_fills(live_service: Any, order: dict[str, Any], exchange_symbol: str) -> dict[str, Any]:
+async def _enrich_live_order_fills(live_service: Any, order: dict[str, Any], exchange_symbol: str, *, wait: bool = True) -> dict[str, Any]:
     """Re-fetch so commission/fills survive IOC expire. Never invent quantity."""
     order_id = str(order.get("id") or "")
     if not order_id:
         return order
     try:
-        st = await live_service.fetch_order("binanceus", order_id, exchange_symbol)
+        st = await live_service.fetch_order("binanceus", order_id, exchange_symbol, priority="background", wait=wait)
     except Exception:
         return order
     if st.get("status") != "success":
@@ -1209,7 +1209,7 @@ async def execute_protected_limit_live(
             order.setdefault("clientOrderId", attempt_cid)
         order_id = str(order.get("id") or "")
         if order_id:
-            order = await _enrich_live_order_fills(live_service, order, exchange_symbol)
+            order = await _enrich_live_order_fills(live_service, order, exchange_symbol, wait=side_l != "sell")
         _stamp_latency(order, submit_ts, response_ts)
         filled = float(order.get("filled") or 0.0)
         amount = float(order.get("amount") or quantity)

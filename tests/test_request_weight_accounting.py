@@ -16,6 +16,7 @@ from backend.services.portfolio_engine import COMBINED_ENGINE_MAX_POSITIONS
 from backend.services.venue_order_budget import VenueOrderBudget
 from backend.utils.binance_weight_limiter import (
     ACCOUNT_WEIGHT,
+    BOOK_TICKER_WEIGHT,
     DEPTH_WEIGHT,
     ENDPOINT_WEIGHTS,
     EXCHANGE_INFO_WEIGHT,
@@ -26,6 +27,7 @@ from backend.utils.binance_weight_limiter import (
     ORDER_SUBMIT_WEIGHT,
     ORDER_USAGE_WEIGHT,
     PROTECTIVE_WEIGHT_RESERVE,
+    TICKER_24H_WEIGHT,
     RateLimited,
     alignment_state,
     apply_venue_header,
@@ -200,6 +202,27 @@ def test_exit_decision_mark_can_use_the_reserve_and_a_feature_read_cannot() -> N
     assert weight_grant_allowed(remaining, 2, priority="exit_decision", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is True
     assert weight_grant_allowed(remaining, 5, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is True
     assert weight_grant_allowed(4, 5, priority="exit_decision", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+
+
+def test_reserve_313_gives_every_lot_a_first_attempt_before_retries_run_out() -> None:
+    """bookTicker is charged even when unusable, then 24hr is the fallback. The 1m kline is not in this cost."""
+    detection = BOOK_TICKER_WEIGHT + TICKER_24H_WEIGHT
+    attempt = DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT
+    remaining = PROTECTIVE_WEIGHT_RESERVE
+    first_attempts = 0
+    for _position in range(COMBINED_ENGINE_MAX_POSITIONS):
+        for step in (detection, attempt):
+            assert weight_grant_allowed(remaining, step, priority="exit_decision" if step == detection else "exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False)
+            remaining -= step
+        first_attempts += 1
+        for _retry in range(MANDATORY_EXIT_SAME_CALL_ATTEMPTS - 1):
+            if not weight_grant_allowed(remaining, attempt, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True):
+                break
+            remaining -= attempt
+    assert first_attempts == COMBINED_ENGINE_MAX_POSITIONS
+    assert remaining >= 0
+    assert detection + attempt == 10
+    assert COMBINED_ENGINE_MAX_POSITIONS * (detection + MANDATORY_EXIT_SAME_CALL_ATTEMPTS * attempt) == 320
 
 
 def test_weight_header_parser() -> None:

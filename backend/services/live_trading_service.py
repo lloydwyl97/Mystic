@@ -769,13 +769,14 @@ class LiveTradingService:
         params: dict[str, Any] | None = None,
         *,
         priority: str = "background",
+        wait: bool = True,
     ) -> dict[str, Any]:
         """Fetch order status. Numeric ids use orderId; others use origClientOrderId."""
         _mark_order_activity(self, symbol, 0)
         try:
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
-                await self._charge_weight("/api/v3/order", 4, priority=priority)
+                await self._charge_weight("/api/v3/order", 4, priority=priority, wait=wait)
                 pair = _to_binance_pair(symbol)
                 extra = dict(params or {})
                 ref = str(order_id or "").strip()

@@ -43,7 +43,7 @@ class _Venue:
 def _fast(monkeypatch):
     monkeypatch.setattr(ple.asyncio, "sleep", _no_sleep)
 
-    async def _enrich(_svc, order, _sym):
+    async def _enrich(_svc, order, _sym, **_k):
         return order
 
     monkeypatch.setattr(ple, "_enrich_live_order_fills", _enrich)

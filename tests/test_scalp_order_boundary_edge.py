@@ -195,7 +195,7 @@ class _Venue:
 
 @pytest.fixture
 def _no_enrich(monkeypatch):
-    async def _enrich(_svc, order, _sym):
+    async def _enrich(_svc, order, _sym, **_k):
         return order
 
     async def _no_sleep(_s):

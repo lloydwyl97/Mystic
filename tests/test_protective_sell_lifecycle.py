@@ -286,7 +286,7 @@ async def test_ioc_expire_does_not_place_gtc_and_a_missing_ioc_does(monkeypatch)
     async def _no_sleep(_s):
         return None
 
-    async def _enrich(_svc, order, _sym):
+    async def _enrich(_svc, order, _sym, **_k):
         return order
 
     monkeypatch.setattr(ple.asyncio, "sleep", _no_sleep)

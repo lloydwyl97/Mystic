@@ -50,13 +50,20 @@ def _decode_redis_val(raw: Any) -> str:
     return str(raw)
 
 
-async def _limited_binance_get(path: str, weight: int, params: dict[str, str], *, priority: str = "background") -> Any:
+async def _limited_binance_get(
+    path: str,
+    weight: int,
+    params: dict[str, str],
+    *,
+    priority: str = "background",
+    wait: bool = True,
+) -> Any:
     from backend.services.canonical_http_client import get_http_client
     from backend.utils.binance_weight_limiter import BinanceWeightLimiter, observe_headers
 
     started = time.time()
     limiter = await BinanceWeightLimiter.create()
-    await limiter.consume(path, weight=weight, wait=True, timeout=5.0, priority=priority)
+    await limiter.consume(path, weight=weight, wait=wait, timeout=5.0, priority=priority)
     client = await get_http_client()
     resp = await client.get("https://api.binance.us" + path, params=params, timeout=10.0)
     await observe_headers(getattr(resp, "headers", None), started_at=started)
@@ -81,8 +88,14 @@ async def _fetch_binance_last_price(bus: str, *, priority: str = "background") -
     return last_px if last_px > 0 else None
 
 
-async def _fetch_binance_1m_kline(bus: str, *, priority: str = "background") -> dict[str, float] | None:
-    resp = await _limited_binance_get("/api/v3/klines", 2, {"symbol": bus, "interval": "1m", "limit": "1"}, priority=priority)
+async def _fetch_binance_1m_kline(bus: str, *, priority: str = "background", wait: bool = True) -> dict[str, float] | None:
+    resp = await _limited_binance_get(
+        "/api/v3/klines",
+        2,
+        {"symbol": bus, "interval": "1m", "limit": "1"},
+        priority=priority,
+        wait=wait,
+    )
     rows = resp.json()
     if not rows:
         return None
@@ -201,7 +214,10 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True, priority:
     kline_high = None
     kline_open = None
     try:
-        kline = await _fetch_binance_1m_kline(bus, priority=priority)
+        # The 1m high folds the watermark. It is not the catastrophic low and must not
+        # spend the protective reserve or wait out a refusal before the sell.
+        kline_priority = "background" if priority == "exit_decision" else priority
+        kline = await _fetch_binance_1m_kline(bus, priority=kline_priority, wait=priority != "exit_decision")
         if kline:
             kline_close = float(kline.get("close") or 0.0) or None
             kline_high = float(kline.get("high") or 0.0) or None
