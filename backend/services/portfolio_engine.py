@@ -2582,6 +2582,21 @@ def _unresolved_sell_intent(db_path: str, symbol: str) -> bool:
     return False
 
 
+def _exit_mark_is_usable(mark_info: dict[str, Any] | None) -> bool:
+    """A live exit may use this mark for watermarks and for a SELL decision.
+
+    A stored high or low is not this mark. A stale, missing, or non-finite
+    quote must not create a new excursion or route an order.
+    """
+    if not isinstance(mark_info, dict) or mark_info.get("price_source_stale"):
+        return False
+    try:
+        price = float(mark_info.get("mark_used"))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(price) and price > 0.0
+
+
 def read_reconcile_state() -> dict[str, Any]:
     """Last startup/reconcile file written by the trading process. Empty when absent."""
     path = os.getenv("MYSTIC_RECONCILE_STATE_FILE", "/home/mystic/mystic/logs/mystic_live_reconcile.json")
@@ -10618,6 +10633,7 @@ class PortfolioEngine:
             "decision_tag": decision_tag,
             "emergency_flag": bool(emergency_flag),
             "strategy_authority": bool(strategy_authority),
+            "mark_fresh": bool(mark_fresh),
             "measured_cost_sample_count": sample_count,
             "measured_cost_p75": float(measured_roundtrip_p75),
             "strict_no_negative_sells": bool(STRICT_NO_NEGATIVE_SELLS),
@@ -14237,7 +14253,7 @@ class PortfolioEngine:
                 "PROFITABILITY_GATE",
             )
             return None
-        if sell_eval.get("mark_price") is not None:
+        if sell_eval.get("mark_price") is not None and sell_eval.get("mark_fresh") is not False:
             price = float(sell_eval["mark_price"])
 
         # Emergency exits (stop/time/thesis/trailing/extreme) and forced strategy
@@ -17185,18 +17201,27 @@ class PortfolioEngine:
             telemetry = self._build_exit_check_telemetry(position, mark_info)
             self._log_exit_check_telemetry(telemetry)
 
-            if mark_info.get("price_source_stale"):
+            if not _exit_mark_is_usable(mark_info):
                 any_stale_marks = True
-                # Still allow risk exits on last known mark — do not skip stop/stall/time.
                 logger.warning(
-                    "EXIT_STALE_MARK_RISK_ONLY: symbol=%s — using last mark for risk exits",
+                    "EXIT_MARK_STALE_NO_SELL symbol=%s source=%s age=%s mark=%s",
                     symbol,
+                    mark_info.get("mark_source"),
+                    mark_info.get("mark_age_seconds"),
+                    mark_info.get("mark_used"),
                 )
+                continue
 
-            current_price = float(mark_info.get("mark_used") or 0.0)
-            if current_price <= 0:
-                logger.warning(f"MONITOR: No usable price for {symbol}, skipping")
-                any_stale_marks = True
+            current_price = float(mark_info["mark_used"])
+            obs_ts = mark_info.get("mark_timestamp")
+            last_obs = getattr(position, "_last_mark_ts", None)
+            if isinstance(obs_ts, (int, float)) and isinstance(last_obs, (int, float)) and float(obs_ts) < float(last_obs):
+                logger.warning(
+                    "EXIT_MARK_OUT_OF_ORDER symbol=%s obs=%s last=%s — watermark and sell unchanged",
+                    symbol,
+                    obs_ts,
+                    last_obs,
+                )
                 continue
 
             # Update high/low watermarks (for MFE/MAE diagnostics).
@@ -17255,6 +17280,8 @@ class PortfolioEngine:
             be_changed = apply_break_even_and_mfe_trail(position, current_price)
             if watermark_changed or be_changed:
                 await self._persist_position_to_sqlite(position)
+            if isinstance(obs_ts, (int, float)):
+                position._last_mark_ts = float(obs_ts)
 
             # LEARNING INGESTION: open-position heartbeat (throttled per symbol).
             # Generates learning rows while holding, before any close happens.

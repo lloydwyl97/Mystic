@@ -79,9 +79,12 @@ async def test_full_pass_falls_back_to_rest_bid_only_when_fresh(tmp_path, monkey
     await eng.monitor_all_positions({}, 0, engine_ids=frozenset({SCALP}))
     assert check.await_args_list[0].kwargs["executable_bid"] == 99.95
     check.reset_mock()
-    eng._resolve_exit_monitor_mark = AsyncMock(return_value={"mark_used": 100.0, "bid": 99.95, "price_source_stale": True})
+    eng._resolve_exit_monitor_mark = AsyncMock(return_value={"mark_used": 89.0, "bid": 88.9, "price_source_stale": True, "mark_timestamp": time.time()})
+    lot = eng.open_positions[make_position_key(SCALP, "BTC/USDT")]
+    lot.lowest_price = 99.0
     await eng.monitor_all_positions({}, 0, engine_ids=frozenset({SCALP}))
-    assert check.await_args_list[0].kwargs["executable_bid"] is None
+    assert check.await_count == 0
+    assert lot.lowest_price == 99.0
 
 
 async def test_old_adverse_distance_holds_and_a_worse_terminal_sells_the_bid(tmp_path, caplog, monkeypatch):
