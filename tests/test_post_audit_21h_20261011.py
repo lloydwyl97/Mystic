@@ -35,9 +35,15 @@ async def test_unbooked_fill_restart_books_one_lot_and_a_retry_does_not(tmp_path
     rows = conn.execute("SELECT engine_id, trade_id, quantity FROM portfolio_engine_positions WHERE symbol='BTC/USDT'").fetchall()
     status = conn.execute("SELECT status, cash_applied FROM filled_asset_custody").fetchone()
     learned = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='adaptive_metric_state'").fetchone()
+    buys = conn.execute("SELECT trade_id, order_id, side, quantity FROM paper_trades WHERE side='BUY'").fetchall()
     conn.close()
     assert rows == [("DAY_V2", "mystic_BTC/USDT_crash", pytest.approx(0.01))]
     assert status == (RECOVERED_ACTIVE_LOT, 1)
+    assert len(buys) == 1
+    assert buys[0][0] == "mystic_BTC/USDT_crash"
+    assert buys[0][1] == "oid-1"
+    assert buys[0][2] == "BUY"
+    assert buys[0][3] == pytest.approx(0.01)
     assert learned[0] in {0, 1}
     if learned[0]:
         conn = sqlite3.connect(db)

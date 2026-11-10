@@ -92,6 +92,65 @@ def remember(
         conn.close()
 
 
+def ensure_canonical_buy_row(db_path: str, row: dict[str, Any]) -> bool:
+    """Insert one live BUY if this custody fill has no paper_trades identity yet.
+
+    A repeat of the same trade id or exchange order id inserts nothing. This does
+    not invent a row for a fill that was never a strategy attempt.
+    """
+    trade_id = str(row.get("trade_id") or "").strip()
+    order_id = str(row.get("exchange_order_id") or "").strip()
+    symbol = str(row.get("symbol") or "").strip()
+    quantity = float(row.get("quantity") or 0.0)
+    price = float(row.get("fill_price") or 0.0)
+    if not trade_id or not symbol or quantity <= 0 or price <= 0:
+        return False
+    from backend.database_schema import create_paper_trades_table
+
+    create_paper_trades_table(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        existing = conn.execute(
+            """
+            SELECT 1 FROM paper_trades
+            WHERE trade_id=?
+               OR (COALESCE(order_id,'')!='' AND order_id=? AND UPPER(side)='BUY')
+            LIMIT 1
+            """,
+            (trade_id, order_id),
+        ).fetchone()
+        if existing is not None:
+            return False
+        stamp = _now()
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}
+        payload = {
+            "trade_id": trade_id,
+            "paper_run_id": "custody_recovery",
+            "mode": "live",
+            "symbol": symbol,
+            "side": "BUY",
+            "quantity": quantity,
+            "price": price,
+            "remaining_position": quantity,
+            "fees_paid": float(row.get("fee") or 0.0),
+            "timestamp": stamp,
+            "entry_timestamp": stamp,
+            "status": "executed",
+            "order_id": order_id or None,
+            "engine_id": str(row.get("engine_id") or ""),
+            "decision_id": str(row.get("decision_id") or "") or None,
+        }
+        names = [name for name in payload if name in cols]
+        conn.execute(
+            f"INSERT INTO paper_trades ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
+            tuple(payload[name] for name in names),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 def open_rows(db_path: str) -> list[dict[str, Any]]:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row

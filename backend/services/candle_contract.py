@@ -12,7 +12,19 @@ from typing import Any
 
 UNIVERSE = ("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT")
 INTERVALS = ("1m", "3m", "5m", "15m", "1h", "4h")
-INTERVAL_SEC = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+INTERVAL_SEC = {
+    "1m": 60,
+    "3m": 180,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "8h": 28800,
+    "12h": 43200,
+    "1d": 86400,
+    "1w": 604800,
+}
 STALE_MULT = 2.0
 CONSUMERS = {
     "1m": "SCALP_V2",

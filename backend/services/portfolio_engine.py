@@ -9322,6 +9322,9 @@ class PortfolioEngine:
                         exchange_order_id=str(row["exchange_order_id"] or ""),
                     )
                 if owned:
+                    from backend.services.filled_asset_custody import ensure_canonical_buy_row
+
+                    ensure_canonical_buy_row(self.db_path, row)
                     mark(self.db_path, engine_id=engine_id, trade_id=trade_id, status=RECOVERED_ACTIVE_LOT, cash_applied=1)
                     continue
                 position = OpenPosition(
@@ -9343,6 +9346,9 @@ class PortfolioEngine:
                     status="ACTIVE",
                 )
                 await self._persist_position_to_sqlite(position)
+                from backend.services.filled_asset_custody import ensure_canonical_buy_row
+
+                ensure_canonical_buy_row(self.db_path, row)
                 debit = float(row["cash_debit"] or 0.0)
                 if debit > 0 and not int(row["cash_applied"] or 0):
                     with connect_rw(self.db_path) as conn:
@@ -11026,6 +11032,21 @@ class PortfolioEngine:
                 )
                 position.adaptive_decision = dict(adaptive_decision or {})
                 with contextlib.suppress(Exception):
+                    from backend.services.filled_asset_custody import remember as _remember_scalp_early
+
+                    _remember_scalp_early(
+                        self.db_path,
+                        engine_id=SCALP_V2_ENGINE_ID,
+                        symbol=norm,
+                        trade_id=trade_id,
+                        quantity=float(filled_qty),
+                        fill_price=float(fill_price),
+                        fee=float(fee or 0.0),
+                        cash_debit=float(total_cost),
+                        client_order_id=client_order_id,
+                        exchange_order_id=order_id,
+                    )
+                with contextlib.suppress(Exception):
                     from backend.services.trade_state import get_trade_state_store
 
                     get_trade_state_store().on_entry_fill(norm, float(fill_price), float(atr or 0.0), engine_id=SCALP_V2_ENGINE_ID)
@@ -12587,6 +12608,23 @@ class PortfolioEngine:
                         symbol,
                         live_order_buy.get("id"),
                         trade_id,
+                    )
+                # Custody is written before the rest of the open path. A crash
+                # after the venue fill still restores one paper BUY and one lot.
+                with contextlib.suppress(Exception):
+                    from backend.services.filled_asset_custody import remember as _remember_live_buy
+
+                    _remember_live_buy(
+                        self.db_path,
+                        engine_id=str(fill_engine_id or "DAY_V2"),
+                        symbol=symbol,
+                        trade_id=str(trade_id or ""),
+                        quantity=float(quantity),
+                        fill_price=float(fill_price),
+                        fee=float(fee or 0.0),
+                        cash_debit=float(total_cost),
+                        client_order_id=str(client_order_id or ""),
+                        exchange_order_id=str(live_order_buy.get("id") or ""),
                     )
                 if trailing_buy_intent_id:
                     try:
