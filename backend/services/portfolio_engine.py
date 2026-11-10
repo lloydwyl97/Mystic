@@ -4278,6 +4278,9 @@ class PortfolioEngine:
                 probe = getattr(self, "_last_sell_probe", None)
                 if isinstance(probe, dict):
                     snap["last_order_probe"] = probe
+                from backend.services.venue_order_budget import venue_order_budget
+
+                snap["venue_order_budget"] = venue_order_budget.snapshot()
                 payload["sell_protection"] = snap
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)

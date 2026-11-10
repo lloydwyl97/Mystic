@@ -55,6 +55,7 @@ LIVE_OUTCOME_EXPIRED_UNFILLED = "EXPIRED_UNFILLED"
 LIVE_OUTCOME_TIMEOUT_CANCELED_UNFILLED = "TIMEOUT_CANCELED_UNFILLED"
 LIVE_OUTCOME_EXCHANGE_REJECTED = "EXCHANGE_REJECTED"
 LIVE_OUTCOME_UNCONFIRMED = "ORDER_UNCONFIRMED"
+LIVE_OUTCOME_RATE_LIMITED = "RATE_LIMITED"
 _LIVE_ORDER_OUTCOME: contextvars.ContextVar[str] = contextvars.ContextVar("_LIVE_ORDER_OUTCOME", default="")
 
 
@@ -1131,6 +1132,10 @@ async def execute_protected_limit_live(
 
     # Try IOC first (full fill or cancel); fall back to GTC+timeout if unsupported.
     for tif in ("IOC", "GTC"):
+        if side_l == "sell" and tif == "IOC":
+            from backend.services.venue_order_budget import venue_order_budget
+
+            venue_order_budget.note_protective_attempt()
         attempt_cid = f"{base_cid}-{tif[0].lower()}"
         submit_ts = time.time()
         try:
@@ -1145,6 +1150,7 @@ async def execute_protected_limit_live(
                 price=limit_price,
                 client_order_id=attempt_cid,
                 time_in_force=tif,
+                priority="exit" if side_l == "sell" else "entry",
             )
         except TypeError:
             submit_ts = time.time()
@@ -1156,11 +1162,15 @@ async def execute_protected_limit_live(
                 amount=quantity,
                 price=limit_price,
                 client_order_id=attempt_cid,
+                priority="exit" if side_l == "sell" else "entry",
             )
         except Exception as ex:
             logger.warning("PROTECTED_LIMIT_LIVE place failed tif=%s %s: %s", tif, exchange_symbol, ex)
             result = None
 
+        if isinstance(result, dict) and result.get("rate_limited"):
+            _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_RATE_LIMITED)
+            return None
         if not result or result.get("status") != "success":
             if tif != "IOC":
                 _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_EXCHANGE_REJECTED)
@@ -1222,6 +1232,10 @@ async def execute_protected_limit_live(
                 return order
             rejected = str(order.get("status") or "").lower() == "rejected"
             _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_EXCHANGE_REJECTED if rejected else LIVE_OUTCOME_EXPIRED_UNFILLED)
+            if side_l == "sell":
+                from backend.services.venue_order_budget import venue_order_budget
+
+                venue_order_budget.note_protective_zero_fill()
             return None
 
         deadline = time.time() + timeout

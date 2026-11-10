@@ -4,6 +4,7 @@ Connects to the real Binance.US trading API for live order execution.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import logging
@@ -233,6 +234,10 @@ class LiveTradingService:
             logger.info("[INFO] Live trading will remain disabled")
             self.binance = None
 
+        with contextlib.suppress(Exception):
+            from backend.services.venue_order_budget import venue_order_budget
+
+            await venue_order_budget.ensure_limits()
         return self.authenticated
         # BUG #L4 FIX: Removed unreachable dead code block (was after return statement)
         # The cache attributes are already initialized in __init__ (lines 118-120)
@@ -626,11 +631,13 @@ class LiveTradingService:
         price: float | None = None,
         client_order_id: str | None = None,
         time_in_force: str | None = None,
+        *,
+        priority: str = "entry",
     ) -> dict[str, Any]:
         """Place a new spot order on Binance.US. Accepts exchange EXCHANGE_ID (or 'binance' for back-compat)."""
         _mark_order_activity(self, symbol, +1)
         try:
-            return await LiveTradingService._place_order_unfenced(self, exchange, symbol, order_type, side, amount, price, client_order_id, time_in_force)
+            return await LiveTradingService._place_order_unfenced(self, exchange, symbol, order_type, side, amount, price, client_order_id, time_in_force, priority)
         finally:
             _mark_order_activity(self, symbol, -1)
 
@@ -644,8 +651,12 @@ class LiveTradingService:
         price: float | None,
         client_order_id: str | None,
         time_in_force: str | None,
+        priority: str = "entry",
     ) -> dict[str, Any]:
         try:
+            from backend.services.venue_order_budget import venue_order_budget
+
+            await venue_order_budget.acquire(priority)
             # Lazy init - connect to Binance only when placing first trade
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
@@ -683,6 +694,17 @@ class LiveTradingService:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         except Exception as e:
+            from backend.services.venue_order_budget import is_venue_rate_limit, venue_order_budget
+
+            if is_venue_rate_limit(e):
+                venue_order_budget.note_rate_limit(e)
+                logger.warning("VENUE_ORDER_RATE_LIMIT %s %s %s", side, symbol, str(e)[:200])
+                return {
+                    "status": "error",
+                    "message": str(e),
+                    "rate_limited": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
             err_str = str(e)
             FILTER_ERR_HINTS = ("LOT_SIZE", "MIN_NOTIONAL", "PRICE_FILTER", "-1013")
             if any(h in err_str for h in FILTER_ERR_HINTS):

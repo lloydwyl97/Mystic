@@ -70,6 +70,9 @@ def is_mandatory_day_flatten(
     et = str(exit_type_name or "").strip().upper()
     if "TP1" in trig or et == "TAKE_PROFIT_1":
         return False
+    # A learned exit is recomputed on the next pass. It is not a sticky flatten.
+    if "LEARNED_CONTINUATION" in trig:
+        return False
     # DAY_V2/SCALP_V2 exits keep their own trigger (e.g. SCALP_V2_NET_PROFIT);
     # a forced strategy exit is a full flatten whatever the trigger says.
     if force_sell and et == "STRATEGY":
@@ -283,6 +286,12 @@ async def run_mandatory_exit_ioc_loop(
             out.abandoned_reason = "no_executable_chunk"
             continue
         order = stamp_preflight(await place_ioc(chunk, limit), pf)
+        from backend.services.protected_limit_execution import LIVE_OUTCOME_RATE_LIMITED, last_live_order_outcome
+
+        if last_live_order_outcome() == LIVE_OUTCOME_RATE_LIMITED:
+            out.abandoned_reason = "venue_rate_limit"
+            logger.warning("MANDATORY_EXIT_RATE_LIMIT attempt=%s remaining=%.8f", i + 1, remaining)
+            break
         filled = float((order or {}).get("filled") or 0.0)
         if order is None or filled <= 0:
             logger.warning(
