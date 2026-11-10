@@ -2563,6 +2563,25 @@ class PriceCache:
         self._timestamps.clear()
 
 
+def _unresolved_sell_intent(db_path: str, symbol: str) -> bool:
+    """True when a SELL for this symbol was sent and the venue has not classified it."""
+    try:
+        from backend.services.strategy_order_intent import intents_to_probe
+    except Exception:
+        return False
+    want = normalize_symbol(symbol)
+    try:
+        pending = intents_to_probe(db_path)
+    except Exception:
+        return False
+    for intent in pending:
+        if str(intent.get("side") or "").upper() != "SELL":
+            continue
+        if normalize_symbol(str(intent.get("symbol") or "")) == want:
+            return True
+    return False
+
+
 def read_reconcile_state() -> dict[str, Any]:
     """Last startup/reconcile file written by the trading process. Empty when absent."""
     path = os.getenv("MYSTIC_RECONCILE_STATE_FILE", "/home/mystic/mystic/logs/mystic_live_reconcile.json")
@@ -13951,6 +13970,14 @@ class PortfolioEngine:
                 "SELL_HELD_OWNERSHIP_UNKNOWN symbol=%s qty=%.8f trigger=%s — exit evaluated, venue quantity not reconciled",
                 symbol,
                 float(quantity or 0.0),
+                exit_trigger,
+            )
+            return None
+        db_path = getattr(self, "db_path", None)
+        if db_path and _unresolved_sell_intent(str(db_path), symbol):
+            logger.warning(
+                "SELL_HELD_UNRESOLVED_INTENT symbol=%s trigger=%s — prior SELL is not filled, open, or proven absent",
+                symbol,
                 exit_trigger,
             )
             return None

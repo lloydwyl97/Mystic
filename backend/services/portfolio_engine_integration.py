@@ -260,6 +260,7 @@ class PortfolioEngineIntegration:
         # for the first exit pass.
         self._exit_protection_ready = asyncio.Event()
         self._exit_protection_ready.set()
+        self._exit_cycle_wake = asyncio.Event()
 
         # Price cache for monitoring
         self.current_prices: dict[str, float] = {}
@@ -3055,6 +3056,7 @@ class PortfolioEngineIntegration:
         engine = self.engine
         if engine is None:
             return
+        known_before = bool(getattr(engine, "_ownership_state_known", False))
         try:
             await engine._recover_strategy_order_intents()
         except Exception:
@@ -3064,6 +3066,8 @@ class PortfolioEngineIntegration:
         except Exception:
             logger.exception("LIVE_BOOTSTRAP_RECONCILE_FAILED")
         engine._startup_exchange_recovery_pending = False
+        if not known_before and bool(getattr(engine, "_ownership_state_known", False)):
+            self._wake_exit_monitor()
 
     async def _purge_stale_bd_exit_hard_pause_state(self) -> None:
         """Remove Redis hard-pause alerts and in-memory pause state left by the old ``bd`` NameError.
@@ -3140,6 +3144,12 @@ class PortfolioEngineIntegration:
 
             logger.warning(f"EXIT_FAILED: {symbol} failure #{failure_count} - cooldown for {cooldown_seconds}s | Error: {error_msg}")
 
+    def _wake_exit_monitor(self) -> None:
+        """Run another exit pass without waiting out the 45s cadence."""
+        event = getattr(self, "_exit_cycle_wake", None)
+        if event is not None:
+            event.set()
+
     def _has_active_scalp_lot(self) -> bool:
         if not self.engine:
             return False
@@ -3154,11 +3164,25 @@ class PortfolioEngineIntegration:
 
         fast = max(0.5, float(SCALP_V2_EXIT_MONITOR_INTERVAL_SEC))
         deadline = time.monotonic() + max(0.0, float(wait_sec))
+        wake = getattr(self, "_exit_cycle_wake", None)
         while self.is_running:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            await asyncio.sleep(min(fast, remaining))
+            if wake is not None and wake.is_set():
+                wake.clear()
+                return
+            slice_sec = min(fast, remaining)
+            if wake is None:
+                await asyncio.sleep(slice_sec)
+            else:
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=slice_sec)
+                except TimeoutError:
+                    pass
+                else:
+                    wake.clear()
+                    return
             if time.monotonic() >= deadline:
                 return
             if self._has_active_scalp_lot():
@@ -3745,6 +3769,9 @@ class PortfolioEngineIntegration:
                     await asyncio.sleep(120)
                     continue
                 live_svc = self.engine._live_service
+                known_before = bool(getattr(self.engine, "_ownership_state_known", False))
+                with contextlib.suppress(Exception):
+                    await self.engine._recover_strategy_order_intents()
                 balance_result = await live_svc.get_balance("binanceus", force_refresh=True)
                 logger.info("LIVE_RECONCILE: balance_fetch binanceus (one per run)")
                 if balance_result.get("status") != "success":
@@ -3759,6 +3786,8 @@ class PortfolioEngineIntegration:
                     free_balances=free_balances,
                     snapshot_ts=balance_result.get("fetched_at"),
                 )
+                if not known_before and bool(getattr(self.engine, "_ownership_state_known", False)):
+                    self._wake_exit_monitor()
             except asyncio.CancelledError:
                 break
             except Exception as e:
