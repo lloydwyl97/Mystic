@@ -908,8 +908,18 @@ async def get_portfolio_status() -> dict[str, Any]:
         try:
             from backend.database_schema import DATABASE_PATH
             from backend.services.continuation_checkpoint import checkpoint_status
+            from backend.services.portfolio_engine import read_reconcile_state
 
             status["continuation_checkpoint"] = await asyncio.to_thread(checkpoint_status, str(DATABASE_PATH))
+            recovery = await asyncio.to_thread(read_reconcile_state)
+            status["startup_recovery_complete"] = recovery.get("startup_recovery_complete")
+            status["account_reconciliation_status"] = recovery.get("account_reconciliation_status")
+            status["first_exit_pass_complete"] = recovery.get("first_exit_pass_complete")
+            status["protection_ready"] = recovery.get("protection_ready")
+            status["entry_ready"] = recovery.get("entry_ready")
+            if recovery.get("account_reconciliation_status") not in (None, "ok") and status.get("effective_entry_permitted"):
+                status["effective_entry_permitted"] = False
+                status["entry_block_reason"] = "ACCOUNT_RECONCILIATION_" + str(recovery.get("account_reconciliation_status")).upper()
         except Exception as exc:
             status["continuation_checkpoint"] = {"error": str(exc)[:200]}
 

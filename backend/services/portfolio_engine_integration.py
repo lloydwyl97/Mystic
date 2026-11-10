@@ -385,6 +385,8 @@ class PortfolioEngineIntegration:
         if not hasattr(self, "_monitor_task") or self._monitor_task is None:
             self._exit_protection_ready_event().clear()
             self._monitor_task = asyncio.create_task(self._position_monitor_loop(), name="portfolio_engine:monitor")
+            if self.engine is not None and getattr(self.engine, "_startup_exchange_recovery_pending", False):
+                self._exchange_recovery_task = asyncio.create_task(self._run_startup_exchange_recovery(), name="portfolio_engine:exchange_recovery")
             self._bar_processor_task = asyncio.create_task(self._bar_processor_loop(), name="portfolio_engine:bar_processor")
             self._trailing_buy_task = asyncio.create_task(self._trailing_buy_loop(), name="portfolio_engine:trailing_buy")
             # CRITICAL FIX: Start signal consumption loop - this was MISSING!
@@ -3048,6 +3050,21 @@ class PortfolioEngineIntegration:
             except asyncio.CancelledError:
                 break
 
+    async def _run_startup_exchange_recovery(self) -> None:
+        """Probe lost order intents, then reconcile the account. Does not block exits."""
+        engine = self.engine
+        if engine is None:
+            return
+        try:
+            await engine._recover_strategy_order_intents()
+        except Exception:
+            logger.exception("STRATEGY_INTENT_RECOVERY_FAILED")
+        try:
+            await engine._live_bootstrap_reconcile()
+        except Exception:
+            logger.exception("LIVE_BOOTSTRAP_RECONCILE_FAILED")
+        engine._startup_exchange_recovery_pending = False
+
     async def _purge_stale_bd_exit_hard_pause_state(self) -> None:
         """Remove Redis hard-pause alerts and in-memory pause state left by the old ``bd`` NameError.
 
@@ -3149,7 +3166,6 @@ class PortfolioEngineIntegration:
 
     async def _position_monitor_loop(self) -> None:
         """Monitor positions and execute exits"""
-        await self._purge_stale_bd_exit_hard_pause_state()
         logger.info("EXIT_MONITOR_LOOP interval_sec=%s", self._exit_monitor_interval)
         first_pass = True
         while self.is_running:
@@ -3158,6 +3174,10 @@ class PortfolioEngineIntegration:
                 if first_pass:
                     first_pass = False
                     self._exit_protection_ready_event().set()
+                    if self.engine is not None and hasattr(self.engine, "note_first_exit_pass"):
+                        with contextlib.suppress(Exception):
+                            self.engine.note_first_exit_pass()
+                    await self._purge_stale_bd_exit_hard_pause_state()
                 if self.engine is not None:
                     try:
                         from backend.config.research_flags import policy_research_enabled

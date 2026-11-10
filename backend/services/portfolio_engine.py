@@ -2563,11 +2563,24 @@ class PriceCache:
         self._timestamps.clear()
 
 
+def read_reconcile_state() -> dict[str, Any]:
+    """Last startup/reconcile file written by the trading process. Empty when absent."""
+    path = os.getenv("MYSTIC_RECONCILE_STATE_FILE", "/home/mystic/mystic/logs/mystic_live_reconcile.json")
+    try:
+        payload = json.loads(Path(path).read_text())
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _reconcile_state_is_fresh(max_age_sec: float = 180.0) -> bool:
     """The trading process writes this file; the API process does not reconcile."""
     path = os.getenv("MYSTIC_RECONCILE_STATE_FILE", "/home/mystic/mystic/logs/mystic_live_reconcile.json")
     try:
         payload = json.loads(Path(path).read_text())
+        status = str(payload.get("account_reconciliation_status") or "ok")
+        if status != "ok":
+            return False
         return time.time() - float(payload.get("time_epoch") or 0.0) <= max_age_sec
     except (OSError, ValueError, TypeError):
         return False
@@ -2988,19 +3001,23 @@ class PortfolioEngine:
                     self._live_execution_enabled = False
                     self._live_service = None
 
-            # LIVE_BOOTSTRAP_RECONCILE: Binance is canonical. Align DB to exchange before invariants.
+            # Exchange account, order probes, and mark refresh run after the exit
+            # monitor is armed. A slow Binance call must not delay the first exit pass.
+            # Buys and sells stay blocked until that reconcile marks ownership known.
             if self._live_execution_enabled and self._live_service:
-                try:
-                    await self._recover_strategy_order_intents()
-                except Exception:
-                    logger.exception("STRATEGY_INTENT_RECOVERY_FAILED")
-                await self._live_bootstrap_reconcile()
+                self._startup_exchange_recovery_pending = True
+                self._ownership_state_known = False
+                self._account_reconciliation_status = "pending"
+                self._write_reconcile_state_file("startup_pending", account_status="pending")
+            else:
+                self._startup_exchange_recovery_pending = False
 
             # CRITICAL: Sync with PaperTradingService to remove stale/dead positions
             await self._sync_positions_with_paper_service()
 
-            # CRITICAL: Recalculate positions_value and unrealized_pnl from loaded positions
-            await self._recompute_positions_values()
+            # Local marks only. Live book refresh belongs to the exit monitor and
+            # the deferred exchange reconcile, not to this blocking startup path.
+            await self._recompute_positions_values(allow_network_mtm=False)
 
             # Compute derived values
             self._compute_total_open_risk()
@@ -3223,6 +3240,9 @@ class PortfolioEngine:
             logger.info("LIVE_BOOTSTRAP_RECONCILE: balance_fetch binanceus (one per run)")
             if balance_result.get("status") != "success":
                 logger.warning("LIVE_BOOTSTRAP_RECONCILE: Could not fetch Binance balance, skipping")
+                self._account_reconciliation_status = "unavailable"
+                self._ownership_state_known = False
+                self._write_reconcile_state_file("startup_unavailable", account_status="unavailable")
                 return
             balance_data = balance_result.get("balance", {}) or {}
             total_balances = balance_data.get("total", {}) or {}
@@ -3354,9 +3374,14 @@ class PortfolioEngine:
             self._last_live_reconcile_time = time.time()
             self._last_live_reconcile_actions = "bootstrap"
             self._ownership_state_known = True
-            self._write_reconcile_state_file("bootstrap")
+            self._account_reconciliation_status = "ok"
+            self._write_reconcile_state_file("bootstrap", account_status="ok")
         except Exception as e:
             logger.exception("LIVE_BOOTSTRAP_RECONCILE: %s", e)
+            self._account_reconciliation_status = "unavailable"
+            self._ownership_state_known = False
+            with contextlib.suppress(Exception):
+                self._write_reconcile_state_file("startup_unavailable", account_status="unavailable")
 
     async def _import_missing_exchange_positions(
         self,
@@ -4188,7 +4213,15 @@ class PortfolioEngine:
         )
         return True
 
-    def _write_reconcile_state_file(self, actions: str) -> None:
+    def note_first_exit_pass(self) -> None:
+        """The exit loop has evaluated the loaded book once. Does not permit entries."""
+        self._first_exit_pass_complete = True
+        status = str(getattr(self, "_account_reconciliation_status", "") or "")
+        if not status:
+            status = "ok" if getattr(self, "_ownership_state_known", False) else "pending"
+        self._write_reconcile_state_file(getattr(self, "_last_live_reconcile_actions", None) or "startup", account_status=status)
+
+    def _write_reconcile_state_file(self, actions: str, *, account_status: str = "ok") -> None:
         """Write last reconcile time/actions to a file for read-only harness (LIVE_RECONCILE_PROOF). Single known path."""
         path = os.getenv(
             "MYSTIC_RECONCILE_STATE_FILE",
@@ -4199,10 +4232,16 @@ class PortfolioEngine:
             if parent:
                 Path(parent).mkdir(parents=True, exist_ok=True)
             now_utc = datetime.now(timezone.utc).isoformat()
+            protection = bool(getattr(self, "_first_exit_pass_complete", False))
             payload = {
                 "time_epoch": time.time(),
                 "time_utc": now_utc,
                 "actions": actions,
+                "account_reconciliation_status": account_status,
+                "startup_recovery_complete": True,
+                "first_exit_pass_complete": protection,
+                "protection_ready": protection,
+                "entry_ready": account_status == "ok" and protection,
             }
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)
@@ -13907,6 +13946,14 @@ class PortfolioEngine:
         engine_id: str = "",
     ) -> dict[str, Any] | None:
         """Serialize sells per symbol, then run the FIFO sell."""
+        if getattr(self, "_live_execution_enabled", False) and not getattr(self, "_ownership_state_known", True):
+            logger.warning(
+                "SELL_HELD_OWNERSHIP_UNKNOWN symbol=%s qty=%.8f trigger=%s — exit evaluated, venue quantity not reconciled",
+                symbol,
+                float(quantity or 0.0),
+                exit_trigger,
+            )
+            return None
         locks = getattr(self, "_sell_execution_locks", None)
         if locks is None:
             self._sell_execution_locks = {}
