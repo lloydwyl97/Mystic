@@ -3523,10 +3523,13 @@ class PortfolioEngineIntegration:
                     from backend.utils.binance_weight_limiter import BinanceWeightLimiter
 
                     limiter = await BinanceWeightLimiter.create()
-                    await limiter.consume("/api/v3/account", weight=10, wait=True, timeout=8.0)
+                    await limiter.consume("/api/v3/account", weight=20, wait=True, timeout=8.0)
 
                     async with httpx.AsyncClient(timeout=15.0) as client:
                         response = await client.get(f"https://api.binance.us/api/v3/account?{query_string}&signature={signature}", headers={"X-MBX-APIKEY": api_key})
+                        from backend.utils.binance_weight_limiter import observe_headers
+
+                        await observe_headers(getattr(response, "headers", None))
 
                         if response.status_code == 200:
                             data = response.json()
@@ -3719,6 +3722,9 @@ class PortfolioEngineIntegration:
                 signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
                 await limiter.consume(path, weight=1, wait=True, timeout=8.0)
                 resp = await client.get(f"https://api.binance.us{path}?{query}&signature={signature}", headers={"X-MBX-APIKEY": api_key})
+                from backend.utils.binance_weight_limiter import observe_headers
+
+                await observe_headers(getattr(resp, "headers", None))
                 if resp.status_code != 200:
                     logger.warning("EXTERNAL_CAPITAL_FLOW_READ_FAILED path=%s status=%s", path, resp.status_code)
                     return

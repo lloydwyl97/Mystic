@@ -131,6 +131,9 @@ class VenueOrderBudget:
     async def ensure_limits(self) -> None:
         if self._loaded:
             return
+        charged = await _charge_request_weight("/api/v3/exchangeInfo", 20, wait=True, timeout=12.0)
+        if not charged:
+            logger.warning("VENUE_ORDER_LIMITS_WEIGHT_UNAVAILABLE")
         try:
             payload = await asyncio.to_thread(_fetch_exchange_limits)
         except Exception:
@@ -280,6 +283,10 @@ class VenueOrderBudget:
             with self._lock:
                 snapshot_id = self._next_id
                 day_at_snapshot = self._day_count
+            charged = await _charge_request_weight("/api/v3/rateLimit/order", 40, wait=False, timeout=0.0)
+            if not charged:
+                logger.warning("VENUE_ORDER_USAGE_WEIGHT_UNAVAILABLE")
+                return False
             try:
                 rows = await asyncio.to_thread(_fetch_order_usage)
             except Exception:
@@ -407,6 +414,9 @@ def _fetch_order_usage() -> list[dict[str, Any]]:
         headers={"X-MBX-APIKEY": api_key},
     )
     with urllib.request.urlopen(request, timeout=10) as response:
+        from backend.utils.binance_weight_limiter import observe_headers_sync
+
+        observe_headers_sync(response.headers)
         payload = json.loads(response.read().decode())
     return payload if isinstance(payload, list) else []
 
@@ -414,9 +424,24 @@ def _fetch_order_usage() -> list[dict[str, Any]]:
 def _fetch_exchange_limits() -> list[dict[str, Any]]:
     url = os.getenv("BINANCEUS_EXCHANGE_INFO_URL", "https://api.binance.us/api/v3/exchangeInfo?symbol=BTCUSDT")
     with urllib.request.urlopen(url, timeout=10) as resp:
+        from backend.utils.binance_weight_limiter import observe_headers_sync
+
+        observe_headers_sync(resp.headers)
         payload = json.loads(resp.read().decode())
     limits = payload.get("rateLimits")
     return limits if isinstance(limits, list) else []
+
+
+async def _charge_request_weight(path: str, weight: int, *, wait: bool, timeout: float) -> bool:
+    try:
+        from backend.utils.binance_weight_limiter import BinanceWeightLimiter
+
+        limiter = await BinanceWeightLimiter.create()
+        await limiter.consume(path, weight=weight, wait=wait, timeout=timeout)
+    except Exception:
+        logger.warning("REQUEST_WEIGHT_CHARGE_FAILED path=%s weight=%s", path, weight)
+        return False
+    return True
 
 
 venue_order_budget = VenueOrderBudget(state_path=os.getenv("MYSTIC_VENUE_ORDER_BUDGET_STATE", "/home/mystic/mystic/logs/venue_order_budget.json"))

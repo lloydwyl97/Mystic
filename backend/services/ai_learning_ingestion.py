@@ -626,9 +626,15 @@ def _fetch_historical_klines_rest(
     try:
         import httpx
 
+        from backend.utils.binance_weight_limiter import kline_request_weight, observe_headers_sync, try_consume_sync
+
+        if not try_consume_sync("/api/v3/klines", kline_request_weight(1000)):
+            logger.warning("FORWARD_LABEL_REST_WEIGHT_UNAVAILABLE %s %s", sym_bus, interval)
+            return []
         url = f"https://api.binance.us/api/v3/klines?symbol={sym_bus}&interval={interval}&startTime={int(start_ms)}&endTime={int(end_ms)}&limit=1000"
         with httpx.Client(timeout=timeout_sec) as client:
             resp = client.get(url)
+            observe_headers_sync(resp.headers)
             resp.raise_for_status()
             rows = resp.json()
         if not isinstance(rows, list):

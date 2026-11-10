@@ -436,12 +436,15 @@ class LiveMarketDataService:
 
                             await limiter.consume(
                                 "/api/v3/ticker/24hr",
-                                weight=1,
+                                weight=2,
                                 wait=True,
                                 timeout=LIMITER_CONSUME_TIMEOUT_LOOP,
                             )
                             async with httpx.AsyncClient() as client:
                                 response = await client.get(url, params=params, timeout=10.0)
+                                from backend.utils.binance_weight_limiter import observe_headers
+
+                                await observe_headers(getattr(response, "headers", None))
                                 response.raise_for_status()
                                 data = response.json()
 
@@ -545,12 +548,15 @@ class LiveMarketDataService:
 
                             await limiter.consume(
                                 "/api/v3/klines",
-                                weight=1,
+                                weight=2,
                                 wait=True,
                                 timeout=LIMITER_CONSUME_TIMEOUT_LOOP,
                             )
                             async with httpx.AsyncClient() as client:
                                 response = await client.get(url, params=params, timeout=10.0)
+                                from backend.utils.binance_weight_limiter import observe_headers
+
+                                await observe_headers(getattr(response, "headers", None))
                                 response.raise_for_status()
                                 klines_data = response.json()
 
@@ -655,12 +661,15 @@ class LiveMarketDataService:
 
                 await limiter.consume(
                     "/api/v3/ticker/24hr",
-                    weight=1,
+                    weight=2,
                     wait=True,
                     timeout=LIMITER_CONSUME_TIMEOUT_LOOP,
                 )
                 async with httpx.AsyncClient() as client:
                     response = await client.get(url, params=params, timeout=10.0)
+                    from backend.utils.binance_weight_limiter import observe_headers
+
+                    await observe_headers(getattr(response, "headers", None))
                     response.raise_for_status()
                     data = response.json()
 
@@ -841,13 +850,18 @@ class LiveMarketDataService:
                 params["endTime"] = max(0, int(end_time_ms))
 
             limiter = await self._get_limiter()
+            from backend.utils.binance_weight_limiter import kline_request_weight, observe_headers
+
             await limiter.consume(
                 "/api/v3/klines",
-                weight=1,
+                weight=kline_request_weight(int(limit)),
                 wait=True,
                 timeout=LIMITER_CONSUME_TIMEOUT_CRITICAL,
             )
-            data = await canonical_http_client.get_json(url, params=params)
+            response = await canonical_http_client.make_request("GET", url, params=params)
+            await observe_headers(getattr(response, "headers", None))
+            response.raise_for_status()
+            data = response.json()
 
             ohlcv = []
             for kline in data:
@@ -937,8 +951,16 @@ class LiveMarketDataService:
 
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
         s = _to_ccxt_symbol(symbol)
+        from backend.utils.binance_weight_limiter import RateLimited, depth_request_weight, observe_headers_sync, try_consume_sync
+
         try:
+            if _PUBLIC_BOOK_CLIENT is None or not getattr(_PUBLIC_BOOK_CLIENT, "markets", None):
+                if not try_consume_sync("/api/v3/exchangeInfo", 20):
+                    raise RateLimited("exchangeInfo weight unavailable")
+            if not try_consume_sync("/api/v3/depth", depth_request_weight(limit)):
+                raise RateLimited("depth weight unavailable")
             ob, call_started, received_ts, sent_ms = await asyncio.to_thread(_fetch_public_order_book, s, limit)
+            observe_headers_sync(getattr(_PUBLIC_BOOK_CLIENT, "last_response_headers", None))
             # Binance.US REST depth carries lastUpdateId but no event time. The
             # depth request's send time is the oldest the snapshot can be.
             request_sent_ts = call_started
@@ -954,6 +976,9 @@ class LiveMarketDataService:
                 "request_sent_ts": request_sent_ts,
                 "received_ts": received_ts,
             }
+        except RateLimited as e:
+            logger.warning("ORDER_BOOK_WEIGHT_REFUSED %s: %s", s, e)
+            return {"bids": [], "asks": [], "fetch_failed": True, "error": str(e)}
         except (
             ValueError,
             TypeError,

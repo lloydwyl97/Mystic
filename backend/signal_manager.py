@@ -172,13 +172,16 @@ async def _fetch_klines(symbol: str, interval: str = "1m", limit: int = 200) -> 
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            await _sig_limiter.consume("/api/v3/klines", weight=1, wait=True, timeout=10.0)
+            from backend.utils.binance_weight_limiter import kline_request_weight, observe_headers
+
+            await _sig_limiter.consume("/api/v3/klines", weight=kline_request_weight(int(limit)), wait=True, timeout=10.0)
             async with _sig_sem:
                 r = await _sig_client.get(
                     f"{BINANCE_US_BASE}/api/v3/klines",
                     params={"symbol": symbol, "interval": interval, "limit": limit},
                     timeout=10,
                 )
+                await observe_headers(getattr(r, "headers", None))
                 if r.status_code == 429:
                     retry_after = r.headers.get("Retry-After")
                     base_sleep = float(retry_after) if retry_after else (2.0**attempt)
@@ -212,16 +215,21 @@ async def _fetch_ticker24(symbol: str) -> dict[str, Any]:
 
 
 async def _fetch_order_book(symbol: str, limit: int = 100) -> dict[str, Any]:
-    if get_http_client is None:
+    if get_http_client is None or BinanceWeightLimiter is None:
         msg = "get_http_client not available"
         raise RuntimeError(msg)
 
+    from backend.utils.binance_weight_limiter import depth_request_weight, observe_headers
+
+    limiter = await BinanceWeightLimiter.create()
+    await limiter.consume("/api/v3/depth", weight=depth_request_weight(limit), wait=True, timeout=10.0)
     client = await get_http_client()
     r = await client.get(
         f"{BINANCE_US_BASE}/api/v3/depth",
         params={"symbol": symbol, "limit": limit},
         timeout=10,
     )
+    await observe_headers(getattr(r, "headers", None))
     r.raise_for_status()
     return r.json()
 

@@ -199,11 +199,14 @@ class LiveTradingService:
             # Test authentication with actual API call
             try:
                 if hasattr(self.binance, "fetch_balance"):
-                    # ================================================================
-                    # PHASE 3 FIX #3: ADD MISSING AWAIT ON CCXT CALL
-                    # ================================================================
-                    # fetch_balance() is synchronous but blocking - wrap with asyncio.to_thread
+                    try:
+                        await self._charge_weight("/api/v3/account", 20)
+                    except (RateLimitedError, CircuitOpenError):
+                        self._initialized = False
+                        logger.warning("LIVE_INIT_WEIGHT_DEFERRED")
+                        return False
                     test_balance = await asyncio.to_thread(self.binance.fetch_balance)
+                    await self._note_exchange_weight()
                     if test_balance:
                         self.authenticated = True
                         logger.info("[OK] Live trading service authenticated successfully")
@@ -252,6 +255,18 @@ class LiveTradingService:
                 self._limiter = await BinanceWeightLimiter.create()
         return self._limiter
 
+    async def _charge_weight(self, path: str, weight: int, *, wait: bool = True, timeout: float = 5.0) -> None:
+        limiter = await self._get_limiter()
+        await limiter.consume(path, weight=weight, wait=wait, timeout=timeout)
+
+    async def _note_response_weight(self, headers: Any) -> None:
+        from backend.utils.binance_weight_limiter import observe_headers
+
+        await observe_headers(headers)
+
+    async def _note_exchange_weight(self) -> None:
+        await self._note_response_weight(getattr(self.binance, "last_response_headers", None))
+
     async def get_account_balance(self) -> dict[str, Any]:
         """Get account balance from Binance.US (if configured) - with 30s cache."""
         try:
@@ -277,6 +292,7 @@ class LiveTradingService:
                     api_secret = self.binance_secret
 
                     if api_key and api_secret:
+                        await self._charge_weight("/api/v3/account", 20)
                         # Build request parameters
                         timestamp = int(time.time() * 1000)
                         query_string = f"timestamp={timestamp}&recvWindow=10000"
@@ -295,6 +311,7 @@ class LiveTradingService:
 
                         # Make request
                         response = await canonical_http_client.make_request("GET", url, headers=headers)
+                        await self._note_response_weight(getattr(response, "headers", None))
 
                         # Check for HTTP errors
                         if response.status_code != 200:
@@ -436,7 +453,10 @@ class LiveTradingService:
             logger.warning("get_symbol_constraints: Binance client not available")
             return out
         try:
+            if force_refresh or not getattr(self.binance, "markets", None):
+                await self._charge_weight("/api/v3/exchangeInfo", 20)
             await asyncio.to_thread(self.binance.load_markets, force_refresh)
+            await self._note_exchange_weight()
         except Exception as e:
             logger.exception("get_symbol_constraints: load_markets failed: %s", e)
             return out
@@ -522,12 +542,11 @@ class LiveTradingService:
             if self.binance:
                 try:
                     limiter = await self._get_limiter()
-                    # CRITICAL FIX: Fetch ALL open orders in ONE API call (5 weight total)
-                    # Instead of looping 10 symbols x 5 weight = 50 weight
-                    # This reduces API weight by 90% (50 -> 5)
-                    await limiter.consume("/api/v3/openOrders", weight=5, wait=True, timeout=5.0)
-                    # Fetch all open orders without symbol filter (gets all pairs)
+                    # One unsigned-symbol openOrders call. Measured weight is 85.
+                    await limiter.consume("/api/v3/openOrders", weight=85, wait=True, timeout=5.0)
+                    # All symbols: measured request weight is 85, not the one-symbol cost.
                     binance_orders = await asyncio.to_thread(self.binance.fetch_open_orders)
+                    await self._note_exchange_weight()
 
                     orders[EXCHANGE_ID] = [
                         {
@@ -543,7 +562,7 @@ class LiveTradingService:
                         for o in binance_orders
                         if isinstance(o, dict)
                     ]
-                    logger.debug(f"Fetched {len(binance_orders)} open orders with single API call (5 weight)")
+                    logger.debug("Fetched %s open orders in one call (weight 85)", len(binance_orders))
                 except (RateLimitedError, CircuitOpenError) as e:
                     logger.warning(f"Rate limited fetching open orders: {e}")
                     orders[EXCHANGE_ID] = []
@@ -655,26 +674,45 @@ class LiveTradingService:
     ) -> dict[str, Any]:
         try:
             from backend.services.venue_order_budget import venue_order_budget
+            from backend.utils.binance_weight_limiter import ORDER_SUBMIT_WEIGHT
 
-            await venue_order_budget.acquire(priority)
-            # Lazy init - connect to Binance only when placing first trade
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
+                try:
+                    if not getattr(self.binance, "markets", None):
+                        await self._charge_weight("/api/v3/exchangeInfo", 20)
+                    await self._charge_weight("/api/v3/order", ORDER_SUBMIT_WEIGHT)
+                except (RateLimitedError, CircuitOpenError) as e:
+                    return {
+                        "status": "error",
+                        "message": str(e),
+                        "rate_limited": True,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                await venue_order_budget.acquire(priority)
                 pair = _to_binance_pair(symbol)
                 params: dict[str, Any] = {}
                 if client_order_id:
                     params["clientOrderId"] = client_order_id
                 if time_in_force and str(order_type).lower() == "limit":
                     params["timeInForce"] = time_in_force
-                order = await asyncio.to_thread(
-                    self.binance.create_order,
-                    symbol=pair,
-                    type=order_type,
-                    side=side,
-                    amount=amount,
-                    price=price,
-                    params=params,
-                )
+                limiter = await self._get_limiter()
+                if priority == "exit":
+                    await limiter.mark_protective_pending(1)
+                try:
+                    order = await asyncio.to_thread(
+                        self.binance.create_order,
+                        symbol=pair,
+                        type=order_type,
+                        side=side,
+                        amount=amount,
+                        price=price,
+                        params=params,
+                    )
+                    await self._note_exchange_weight()
+                finally:
+                    if priority == "exit":
+                        await limiter.mark_protective_pending(-1)
                 return {
                     "status": "success",
                     "order": _order_fill_payload(order),
@@ -729,6 +767,7 @@ class LiveTradingService:
         try:
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
+                await self._charge_weight("/api/v3/order", 4)
                 pair = _to_binance_pair(symbol)
                 extra = dict(params or {})
                 ref = str(order_id or "").strip()
@@ -742,6 +781,7 @@ class LiveTradingService:
                         pair,
                         {"origClientOrderId": cid},
                     )
+                await self._note_exchange_weight()
                 return {
                     "status": "success",
                     "order": _order_fill_payload(order),
@@ -755,7 +795,12 @@ class LiveTradingService:
             elif "code" in msg and "-1100" in msg:
                 code = "-1100"
             logger.info("fetch_order ref=%s code=%s err=%s", order_id, code or "?", msg[:200])
-            return {"status": "error", "message": msg, "code": code}
+            return {
+                "status": "error",
+                "message": msg,
+                "code": code,
+                "rate_limited": isinstance(e, (RateLimitedError, CircuitOpenError)),
+            }
 
     async def fetch_order_trades(self, exchange: str, symbol: str, order_id: str) -> dict[str, Any]:
         """Fetch the venue's per-fill trade records for one order.
@@ -770,6 +815,7 @@ class LiveTradingService:
             await self._ensure_initialized()
             if exchange.lower() not in {EXCHANGE_ID.lower(), "binance", "binanceus"} or not self.binance:
                 return {"status": "error", "message": "Exchange not available"}
+            await self._charge_weight("/api/v3/myTrades", 20)
             pair = _to_binance_pair(symbol)
             trades = await asyncio.to_thread(
                 self.binance.fetch_my_trades,
@@ -799,18 +845,27 @@ class LiveTradingService:
                         "timestamp": t.get("timestamp") or info.get("time"),
                     }
                 )
+            await self._note_exchange_weight()
             return {"status": "success", "trades": out}
         except Exception as e:  # reconciliation must never raise into trading
             logger.warning("fetch_order_trades %s %s: %s", symbol, order_id, e)
-            return {"status": "error", "message": str(e)}
+            return {
+                "status": "error",
+                "message": str(e),
+                "rate_limited": isinstance(e, (RateLimitedError, CircuitOpenError)),
+            }
 
     async def cancel_order(self, exchange: str, order_id: str, symbol: str) -> dict[str, Any]:
         """Cancel an existing spot order on Binance.US."""
         try:
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
+                from backend.utils.binance_weight_limiter import ORDER_CANCEL_WEIGHT
+
+                await self._charge_weight("/api/v3/order", ORDER_CANCEL_WEIGHT)
                 pair = _to_binance_pair(symbol)
                 await asyncio.to_thread(self.binance.cancel_order, id=order_id, symbol=pair)
+                await self._note_exchange_weight()
                 return {
                     "status": "success",
                     "message": f"Order {order_id} cancelled successfully",
@@ -820,6 +875,13 @@ class LiveTradingService:
             return {
                 "status": "error",
                 "message": f"Exchange {exchange} not available or not configured",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        except (RateLimitedError, CircuitOpenError) as e:
+            return {
+                "status": "error",
+                "message": str(e),
+                "rate_limited": True,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
@@ -864,8 +926,9 @@ class LiveTradingService:
             # Use public endpoint - no authentication required
             url = f"https://api.binance.us/api/v3/ticker/price?symbol={pair}"
 
-            # Make request
+            await self._charge_weight("/api/v3/ticker/price", 1)
             response = await canonical_http_client.make_request("GET", url)
+            await self._note_response_weight(getattr(response, "headers", None))
 
             # Check for HTTP errors
             if response.status_code != 200:

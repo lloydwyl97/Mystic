@@ -4281,6 +4281,9 @@ class PortfolioEngine:
                 from backend.services.venue_order_budget import venue_order_budget
 
                 snap["venue_order_budget"] = venue_order_budget.snapshot()
+                from backend.utils.binance_weight_limiter import request_weight_status
+
+                snap["request_weight"] = request_weight_status()
                 payload["sell_protection"] = snap
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)

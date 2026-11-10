@@ -148,6 +148,9 @@ class BinanceREST:
             await self.limiter.consume(path, weight, wait=True, timeout=5.0)
             try:
                 resp = await breaker.call(_make_api_call)
+                from backend.utils.binance_weight_limiter import observe_headers
+
+                await observe_headers(getattr(resp, "headers", None))
                 if resp.status_code in (418, 429):
                     # Throttle or ban-ish responses; trip circuit and backoff
                     try:

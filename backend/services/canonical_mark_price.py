@@ -50,13 +50,21 @@ def _decode_redis_val(raw: Any) -> str:
     return str(raw)
 
 
-async def _fetch_binance_book_ticker(bus: str) -> dict[str, float] | None:
+async def _limited_binance_get(path: str, weight: int, params: dict[str, str]) -> Any:
     from backend.services.canonical_http_client import get_http_client
+    from backend.utils.binance_weight_limiter import BinanceWeightLimiter, observe_headers
 
+    limiter = await BinanceWeightLimiter.create()
+    await limiter.consume(path, weight=weight, wait=True, timeout=5.0)
     client = await get_http_client()
-    url = "https://api.binance.us/api/v3/ticker/bookTicker"
-    resp = await client.get(url, params={"symbol": bus}, timeout=10.0)
+    resp = await client.get("https://api.binance.us" + path, params=params, timeout=10.0)
+    await observe_headers(getattr(resp, "headers", None))
     resp.raise_for_status()
+    return resp
+
+
+async def _fetch_binance_book_ticker(bus: str) -> dict[str, float] | None:
+    resp = await _limited_binance_get("/api/v3/ticker/bookTicker", 2, {"symbol": bus})
     data = resp.json()
     bid = float(data.get("bidPrice") or 0.0)
     ask = float(data.get("askPrice") or 0.0)
@@ -66,24 +74,14 @@ async def _fetch_binance_book_ticker(bus: str) -> dict[str, float] | None:
 
 
 async def _fetch_binance_last_price(bus: str) -> float | None:
-    from backend.services.canonical_http_client import get_http_client
-
-    client = await get_http_client()
-    url = "https://api.binance.us/api/v3/ticker/24hr"
-    resp = await client.get(url, params={"symbol": bus}, timeout=10.0)
-    resp.raise_for_status()
+    resp = await _limited_binance_get("/api/v3/ticker/24hr", 2, {"symbol": bus})
     data = resp.json()
     last_px = float(data.get("lastPrice") or 0.0)
     return last_px if last_px > 0 else None
 
 
 async def _fetch_binance_1m_kline(bus: str) -> dict[str, float] | None:
-    from backend.services.canonical_http_client import get_http_client
-
-    client = await get_http_client()
-    url = "https://api.binance.us/api/v3/klines"
-    resp = await client.get(url, params={"symbol": bus, "interval": "1m", "limit": 1}, timeout=10.0)
-    resp.raise_for_status()
+    resp = await _limited_binance_get("/api/v3/klines", 2, {"symbol": bus, "interval": "1m", "limit": "1"})
     rows = resp.json()
     if not rows:
         return None

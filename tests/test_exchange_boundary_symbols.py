@@ -96,11 +96,20 @@ async def test_klines_request_uses_bare_symbol(monkeypatch, timeframe):
     monkeypatch.setattr(store, "load_aligned_candles", lambda *_a, **_k: None)
     sent: list[dict] = []
 
-    async def _get_json(url, params=None):
-        sent.append({"url": url, **(params or {})})
-        return [[1, "1", "1", "1", "1", "1"]]
+    class _Resp:
+        headers: dict[str, str] = {}
 
-    monkeypatch.setattr(lmd, "canonical_http_client", SimpleNamespace(get_json=_get_json))
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> list[list[str]]:
+            return [["1", "1", "1", "1", "1", "1"]]
+
+    async def _make_request(_method, url, params=None, **_kwargs):
+        sent.append({"url": url, **(params or {})})
+        return _Resp()
+
+    monkeypatch.setattr(lmd, "canonical_http_client", SimpleNamespace(make_request=_make_request))
     svc = lmd.live_market_data_service
     monkeypatch.setattr(svc, "_get_limiter", AsyncMock(return_value=SimpleNamespace(consume=AsyncMock())))
     for engine in ENGINES:
@@ -205,7 +214,14 @@ class _FakeCcxt:
 @pytest.mark.parametrize(("_base", "ccxt", "api"), COINS)
 async def test_order_paths_never_send_engine_prefix(_base, ccxt, api):
     fake = _FakeCcxt()
-    svc = SimpleNamespace(binance=fake, _ensure_initialized=AsyncMock())
+    limiter = SimpleNamespace(mark_protective_pending=AsyncMock())
+    svc = SimpleNamespace(
+        binance=fake,
+        _ensure_initialized=AsyncMock(),
+        _charge_weight=AsyncMock(),
+        _note_exchange_weight=AsyncMock(),
+        _get_limiter=AsyncMock(return_value=limiter),
+    )
     for engine in ENGINES:
         key = f"{engine}::{ccxt}"
         await LiveTradingService.place_order(svc, "binanceus", key, "limit", "buy", 1.0, price=1.0)

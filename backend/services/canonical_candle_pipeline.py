@@ -131,19 +131,28 @@ class CanonicalCandlePipeline:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        try:
-            from backend.utils.binance_weight_limiter import BinanceWeightLimiter
+        from backend.utils.binance_weight_limiter import (
+            BinanceWeightLimiter,
+            CircuitOpen,
+            RateLimited,
+            kline_request_weight,
+            observe_headers,
+        )
 
-            limiter = await BinanceWeightLimiter.create()
-            await limiter.consume("/api/v3/klines", weight=1, wait=True, timeout=12.0)
-        except Exception as exc:
-            logger.debug("kline limiter unavailable: %s", exc)
         retries = 0
         last_exc: Exception | None = None
         while retries < 4:
             try:
+                limiter = await BinanceWeightLimiter.create()
+                await limiter.consume(
+                    "/api/v3/klines",
+                    weight=kline_request_weight(int(params["limit"])),
+                    wait=True,
+                    timeout=12.0,
+                )
                 async with httpx.AsyncClient(timeout=20.0) as client:
                     response = await client.get(BINANCE_KLINES, params=params)
+                    await observe_headers(getattr(response, "headers", None))
                     if response.status_code == 429:
                         retries += 1
                         await asyncio.sleep(min(8.0, 1.5 * retries))
@@ -151,6 +160,9 @@ class CanonicalCandlePipeline:
                     response.raise_for_status()
                     data = response.json()
                 return data if isinstance(data, list) else []
+            except (RateLimited, CircuitOpen):
+                self._errors[self._stream_key(symbol, interval)] = "request_weight"
+                return []
             except (httpx.HTTPError, OSError) as exc:
                 last_exc = exc
                 retries += 1

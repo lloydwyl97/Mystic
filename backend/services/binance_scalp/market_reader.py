@@ -32,7 +32,6 @@ SCALP_DEPTH_CACHE_TTL_SEC: float = float(os.getenv("SCALP_DEPTH_CACHE_TTL_SEC", 
 SCALP_WS_DEPTH_MAX_AGE_SEC: float = float(os.getenv("SCALP_WS_DEPTH_MAX_AGE_SEC", "1.5"))
 _DEPTH_CACHE_KEY_PREFIX = "scalp:depth_cache:"
 _WS_DEPTH_KEY_PREFIX = "scalp:ws_depth:"
-_DEPTH_ENDPOINT_WEIGHT = 5  # Binance.US weight for GET /api/v3/depth?limit=100
 
 
 @dataclass(frozen=True)
@@ -67,11 +66,16 @@ def fetch_depth_sync(symbol_bus: str, *, limit: int = 100) -> tuple[list[list[fl
     sym = symbol_bus.strip().upper()
     base_url = os.getenv("BINANCE_US_REST_BASE", "https://api.binance.us")
     url = f"{base_url.rstrip('/')}/api/v3/depth?symbol={sym}&limit={int(limit)}"
+    from backend.utils.binance_weight_limiter import depth_request_weight, observe_headers_sync, try_consume_sync
+
+    if not try_consume_sync("/api/v3/depth", depth_request_weight(limit)):
+        raise RuntimeError(f"depth weight unavailable for {sym}")
     try:
         import httpx
 
         with httpx.Client(timeout=15.0) as client:
             resp = client.get(url)
+            observe_headers_sync(resp.headers)
             resp.raise_for_status()
             data = resp.json()
     except Exception as exc:
@@ -236,19 +240,6 @@ def _write_depth_cache(r: redis.Redis, sym: str, bids: list[list[float]], asks: 
         pass
 
 
-def _record_depth_weight_usage(r: redis.Redis) -> None:
-    """Mirror BinanceWeightLimiter's usage counters for visibility (bwl:usage:*, bwl:req:*).
-
-    Best-effort only — never gates/blocks a request; this is metrics, not enforcement.
-    Existing async limiter behavior for other endpoints is unchanged.
-    """
-    try:
-        r.incrby("bwl:usage:/api/v3/depth", _DEPTH_ENDPOINT_WEIGHT)
-        r.incr("bwl:req:/api/v3/depth")
-    except Exception:
-        pass
-
-
 class ScalpMarketReader:
     """Read-only: Redis orderbook:{BASE} features + public REST depth for walks."""
 
@@ -308,7 +299,6 @@ class ScalpMarketReader:
                 book_source = "binance_us_public_depth_readonly"
                 if bids and asks:
                     _write_depth_cache(self._redis, bus, bids, asks)
-                    _record_depth_weight_usage(self._redis)
 
         if not bids or not asks:
             return None
