@@ -547,6 +547,8 @@ def _reconcile_symbol(symbol: str, recorded: dict[str, list[dict[str, Any]]], ve
                         "price": (f["cost"] / f["qty"]) if f["qty"] else 0.0,
                         "exchange_order_id": f.get("order") or "",
                         "client_order_id": f.get("client_order_id") or "",
+                        "fee": f.get("fee_cost") or 0.0,
+                        "fee_asset": f.get("fee_ccy") or "",
                         "venue_trade_id": f.get("id") or "",
                         "local_record_id": "",
                         "dollar_discrepancy": leftover * ((f["cost"] / f["qty"]) if f["qty"] else 0.0),

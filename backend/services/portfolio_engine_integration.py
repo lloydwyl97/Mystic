@@ -1661,6 +1661,7 @@ class PortfolioEngineIntegration:
             # economic significance and must not block fresh DAY V2 entries.
             # _can_open_position below serves as the hard gate for all new entries.
             already_open = day_v2_held_symbols(self.engine.open_positions if self.engine else None)
+            day_batch_started = time.time()
 
             candidates: list[dict[str, Any]] = []
             for symbol in DAY_V2_UNIVERSE:
@@ -1835,6 +1836,13 @@ class PortfolioEngineIntegration:
                 return rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), canonical_roundtrip_cost_pct())
 
             ranked = await asyncio.to_thread(_score_and_rank_day)
+            day_batch_ended = time.time()
+            for cand in ranked:
+                cand["_timing"] = {
+                    "signal_observed": float(cand.get("ask_at") or cand.get("as_of") or day_batch_started),
+                    "eval_batch_start": day_batch_started,
+                    "eval_batch_end": day_batch_ended,
+                }
             logger.info(
                 "DAY_V2_RANKED %s",
                 " ".join(
@@ -1967,6 +1975,8 @@ class PortfolioEngineIntegration:
                 "alternatives": cand.get("alternatives") or [],
             }
         )
+        if isinstance(cand.get("_timing"), dict):
+            economic["_timing"] = dict(cand["_timing"])
         return record_candidate(
             db_path,
             engine="DAY_V2",

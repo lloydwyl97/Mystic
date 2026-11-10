@@ -9423,7 +9423,14 @@ class PortfolioEngine:
                     logger.warning("STRATEGY_INTENT_PROBE_FAILED trade=%s", intent.get("trade_id"), exc_info=True)
                     break
                 if str(res.get("status") or "") == "success" and isinstance(res.get("order"), dict):
-                    apply_venue_order(self.db_path, res["order"])
+                    from backend.services.live_fill_economics import merge_venue_trades_into_order
+
+                    order = res["order"]
+                    applied = apply_venue_order(self.db_path, order)
+                    if applied.get("reason") == "NEEDS_TRADES":
+                        trades = await self._live_service.fetch_order_trades("binanceus", symbol, str(order.get("id") or ""))
+                        if str(trades.get("status") or "") == "success":
+                            apply_venue_order(self.db_path, merge_venue_trades_into_order(order, trades.get("trades")))
                     found = True
                     probed += 1
                     break
@@ -27255,6 +27262,19 @@ class PortfolioEngine:
             "order_submit_to_fill_ms": execution_latency["order_submit_to_fill_ms"],
             "candidate_batch_ms": execution_latency.get("candidate_batch_ms")
             or {"avg": None, "p50": None, "p95": None, "p99": None, "max": None, "samples": 0, "metric": "candidate_batch_ms", "source": "not_stored"},
+            "day_candidate_batch_ms": execution_latency.get("day_candidate_batch_ms")
+            or {"avg": None, "p50": None, "p95": None, "p99": None, "max": None, "samples": 0, "metric": "day_candidate_batch_ms", "source": "not_stored"},
+            "preflight_ms": execution_latency.get("preflight_ms") or {"avg": None, "p50": None, "p95": None, "p99": None, "max": None, "samples": 0, "metric": "preflight_ms", "source": "not_stored"},
+            "signal_observed_to_submit_ms": {
+                "avg": None,
+                "p50": None,
+                "p95": None,
+                "p99": None,
+                "max": None,
+                "samples": 0,
+                "metric": "signal_observed_to_submit_ms",
+                "source": "not_stored",
+            },
             "health_flag": health_flag,
             "stale_symbol_count": stale_count,
             "total_symbols": len(TRADING_SYMBOLS),
@@ -27263,10 +27283,17 @@ class PortfolioEngine:
 
     async def _get_execution_latency(self) -> dict:
         """Rolling submit-to-ack and submit-to-fill from stored live orders."""
-        from backend.services.protected_limit_execution import summarize_candidate_batch_ms, summarize_live_fill_latency
+        from backend.services.protected_limit_execution import (
+            summarize_candidate_batch_ms,
+            summarize_day_candidate_batch_ms,
+            summarize_live_fill_latency,
+            summarize_preflight_ms,
+        )
 
         fills = await asyncio.to_thread(summarize_live_fill_latency, self.db_path)
         fills["candidate_batch_ms"] = await asyncio.to_thread(summarize_candidate_batch_ms, self.db_path)
+        fills["day_candidate_batch_ms"] = await asyncio.to_thread(summarize_day_candidate_batch_ms, self.db_path)
+        fills["preflight_ms"] = await asyncio.to_thread(summarize_preflight_ms, self.db_path)
         return fills
 
     async def get_audit_export(self, hours: int = 24) -> list[dict]:

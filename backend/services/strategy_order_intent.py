@@ -44,6 +44,11 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn.execute(_SCHEMA)
     # One trade can have a later remainder order. The client id is the idempotency key.
     conn.execute("DROP INDEX IF EXISTS ux_strategy_intent_trade")
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_order_intents)")}
+    if "filled_gross" not in cols:
+        conn.execute("ALTER TABLE strategy_order_intents ADD COLUMN filled_gross REAL NOT NULL DEFAULT 0")
+    if "filled_cash" not in cols:
+        conn.execute("ALTER TABLE strategy_order_intents ADD COLUMN filled_cash REAL NOT NULL DEFAULT 0")
     return conn
 
 
@@ -171,11 +176,13 @@ def adopt_venue_fill(
     quantity: float,
     price: float,
     fee: float = 0.0,
+    fee_asset: str = "",
+    quote_fee: float = 0.0,
 ) -> dict[str, Any]:
     """Apply one venue fill to its pre-submit strategy intent. The same fill id is a no-op.
 
-    A BUY ends as exactly one paper row whose quantity is the cumulative fill.
-    A SELL records the cumulative filled quantity on the intent for the close.
+    A BUY position quantity is gross base minus base-asset commission. The price
+    stays the execution price of the gross fill. A SELL quantity is the base sold.
     """
     from backend.services.filled_asset_custody import ensure_canonical_buy_row
 
@@ -197,24 +204,65 @@ def adopt_venue_fill(
         px = float(price or 0.0)
         if qty <= 0 or px <= 0:
             return {"adopted": False, "reason": "EMPTY_FILL"}
-        if aggregate:
-            filled_qty = qty
-            filled_cost = qty * px
-            filled_fee = float(fee or 0.0)
+        from backend.services.live_fill_economics import QUOTE_FEE_ASSETS, _base_asset, canonical_buy_economics
+
+        side = str(row["side"] or "").upper()
+        asset = str(fee_asset or "").upper()
+        base_fee = 0.0
+        qfee = float(quote_fee or 0.0)
+        legacy_usd = 0.0
+        if side == "BUY":
+            base_name = _base_asset(str(row["symbol"] or ""))
+            if asset == base_name:
+                base_fee = float(fee or 0.0)
+            elif asset in QUOTE_FEE_ASSETS:
+                qfee += float(fee or 0.0)
+            elif not asset:
+                legacy_usd = float(fee or 0.0)
+            leg = canonical_buy_economics(gross_qty=qty, price=px, base_fee=base_fee, quote_fee=qfee)
+            add_net = leg["net_qty"]
+            add_gross = leg["gross_qty"]
+            add_quote = leg["quote_notional"]
+            add_fee = leg["fee_usd"] + legacy_usd
+            add_cash = leg["cash_debit"]
         else:
-            filled_qty = float(row["filled_qty"] or 0.0) + qty
-            filled_cost = float(row["filled_cost"] or 0.0) + qty * px
-            filled_fee = float(row["filled_fee"] or 0.0) + float(fee or 0.0)
+            add_net = qty
+            add_gross = qty
+            add_quote = qty * px
+            add_fee = float(fee or 0.0) + qfee
+            add_cash = add_quote
+        if aggregate:
+            filled_qty = add_net
+            filled_gross = add_gross
+            filled_cost = add_quote
+            filled_fee = add_fee
+            filled_cash = add_cash
+        else:
+            filled_qty = float(row["filled_qty"] or 0.0) + add_net
+            filled_gross = float(row["filled_gross"] or 0.0) + add_gross
+            filled_cost = float(row["filled_cost"] or 0.0) + add_quote
+            filled_fee = float(row["filled_fee"] or 0.0) + add_fee
+            filled_cash = float(row["filled_cash"] or 0.0) + add_cash
         seen.add(fid or f"{exchange_order_id}:{filled_qty}")
-        vwap = filled_cost / filled_qty
+        vwap = filled_cost / filled_gross if filled_gross else 0.0
         conn.execute(
             """
             UPDATE strategy_order_intents
-            SET exchange_order_id=?, status='FILLED', filled_qty=?, filled_cost=?, filled_fee=?,
-                fill_ids_json=?, updated_at=?
+            SET exchange_order_id=?, status='FILLED', filled_qty=?, filled_gross=?, filled_cost=?,
+                filled_fee=?, filled_cash=?, fill_ids_json=?, updated_at=?
             WHERE client_order_id=?
             """,
-            (str(exchange_order_id or row["exchange_order_id"] or ""), filled_qty, filled_cost, filled_fee, json.dumps(sorted(seen)), time.time(), cid),
+            (
+                str(exchange_order_id or row["exchange_order_id"] or ""),
+                filled_qty,
+                filled_gross,
+                filled_cost,
+                filled_fee,
+                filled_cash,
+                json.dumps(sorted(seen)),
+                time.time(),
+                cid,
+            ),
         )
         conn.commit()
         intent = dict(row)
@@ -282,8 +330,10 @@ def adopt_venue_fill(
         "regime": intent["regime"],
         "feature_version": intent["feature_version"],
         "filled_qty": filled_qty,
+        "gross_qty": filled_gross,
         "vwap": vwap,
         "fee": filled_fee,
+        "cash_debit": filled_cash,
     }
 
 
@@ -359,6 +409,7 @@ def claim_strategy_fill(
     quantity: float,
     price: float,
     fee: float = 0.0,
+    fee_asset: str = "",
     side: str = "",
 ) -> dict[str, Any]:
     """Adopt a venue fill when a pre-submit intent owns it. Otherwise leave it unclassified."""
@@ -377,11 +428,30 @@ def claim_strategy_fill(
         quantity=quantity,
         price=price,
         fee=fee,
+        fee_asset=fee_asset,
     )
 
 
+def _trade_fee(trade: dict[str, Any]) -> tuple[float, str]:
+    fee_raw = trade.get("fee") if isinstance(trade.get("fee"), dict) else {}
+    amount = trade.get("commission")
+    if amount is None:
+        amount = fee_raw.get("cost")
+    asset = str(trade.get("commissionAsset") or trade.get("commission_asset") or fee_raw.get("currency") or "").upper()
+    try:
+        qty = float(amount or 0.0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    return qty, asset
+
+
 def apply_venue_order(db_path: str, order: dict[str, Any]) -> dict[str, Any]:
-    """Apply a fetched venue order to the intent named by its client id."""
+    """Apply a fetched venue order to the intent named by its client id.
+
+    A summary that has executed quantity but no commission asset is not booked.
+    The caller fetches myTrades and calls again. Gross executedQty is never
+    treated as the position size when the fee asset is unknown.
+    """
     cid = str(order.get("clientOrderId") or order.get("client_order_id") or "")
     oid = str(order.get("id") or "")
     info = order.get("info") if isinstance(order.get("info"), dict) else {}
@@ -391,17 +461,33 @@ def apply_venue_order(db_path: str, order: dict[str, Any]) -> dict[str, Any]:
         for index, trade in enumerate(trades):
             if not isinstance(trade, dict):
                 continue
-            qty = float(trade.get("qty") or trade.get("amount") or 0.0)
-            px = float(trade.get("price") or 0.0)
-            fee_raw = trade.get("fee") if isinstance(trade.get("fee"), dict) else {}
-            fee = float(trade.get("commission") or fee_raw.get("cost") or 0.0)
-            fid = str(trade.get("tradeId") or trade.get("id") or f"{oid}:{index}")
-            last = adopt_venue_fill(db_path, client_order_id=cid, exchange_order_id=oid, fill_id=fid, quantity=qty, price=px, fee=fee)
+            try:
+                qty = float(trade.get("qty") or trade.get("amount") or 0.0)
+                px = float(trade.get("price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            fee, asset = _trade_fee(trade)
+            fid = str(trade.get("tradeId") or trade.get("trade_id") or trade.get("id") or f"{oid}:{index}")
+            last = adopt_venue_fill(
+                db_path,
+                client_order_id=cid,
+                exchange_order_id=oid,
+                fill_id=fid,
+                quantity=qty,
+                price=px,
+                fee=fee,
+                fee_asset=asset,
+            )
         return last
     filled = float(order.get("filled") or 0.0)
     average = float(order.get("average") or order.get("price") or 0.0)
-    if filled > 0 and average > 0 and oid:
-        fee_raw = order.get("fee") if isinstance(order.get("fee"), dict) else {}
+    fee_raw = order.get("fee") if isinstance(order.get("fee"), dict) else {}
+    asset = str(fee_raw.get("currency") or order.get("commissionAsset") or info.get("commissionAsset") or "").upper()
+    if filled > 0 and average > 0 and oid and asset:
+        try:
+            fee = float(fee_raw.get("cost") if fee_raw.get("cost") is not None else order.get("commission") or info.get("commission") or 0.0)
+        except (TypeError, ValueError):
+            fee = 0.0
         return adopt_venue_fill(
             db_path,
             client_order_id=cid,
@@ -409,10 +495,13 @@ def apply_venue_order(db_path: str, order: dict[str, Any]) -> dict[str, Any]:
             fill_id=f"order:{oid}",
             quantity=filled,
             price=average,
-            fee=float(fee_raw.get("cost") or 0.0),
+            fee=fee,
+            fee_asset=asset,
         )
     if oid and cid:
         mark_exchange_order(db_path, normalize_client_order_id(cid), oid, status="ACKED")
+    if filled > 0 and not asset:
+        return {"adopted": False, "reason": "NEEDS_TRADES", "exchange_order_id": oid, "client_order_id": normalize_client_order_id(cid)}
     return last
 
 
@@ -502,8 +591,8 @@ def recover_recorded_fills(db_path: str) -> int:
             return 0
         rows = conn.execute(
             f"""
-            SELECT exchange_order_id, client_order_id, side, executed_qty, avg_fill_price,
-                   fee_amount, venue_trade_ids_json, mystic_trade_id
+            SELECT exchange_order_id, client_order_id, side, symbol, executed_qty, avg_fill_price,
+                   fee_amount, fee_asset, fee_items_json, venue_trade_ids_json, mystic_trade_id
             FROM live_exchange_fills
             WHERE {" OR ".join(clauses)}
             """,
@@ -523,13 +612,39 @@ def recover_recorded_fills(db_path: str) -> int:
         if intent is None or str(intent.get("side") or "").upper() != side:
             continue
         executed = float(row.get("executed_qty") or 0.0)
-        if executed <= 0 or float(intent.get("filled_qty") or 0.0) + 1e-12 >= executed:
+        already = float(intent.get("filled_gross") or intent.get("filled_qty") or 0.0)
+        if executed <= 0 or already + 1e-12 >= executed:
             continue
         try:
-            trade_ids = [str(item) for item in json.loads(row.get("venue_trade_ids_json") or "[]") if str(item)]
+            venue_ids = [str(item) for item in json.loads(row.get("venue_trade_ids_json") or "[]") if str(item)]
         except (TypeError, ValueError):
-            trade_ids = []
-        fill_id = trade_ids[0] if len(trade_ids) == 1 else f"order:{row.get('exchange_order_id')}"
+            venue_ids = []
+        try:
+            fee_items = json.loads(row.get("fee_items_json") or "[]")
+        except (TypeError, ValueError):
+            fee_items = []
+        from backend.services.live_fill_economics import commission_parts
+
+        parts = commission_parts(
+            str(row.get("symbol") or intent.get("symbol") or ""),
+            fee_items if isinstance(fee_items, list) else [],
+            gross_qty=executed,
+            fee_amount=float(row.get("fee_amount") or 0.0),
+            fee_asset=str(row.get("fee_asset") or ""),
+        )
+        fill_id = venue_ids[0] if len(venue_ids) == 1 else f"order:{row.get('exchange_order_id')}"
+        asset = ""
+        fee = 0.0
+        extra_quote = float(parts["quote_fee"] or 0.0)
+        if float(parts["base_fee"] or 0.0) > 0 and side == "BUY":
+            from backend.services.live_fill_economics import _base_asset
+
+            asset = _base_asset(str(row.get("symbol") or intent.get("symbol") or ""))
+            fee = float(parts["base_fee"])
+        elif extra_quote > 0:
+            asset = "USDT"
+            fee = extra_quote
+            extra_quote = 0.0
         result = adopt_venue_fill(
             db_path,
             client_order_id=str(intent["client_order_id"]),
@@ -537,7 +652,9 @@ def recover_recorded_fills(db_path: str) -> int:
             fill_id=fill_id,
             quantity=executed,
             price=float(row.get("avg_fill_price") or 0.0),
-            fee=float(row.get("fee_amount") or 0.0),
+            fee=fee,
+            fee_asset=asset,
+            quote_fee=extra_quote,
         )
         if result.get("adopted"):
             adopted += 1
@@ -588,8 +705,10 @@ def materialize_buy_custody(db_path: str) -> int:
             complete_intent(db_path, trade_id=str(intent["trade_id"]), side="BUY", status="CLOSED")
             continue
         qty = float(intent["filled_qty"] or 0.0)
-        cost = float(intent["filled_cost"] or 0.0)
-        price = cost / qty if qty else 0.0
+        gross = float(intent.get("filled_gross") or 0.0)
+        quote = float(intent["filled_cost"] or 0.0)
+        price = (quote / gross) if gross else ((quote / qty) if qty else 0.0)
+        cash = float(intent.get("filled_cash") or 0.0) or quote
         remember(
             db_path,
             engine_id=str(intent["engine_id"]),
@@ -598,7 +717,7 @@ def materialize_buy_custody(db_path: str) -> int:
             quantity=qty,
             fill_price=price,
             fee=float(intent["filled_fee"] or 0.0),
-            cash_debit=cost,
+            cash_debit=cash,
             client_order_id=str(intent["client_order_id"]),
             exchange_order_id=str(intent["exchange_order_id"] or ""),
         )

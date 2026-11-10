@@ -297,6 +297,92 @@ def quantity_identity(
     return ending
 
 
+def canonical_buy_economics(
+    *,
+    gross_qty: object,
+    price: object,
+    base_fee: object = 0,
+    quote_fee: object = 0,
+) -> dict[str, float]:
+    """One BUY's canonical books. Position quantity is base received, not executedQty.
+
+    A base-asset commission reduces the coins held. A quote commission does not.
+    The execution price stays quote spent on the gross fill divided by gross base.
+    Cash spent is that quote notional plus any quote-asset commission.
+    """
+    gross = money(gross_qty)
+    px = money(price)
+    base = money(base_fee)
+    quote = money(quote_fee)
+    if gross < 0:
+        gross = Decimal("0")
+    if px < 0:
+        px = Decimal("0")
+    if base < 0:
+        base = Decimal("0")
+    if quote < 0:
+        quote = Decimal("0")
+    base = min(base, gross)
+    net = gross - base
+    quote_notional = gross * px
+    return {
+        "gross_qty": float(gross),
+        "net_qty": float(net),
+        "price": float(px),
+        "quote_notional": float(quote_notional),
+        "base_fee": float(base),
+        "quote_fee": float(quote),
+        "fee_usd": float(base * px + quote),
+        "cash_debit": float(quote_notional + quote),
+    }
+
+
+def commission_parts(
+    symbol: str,
+    items: list[dict[str, Any]] | None,
+    *,
+    gross_qty: float = 0.0,
+    fee_amount: float = 0.0,
+    fee_asset: str = "",
+) -> dict[str, Any]:
+    """Split venue commission into base, quote, and anything else.
+
+    Item rows win. A bare fee column is used only when it is a plausible base
+    size or an explicit quote asset. A USD figure stored under a base asset
+    name is not subtracted from the position.
+    """
+    base_name = _base_asset(symbol)
+    base_fee = 0.0
+    quote_fee = 0.0
+    other: list[str] = []
+    saw_item = False
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        amount = _as_float(item.get("amount") if item.get("amount") is not None else item.get("cost"))
+        asset = str(item.get("asset") or item.get("currency") or item.get("commissionAsset") or "").upper()
+        if not amount or not asset:
+            continue
+        saw_item = True
+        if asset == base_name:
+            base_fee += abs(amount)
+        elif asset in QUOTE_FEE_ASSETS:
+            quote_fee += abs(amount)
+        else:
+            other.append(asset)
+    if not saw_item:
+        asset = str(fee_asset or "").upper()
+        amount = abs(float(fee_amount or 0.0))
+        gross = abs(float(gross_qty or 0.0))
+        if asset == base_name and amount > 0 and (gross <= 0 or amount < gross * 0.01):
+            base_fee = amount
+        elif asset in QUOTE_FEE_ASSETS and amount > 0:
+            quote_fee = amount
+        elif asset and amount > 0:
+            other.append(asset)
+    return {"base_fee": base_fee, "quote_fee": quote_fee, "other_assets": other}
+
+
 def merge_venue_trades_into_order(order: dict[str, Any] | None, trades: list[dict[str, Any]] | None) -> dict[str, Any]:
     """Attach myTrades onto a GET /order payload that omitted fills."""
     raw = dict(order) if isinstance(order, dict) else {}

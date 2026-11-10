@@ -49,6 +49,7 @@ from backend.utils.symbols import normalize_symbol
 logger = logging.getLogger(__name__)
 
 _PREFLIGHT_FRESHNESS: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("_PREFLIGHT_FRESHNESS", default=None)
+_PREFLIGHT_CLOCK: contextvars.ContextVar[float] = contextvars.ContextVar("_PREFLIGHT_CLOCK", default=0.0)
 
 LIVE_OUTCOME_EXPIRED_UNFILLED = "EXPIRED_UNFILLED"
 LIVE_OUTCOME_TIMEOUT_CANCELED_UNFILLED = "TIMEOUT_CANCELED_UNFILLED"
@@ -98,6 +99,8 @@ class ProtectedPreflightResult:
     executable_qty: float = 0.0
     book_freshness: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    preflight_started: float = 0.0
+    preflight_finished: float = 0.0
 
     def to_audit_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +114,8 @@ class ProtectedPreflightResult:
             "book_age_sec": self.book_age_sec,
             "reject_reason": self.reject_reason,
             "book_freshness": dict(self.book_freshness),
+            "preflight_started": self.preflight_started or None,
+            "preflight_finished": self.preflight_finished or None,
         }
 
 
@@ -233,6 +238,10 @@ def get_last_execution_protection_state(*, taker_fee: float | None = None) -> di
 
 
 def _update_last_state(result: ProtectedPreflightResult) -> None:
+    started = float(_PREFLIGHT_CLOCK.get() or 0.0)
+    if started and not result.preflight_started:
+        result.preflight_started = started
+        result.preflight_finished = time.time()
     _last_state.update(
         {
             "last_preflight_passed": bool(result.passed),
@@ -486,6 +495,7 @@ async def run_protected_preflight(
     executable chunk and limit. They must not refuse liquidation unless the
     book is missing/stale or the absolute catastrophic bound is breached.
     """
+    _PREFLIGHT_CLOCK.set(time.time())
     ns = normalize_symbol(symbol)
     side_u = str(side or "").strip().upper()
     exec_mode = "PROTECTED_LIMIT_LIVE" if live_capable else "PROTECTED_LIMIT_SIM"
@@ -998,6 +1008,103 @@ def summarize_candidate_batch_ms(db_path: str, *, limit: int = 200) -> dict[str,
     return stats
 
 
+def summarize_day_candidate_batch_ms(db_path: str, *, limit: int = 200) -> dict[str, Any]:
+    """Duration of recorded DAY evaluation batches. Null until a batch is stamped."""
+    window = max(1, int(limit))
+    durations: list[float] = []
+    seen: set[float] = set()
+    rows: list[Any] = []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                """
+                SELECT economic_json FROM adaptive_candidate_markouts
+                WHERE engine_id='DAY_V2'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (window,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.debug("DAY_CANDIDATE_BATCH_TIMING_READ_FAILED", exc_info=True)
+    for row in rows:
+        try:
+            payload = json.loads(row[0] or "{}")
+        except (TypeError, ValueError):
+            continue
+        timing = payload.get("_timing") if isinstance(payload, dict) else None
+        if not isinstance(timing, dict):
+            continue
+        try:
+            start_s = float(timing.get("eval_batch_start"))
+            end_s = float(timing.get("eval_batch_end"))
+        except (TypeError, ValueError):
+            continue
+        duration = (end_s - start_s) * 1000.0
+        if duration < 0 or duration > 120_000 or start_s in seen:
+            continue
+        seen.add(start_s)
+        durations.append(duration)
+    stats = _latency_stats(durations)
+    stats["metric"] = "day_candidate_batch_ms"
+    stats["source"] = "adaptive_candidate_markouts.timing" if durations else "not_stored"
+    return stats
+
+
+def summarize_preflight_ms(db_path: str, *, limit: int = 200) -> dict[str, Any]:
+    """Preflight duration from orders that stored a preflight clock. Older orders stay unmeasured."""
+    window = max(1, int(limit))
+    durations: list[float] = []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                """
+                SELECT raw_json FROM live_exchange_fills
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (window,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        try:
+            order = json.loads(row[0] or "{}")
+        except (TypeError, ValueError):
+            continue
+        audit = order.get("_mystic_preflight") if isinstance(order, dict) else None
+        if not isinstance(audit, dict):
+            continue
+        try:
+            start_s = float(audit.get("preflight_started"))
+            end_s = float(audit.get("preflight_finished"))
+        except (TypeError, ValueError):
+            continue
+        duration = (end_s - start_s) * 1000.0
+        if duration < 0 or duration > 120_000:
+            continue
+        durations.append(duration)
+    stats = _latency_stats(durations)
+    stats["metric"] = "preflight_ms"
+    stats["source"] = "live_exchange_fills.preflight" if durations else "not_stored"
+    return stats
+
+
+def lost_ack_may_submit_replacement(probe: dict[str, Any] | None) -> bool:
+    """A second order is allowed only when the venue proves this client id was never accepted."""
+    if not isinstance(probe, dict):
+        return False
+    if str(probe.get("status") or "") == "success" and probe.get("order"):
+        return False
+    return str(probe.get("code") or "") == "-2013"
+
+
 async def execute_protected_limit_live(
     live_service: Any,
     *,
@@ -1071,7 +1178,7 @@ async def execute_protected_limit_live(
             if probe.get("status") == "success" and probe.get("order"):
                 logger.warning("PROTECTED_LIMIT_IOC_FOUND_AFTER_ERROR %s %s cid=%s", side_l, exchange_symbol, attempt_cid)
                 result = {"status": "success", "order": probe.get("order")}
-            elif str(probe.get("code") or "") == "-2013":
+            elif lost_ack_may_submit_replacement(probe):
                 continue
             else:
                 logger.error(

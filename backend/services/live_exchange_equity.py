@@ -388,6 +388,7 @@ def backfill_exchange_reconciled_orders(
             quantity=float(row.get("unmatched_quantity") or row.get("quantity") or 0.0),
             price=float(row.get("price") or 0.0),
             fee=float(row.get("fee") or 0.0),
+            fee_asset=str(row.get("fee_asset") or ""),
             side=str(row.get("side") or ""),
         )
         if claimed.get("adopted") or claimed.get("reason") == "DUPLICATE_FILL":

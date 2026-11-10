@@ -283,6 +283,8 @@ def test_probe_order_and_aggregate_fill_are_applied_once(tmp_path) -> None:
         db,
         {"id": "ord-p", "clientOrderId": f"{cid}-i", "filled": 1.0, "average": 101.0, "fee": {"cost": 0.1}},
     )
+    assert first["adopted"] is False
+    assert first["reason"] == "NEEDS_TRADES"
     second = apply_venue_order(
         db,
         {
@@ -291,8 +293,7 @@ def test_probe_order_and_aggregate_fill_are_applied_once(tmp_path) -> None:
             "trades": [{"id": "leg-1", "qty": 0.4, "price": 100.0}, {"id": "leg-2", "qty": 0.6, "price": 102.0}],
         },
     )
-    assert first["adopted"] is True
-    assert second["adopted"] is False
+    assert second["adopted"] is True
     assert _paper_qty(db, "t-probe") == pytest.approx(1.0)
 
 
