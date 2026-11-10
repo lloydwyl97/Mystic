@@ -35,7 +35,6 @@ _socket.getaddrinfo = _ipv4_only_getaddrinfo
 # CRITICAL FIX: Windows ProactorEventLoop has bugs with async Redis connections
 # Must be set BEFORE any asyncio operations
 import sys
-from pathlib import Path
 
 if sys.platform == "win32":
     import asyncio
@@ -143,29 +142,18 @@ def _proof_logging_config() -> None:
 
 
 PID_FILE = "/tmp/mystic_pe_integration.pid"
+WRITER_LOCK = os.getenv("MYSTIC_PORTFOLIO_WRITER_LOCK", "/home/mystic/mystic/logs/mystic_portfolio_writer.lock")
 
 
 def _check_singleton() -> None:
-    """Abort if another PE integration process is already running."""
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE) as f:
-                old_pid = int(f.read().strip())
-            os.kill(old_pid, 0)
-            logger.error("ABORT: PE integration already running (PID %d). Kill it first.", old_pid)
-            sys.exit(1)
-        except (ProcessLookupError, ValueError):
-            pass
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    import atexit
+    """Abort if another portfolio process already holds the order-writer lock."""
+    from backend.services.venue_order_budget import hold_writer_lock
 
-    def _unlink_pid_file() -> None:
-        p = Path(PID_FILE)
-        if p.exists():
-            p.unlink()
-
-    atexit.register(_unlink_pid_file)
+    if hold_writer_lock(WRITER_LOCK) is None:
+        logger.error("ABORT: portfolio order writer lock is held (%s). Kill the other process first.", WRITER_LOCK)
+        sys.exit(1)
+    with open(PID_FILE, "w") as handle:
+        handle.write(str(os.getpid()))
 
 
 async def main():
@@ -208,6 +196,11 @@ async def main():
         from backend.services.day_v2.migrations import apply_all_migrations
 
         apply_all_migrations(os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db"))
+
+        from backend.services.venue_order_budget import venue_order_budget
+
+        await venue_order_budget.ensure_limits()
+        venue_order_budget.arm_restart_blackout()
 
         # Start the service
         integration = await start_portfolio_integration()

@@ -133,3 +133,119 @@ async def test_zero_fill_retries_use_a_fresh_preflight_each_attempt():
     assert [book[1] for book in books] == [impact_for_attempt(0), impact_for_attempt(1), impact_for_attempt(2)]
     assert result.abandoned_reason == "residual_after_same_call"
     assert result.combined_order is None
+
+
+def _short_day_limits(per_10s: int) -> list[dict]:
+    return [
+        {"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": per_10s},
+        {"rateLimitType": "ORDERS", "interval": "DAY", "intervalNum": 1, "limit": 200000},
+    ]
+
+
+def test_restart_does_not_report_an_empty_10_second_window():
+    clock = {"t": 5.0}
+    budget = VenueOrderBudget(clock=lambda: clock["t"])
+    budget.set_limits(VENUE)
+    budget.arm_restart_blackout()
+    view = budget.snapshot()
+    assert view["orders_10s_authoritative"] is False
+    assert view["orders_used_10s"] is None
+    assert budget.try_acquire("exit") is False
+    assert budget.try_acquire("entry") is False
+    clock["t"] = 14.999
+    assert budget.try_acquire("exit") is False
+    clock["t"] = 15.0
+    assert budget.try_acquire("exit") is True
+    assert budget.snapshot()["orders_10s_authoritative"] is True
+    assert budget.snapshot()["orders_used_10s"] == 1
+
+
+def test_10_second_boundary_uses_the_monotonic_clock():
+    clock = {"t": 0.0}
+    budget = VenueOrderBudget(clock=lambda: clock["t"])
+    budget.set_limits(_short_day_limits(1))
+    assert budget.try_acquire("exit") is True
+    clock["t"] = 9.999
+    assert budget.try_acquire("exit") is False
+    clock["t"] = 10.0
+    assert budget.try_acquire("exit") is True
+    clock["t"] = 10.001
+    assert budget.try_acquire("exit") is False
+
+
+def test_daily_count_survives_restart_and_resets_on_the_utc_day(tmp_path):
+    path = tmp_path / "budget.json"
+    day = {"value": "2026-11-10"}
+    clock = {"t": 0.0}
+    first = VenueOrderBudget(clock=lambda: clock["t"], state_path=str(path), day_fn=lambda: day["value"])
+    first.set_limits(VENUE)
+    assert first.try_acquire("exit") is True
+    assert first.try_acquire("exit") is True
+    restarted = VenueOrderBudget(clock=lambda: clock["t"], state_path=str(path), day_fn=lambda: day["value"])
+    restarted.set_limits(VENUE)
+    view = restarted.snapshot()
+    assert view["orders_used_day"] == 2
+    assert view["orders_day_authoritative"] is True
+    assert view["orders_limit_day"] == 200000
+    day["value"] = "2026-11-11"
+    assert restarted.try_acquire("exit") is True
+    assert restarted.snapshot()["orders_used_day"] == 1
+
+
+def test_each_ioc_attempt_consumes_its_own_slot():
+    budget = VenueOrderBudget(clock=lambda: 0.0)
+    budget.set_limits(_short_day_limits(3))
+    granted = [budget.try_acquire("exit") for _ in range(6)]
+    assert granted == [True, True, True, False, False, False]
+
+
+def test_lost_ack_does_not_refund_the_slot():
+    budget = VenueOrderBudget(clock=lambda: 0.0)
+    budget.set_limits(_short_day_limits(2))
+    assert budget.try_acquire("exit") is True
+    # The venue may have counted the POST even though the response never returned.
+    assert budget.snapshot()["orders_used_10s"] == 1
+    assert budget.try_acquire("exit") is True
+    assert budget.snapshot()["orders_used_10s"] == 2
+    assert budget.try_acquire("exit") is False
+
+
+def test_rate_limit_response_fills_the_named_window():
+    clock = {"t": 0.0}
+    budget = VenueOrderBudget(clock=lambda: clock["t"])
+    budget.set_limits(VENUE)
+    budget.note_rate_limit('{"code":-1015,"msg":"Too many new orders; current limit is 100 orders per 10 SECOND."}')
+    assert budget.try_acquire("exit") is False
+    assert budget.snapshot()["last_rate_limit_error"].startswith('{"code":-1015')
+    clock["t"] = 10.0
+    assert budget.try_acquire("exit") is True
+
+
+def test_concurrent_reservations_stay_inside_the_limit():
+    import threading
+
+    budget = VenueOrderBudget(clock=lambda: 0.0)
+    budget.set_limits(_short_day_limits(10))
+    priorities = ["exit"] * 8 + ["entry"] * 8
+    results: list[tuple[str, bool]] = []
+    barrier = threading.Barrier(16)
+
+    def go(priority: str) -> None:
+        barrier.wait()
+        results.append((priority, budget.try_acquire(priority)))
+
+    threads = [threading.Thread(target=go, args=(priority,)) for priority in priorities]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sum(1 for _priority, ok in results if ok) <= 10
+    assert sum(1 for priority, ok in results if priority == "entry" and ok) <= 2
+
+
+def test_second_portfolio_writer_fails_closed(tmp_path):
+    from backend.services.venue_order_budget import hold_writer_lock
+
+    path = tmp_path / "writer.lock"
+    assert hold_writer_lock(str(path)) is not None
+    assert hold_writer_lock(str(path)) is None
