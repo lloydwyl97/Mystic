@@ -1795,6 +1795,9 @@ class PortfolioEngineIntegration:
                     # Every representable state is priced. The detector names one state of a
                     # family; the others keep their own learned key and stay at the neutral
                     # prior until their own results are a positive net.
+                    from backend.services.adaptive_learning import market_regime_tag
+
+                    regime_tag = market_regime_tag(db_path, symbol) or ""
                     for signal in signals:
                         self._admit_day_context_candidate(
                             candidates,
@@ -1809,6 +1812,7 @@ class PortfolioEngineIntegration:
                             bars_1h=bars_1h,
                             detector_fired=signal is fired,
                             ask_at=ask_at,
+                            regime_tag=regime_tag,
                         )
 
                 except Exception:
@@ -1901,6 +1905,7 @@ class PortfolioEngineIntegration:
         bars_1h: list[dict[str, Any]],
         detector_fired: bool = False,
         ask_at: float | None = None,
+        regime_tag: str | None = None,
     ) -> None:
         """Add one structural DAY context. Setup opinions are not a veto.
 
@@ -1934,6 +1939,8 @@ class PortfolioEngineIntegration:
         from backend.services.adaptive_learning import day_learned_setup, market_regime_tag
         from backend.services.day_v2.live_signal import day_state_features
 
+        if regime_tag is None:
+            regime_tag = market_regime_tag(db_path, symbol) or ""
         candidates.append(
             {
                 "symbol": symbol,
@@ -1946,7 +1953,7 @@ class PortfolioEngineIntegration:
                 "db_symbol": db_sym_15m,
                 "as_of": as_of,
                 "ask_at": float(ask_at if ask_at is not None else max(as_of, time.time())),
-                "regime_tag": market_regime_tag(db_path, symbol) or "",
+                "regime_tag": regime_tag,
                 "state_features": day_state_features(bars_15m, bars_1h, signal.setup),
             }
         )

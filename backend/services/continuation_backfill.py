@@ -149,6 +149,19 @@ def load_positions(db_path: str, *, active_since: float | None = None) -> tuple[
     conn.row_factory = sqlite3.Row
     try:
         buys = conn.execute("SELECT * FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,'')) IN ('DAY_V2','SCALP_V2')").fetchall()
+        paper_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_trades)")}
+        latest_sell: dict[tuple[str, str, str], sqlite3.Row] = {}
+        if {"id", "engine_id", "symbol", "entry_timestamp", "timestamp", "price", "exit_reason"} <= paper_cols:
+            for sell_row in conn.execute(
+                """
+                SELECT id, engine_id, symbol, entry_timestamp, timestamp, price, exit_reason
+                FROM paper_trades
+                WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,'')) IN ('DAY_V2','SCALP_V2')
+                  AND entry_timestamp IS NOT NULL
+                ORDER BY id ASC
+                """
+            ):
+                latest_sell[(str(sell_row["engine_id"] or "").upper(), str(sell_row["symbol"]), str(sell_row["entry_timestamp"]))] = sell_row
         positions: list[Position] = []
         for buy in buys:
             engine = str(buy["engine_id"] or "").upper()
@@ -170,14 +183,18 @@ def load_positions(db_path: str, *, active_since: float | None = None) -> tuple[
             if not setup:
                 skipped[(engine, "no_setup")] += 1
                 continue
-            sell = conn.execute(
-                """
-                SELECT timestamp, price, exit_reason FROM paper_trades
-                WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? AND entry_timestamp=?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (engine, buy["symbol"], buy["entry_timestamp"]),
-            ).fetchone()
+            entry_stamp = buy["entry_timestamp"]
+            if latest_sell:
+                sell = latest_sell.get((engine, str(buy["symbol"]), str(entry_stamp))) if entry_stamp is not None else None
+            else:
+                sell = conn.execute(
+                    """
+                    SELECT timestamp, price, exit_reason FROM paper_trades
+                    WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? AND entry_timestamp=?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (engine, buy["symbol"], entry_stamp),
+                ).fetchone()
             exit_time = _epoch(sell["timestamp"]) if sell else None
             if active_since is not None and exit_time is not None and exit_time < active_since:
                 skipped[(engine, "outside_recent_window")] += 1

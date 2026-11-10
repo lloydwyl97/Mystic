@@ -508,6 +508,10 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_unresolved ON adaptive_candidate_markouts(resolved, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_opportunity ON adaptive_candidate_markouts(engine_id, opportunity_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_symbol_time ON adaptive_candidate_markouts(engine_id, symbol, evaluated_at)")
+    # The open-label read is WHERE resolved=0 AND engine_id=? ORDER BY learned, id.
+    # Without this, the planner walks every row of the engine and sorts.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_due ON adaptive_candidate_markouts(resolved, engine_id, learned, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_calibration ON adaptive_candidate_markouts(calibration_learned, filled) WHERE realized_net IS NOT NULL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS adaptive_linear_model (
