@@ -953,15 +953,15 @@ class LiveMarketDataService:
             "source": EXCHANGE_ID,
         }
 
-    async def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
+    async def get_order_book(self, symbol: str, limit: int = 10, *, priority: str = "background") -> dict[str, Any]:
         s = _to_ccxt_symbol(symbol)
         from backend.utils.binance_weight_limiter import RateLimited, depth_request_weight, observe_headers_sync, try_consume_sync
 
         try:
             if _PUBLIC_BOOK_CLIENT is None or not getattr(_PUBLIC_BOOK_CLIENT, "markets", None):
-                if not try_consume_sync("/api/v3/exchangeInfo", 20):
+                if not try_consume_sync("/api/v3/exchangeInfo", 20, priority):
                     raise RateLimited("exchangeInfo weight unavailable")
-            if not try_consume_sync("/api/v3/depth", depth_request_weight(limit)):
+            if not try_consume_sync("/api/v3/depth", depth_request_weight(limit), priority):
                 raise RateLimited("depth weight unavailable")
             started = time.time()
             ob, call_started, received_ts, sent_ms = await asyncio.to_thread(_fetch_public_order_book, s, limit)

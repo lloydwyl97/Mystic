@@ -142,7 +142,7 @@ class _FakeLive:
         self.payload = payload
         self.calls: list[tuple] = []
 
-    async def fetch_order(self, exchange: str, order_id: str, symbol: str, params=None):
+    async def fetch_order(self, exchange: str, order_id: str, symbol: str, params=None, **_k):
         self.calls.append((exchange, order_id, symbol, params))
         return self.payload
 

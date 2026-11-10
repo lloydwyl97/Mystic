@@ -298,7 +298,7 @@ async def test_ioc_expire_does_not_place_gtc_and_a_missing_ioc_does(monkeypatch)
         placed.append(str(kwargs.get("time_in_force")))
         return {"status": "success", "order": {"id": "1", "filled": 0.0, "amount": 1.0, "status": "expired"}}
 
-    async def fetch(_exchange, order_id, _symbol):
+    async def fetch(_exchange, order_id, _symbol, **_k):
         if str(order_id).endswith("-i"):
             return {"status": "error", "code": "-2013"}
         return {"status": "success", "order": {"id": "2", "filled": 1.0, "amount": 1.0, "status": "closed", "average": 90.0, "clientOrderId": str(order_id)}}

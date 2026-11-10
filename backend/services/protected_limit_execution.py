@@ -415,14 +415,14 @@ def evaluate_executable_sell_profit(
     return base
 
 
-async def _fetch_order_book(ccxt_symbol: str) -> ExecutableBook | None:
+async def _fetch_order_book(ccxt_symbol: str, *, priority: str = "background") -> ExecutableBook | None:
     """Fetch L2 via live_market_data service (existing path, depth limit capped)."""
     try:
         from backend.services.live_market_data import live_market_data_service
 
         if live_market_data_service is None:
             return None
-        ob = await live_market_data_service.get_order_book(ccxt_symbol, limit=ORDERBOOK_DEPTH_LIMIT)
+        ob = await live_market_data_service.get_order_book(ccxt_symbol, limit=ORDERBOOK_DEPTH_LIMIT, priority=priority)
         bids = ob.get("bids") or []
         asks = ob.get("asks") or []
         if not bids or not asks:
@@ -527,7 +527,7 @@ async def run_protected_preflight(
         )
 
     _PREFLIGHT_FRESHNESS.set({})
-    fetched = await _fetch_order_book(ns)
+    fetched = await _fetch_order_book(ns, priority="exit" if side_u == "SELL" else "entry")
     if fetched is None or not fetched.bids or not fetched.asks:
         return _fail(
             ns,
@@ -1179,7 +1179,12 @@ async def execute_protected_limit_live(
             # A second order is sent only when the venue says this id does not exist.
             await asyncio.sleep(poll_interval)
             try:
-                probe = await live_service.fetch_order("binanceus", attempt_cid, exchange_symbol)
+                probe = await live_service.fetch_order(
+                    "binanceus",
+                    attempt_cid,
+                    exchange_symbol,
+                    priority="exit" if side_l == "sell" else "entry",
+                )
             except Exception as ex:
                 probe = {"status": "error", "message": str(ex)}
             if probe.get("status") == "success" and probe.get("order"):
@@ -1240,9 +1245,10 @@ async def execute_protected_limit_live(
 
         deadline = time.time() + timeout
         last = order
+        weight_priority = "exit" if side_l == "sell" else "entry"
         while time.time() < deadline:
             await asyncio.sleep(poll_interval)
-            st = await live_service.fetch_order("binanceus", order_id, exchange_symbol)
+            st = await live_service.fetch_order("binanceus", order_id, exchange_symbol, priority=weight_priority)
             if st.get("status") != "success":
                 continue
             o = st.get("order") or {}
@@ -1263,9 +1269,9 @@ async def execute_protected_limit_live(
             closed = False
             for _attempt in range(3):
                 with contextlib.suppress(Exception):
-                    await live_service.cancel_order("binanceus", order_id, exchange_symbol)
+                    await live_service.cancel_order("binanceus", order_id, exchange_symbol, priority=weight_priority)
                 try:
-                    st = await live_service.fetch_order("binanceus", order_id, exchange_symbol)
+                    st = await live_service.fetch_order("binanceus", order_id, exchange_symbol, priority=weight_priority)
                 except Exception:
                     st = {}
                 if st.get("status") == "success":

@@ -8751,17 +8751,23 @@ class PortfolioEngine:
         order_id = order.get("id")
         if not order_id or not self._live_service:
             return order
+        weight_priority = "exit" if str(side).lower() == "sell" else "entry"
         if len(order.get("_mystic_order_ids") or []) > 1:
             # Combined multi-order close: a GET on the last id would replace the
             # aggregate filled/cost with that single chunk.
             return order
-        order = await self._attach_venue_trades(order, exchange_symbol)
+        order = await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority)
         status = (order.get("status") or "").lower()
         if status in ("closed", "filled", "canceled", "cancelled", "expired"):
-            return await self._attach_venue_trades(order, exchange_symbol)
+            return await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority)
         for _ in range(2):
             await asyncio.sleep(0.2 + 0.2 * random.random())
-            res = await self._live_service.fetch_order("binanceus", str(order_id), exchange_symbol)
+            res = await self._live_service.fetch_order(
+                "binanceus",
+                str(order_id),
+                exchange_symbol,
+                priority="exit" if str(side).lower() == "sell" else "entry",
+            )
             if res.get("status") != "success":
                 break
             fetched = res.get("order", {})
@@ -8792,9 +8798,9 @@ class PortfolioEngine:
                 order_id,
                 float(filled) if filled else 0,
             )
-        return await self._attach_venue_trades(order, exchange_symbol)
+        return await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority)
 
-    async def _attach_venue_trades(self, order: dict[str, Any], exchange_symbol: str) -> dict[str, Any]:
+    async def _attach_venue_trades(self, order: dict[str, Any], exchange_symbol: str, *, priority: str = "background") -> dict[str, Any]:
         """GET /order omits fills. myTrades is the venue commission authority."""
         if not order or not self._live_service:
             return order
@@ -8807,7 +8813,7 @@ class PortfolioEngine:
         try:
             from backend.services.live_fill_economics import merge_venue_trades_into_order
 
-            res = await self._live_service.fetch_order_trades("binanceus", exchange_symbol, oid)
+            res = await self._live_service.fetch_order_trades("binanceus", exchange_symbol, oid, priority=priority)
             if res.get("status") != "success":
                 return order
             return merge_venue_trades_into_order(order, res.get("trades") or [])
@@ -9503,7 +9509,12 @@ class PortfolioEngine:
         absent = 0
         for suffix in ("-i", "-g"):
             try:
-                res = await self._live_service.fetch_order("binanceus", f"{cid}{suffix}", symbol)
+                res = await self._live_service.fetch_order(
+                    "binanceus",
+                    f"{cid}{suffix}",
+                    symbol,
+                    priority="exit" if str(intent.get("side") or "").lower() == "sell" else "entry",
+                )
             except Exception:
                 logger.warning("STRATEGY_INTENT_PROBE_FAILED trade=%s", intent.get("trade_id"), exc_info=True)
                 return {"unconfirmed": True}
@@ -9595,9 +9606,9 @@ class PortfolioEngine:
             if not oid:
                 continue
             with contextlib.suppress(Exception):
-                await self._live_service.cancel_order("binanceus", oid, str(intent.get("symbol") or symbol))
+                await self._live_service.cancel_order("binanceus", oid, str(intent.get("symbol") or symbol), priority="exit")
             try:
-                again = await self._live_service.fetch_order("binanceus", oid, str(intent.get("symbol") or symbol))
+                again = await self._live_service.fetch_order("binanceus", oid, str(intent.get("symbol") or symbol), priority="exit")
             except Exception:
                 logger.warning("SELL_CANCEL_CONFIRM_FAILED symbol=%s order=%s", symbol, oid, exc_info=True)
                 continue

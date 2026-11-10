@@ -9,6 +9,7 @@ from collections import defaultdict
 from typing import Any
 
 from backend.config.mystic_api_schedule import BINANCEUS_WEIGHT_PER_MIN
+from backend.config.protected_execution import MANDATORY_EXIT_SAME_CALL_ATTEMPTS
 from backend.metrics import (
     limiter_circuit_open,
     limiter_consume_wait_seconds,
@@ -91,6 +92,17 @@ VENUE_HW_AT_KEY = "bwl:venue_hw_at"
 VENUE_HW_WINDOW_KEY = "bwl:venue_hw_window"
 WINDOW_KEY = "bwl:window_id"
 PROTECTIVE_KEY = "bwl:protective_pending"
+EXIT_USED_KEY = "bwl:exit_weight_used"
+DEFERRED_KEY = "bwl:deferred_weight"
+EXIT_REFUSAL_KEY = "bwl:last_exit_refusal"
+# 4 DAY + 4 SCALP lots. One clean attempt is a fresh book plus the submit.
+# The mandatory loop can repeat that pair in the same minute. One in-flight
+# order may also need a status read, myTrades, and a cancel.
+PROTECTIVE_POSITION_SLOTS = 8
+PROTECTIVE_ATTEMPT_WEIGHT = DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT
+PROTECTIVE_RECOVERY_WEIGHT = ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT
+PROTECTIVE_WEIGHT_RESERVE = PROTECTIVE_POSITION_SLOTS * MANDATORY_EXIT_SAME_CALL_ATTEMPTS * PROTECTIVE_ATTEMPT_WEIGHT + PROTECTIVE_RECOVERY_WEIGHT
+_PRIORITY_CODE = {"background": 0, "entry": 1, "exit": 2}
 # A venue minute is 60 seconds. A sample older than that cannot still be the open minute.
 VENUE_SAMPLE_MAX_AGE_SEC = 60
 
@@ -129,14 +141,31 @@ if stored == nil or stored ~= window then
   redis.call('SET', KEYS[4], window)
   redis.call('SET', KEYS[2], (window + 1) * 60)
   redis.call('SET', KEYS[3], 0)
+  redis.call('SET', KEYS[13], 0)
+  redis.call('SET', KEYS[14], 0)
 end
+local priority = tonumber(ARGV[5])
+local reserve = tonumber(ARGV[6])
 if tokens == nil or tokens < weight then
+  if priority >= 2 then
+    redis.call('SET', KEYS[15], ARGV[1])
+  end
   return 0
+end
+if priority < 2 then
+  local pending = tonumber(redis.call('GET', KEYS[12])) or 0
+  if pending > 0 or (tokens - weight) < reserve then
+    redis.call('INCRBY', KEYS[14], weight)
+    return 0
+  end
 end
 redis.call('DECRBY', KEYS[1], weight)
 redis.call('INCRBY', KEYS[3], weight)
 redis.call('INCRBY', KEYS[8], weight)
 redis.call('INCR', KEYS[9])
+if priority >= 2 then
+  redis.call('INCRBY', KEYS[13], weight)
+end
 return 1
 """
 
@@ -397,7 +426,22 @@ def _consume_keys(path: str) -> tuple[str, ...]:
         f"bwl:req:{path}",
         VENUE_USED_KEY,
         VENUE_USED_AT_KEY,
+        PROTECTIVE_KEY,
+        EXIT_USED_KEY,
+        DEFERRED_KEY,
+        EXIT_REFUSAL_KEY,
     )
+
+
+def weight_grant_allowed(tokens: int, weight: int, *, priority: str, reserve: int, pending: bool) -> bool:
+    """Who may spend the shared minute. Exit may use the reserve. A pending sell blocks the rest."""
+    if weight <= 0 or int(tokens) < int(weight):
+        return False
+    if priority == "exit":
+        return True
+    if pending:
+        return False
+    return int(tokens) - int(weight) >= int(reserve)
 
 
 def note_venue_used_sync(used: int, started_at: float | None = None) -> None:
@@ -434,19 +478,21 @@ def observe_headers_sync(headers: Any, started_at: float | None = None) -> None:
         logger.debug("venue weight header not applied", exc_info=True)
 
 
-def try_consume_sync(path: str, weight: int) -> bool:
+def try_consume_sync(path: str, weight: int, priority: str = "background") -> bool:
     """Atomic shared-bucket charge for synchronous callers. False sends nothing."""
     try:
         client = get_sync_redis_service()
         now = time.time()
         granted = client.eval(
             _CONSUME_LUA,
-            11,
+            15,
             *_consume_keys(path),
             str(now),
             int(WEIGHT_BUDGET_PER_MIN),
             max(1, int(weight)),
             str(VENUE_SAMPLE_MAX_AGE_SEC),
+            str(_PRIORITY_CODE.get(priority, 0)),
+            str(PROTECTIVE_WEIGHT_RESERVE),
         )
         return int(granted or 0) == 1
     except Exception:
@@ -476,6 +522,9 @@ def request_weight_status() -> dict[str, Any]:
         observed_raw = client.get(VENUE_USED_AT_KEY)
         charged_raw = client.get(CHARGED_KEY)
         pending_raw = client.get(PROTECTIVE_KEY)
+        exit_used_raw = client.get(EXIT_USED_KEY)
+        deferred_raw = client.get(DEFERRED_KEY)
+        refusal_raw = client.get(EXIT_REFUSAL_KEY)
         window_raw = client.get(WINDOW_KEY)
         hw_raw = client.get(VENUE_HW_KEY)
         hw_window_raw = client.get(VENUE_HW_WINDOW_KEY)
@@ -505,6 +554,13 @@ def request_weight_status() -> dict[str, Any]:
         "request_weight_authoritative": False,
         "rate_limited_until": (now + ttl) if ttl > 0 else None,
         "protective_request_pending": int(pending_raw or 0) > 0,
+        "protective_pending": int(pending_raw or 0) > 0,
+        "protective_weight_reserved": PROTECTIVE_WEIGHT_RESERVE,
+        "protective_weight_used": int(exit_used_raw or 0),
+        "background_weight_deferred": int(deferred_raw or 0),
+        "last_protective_weight_refusal": float(refusal_raw) if refusal_raw is not None else None,
+        "critical_capacity_remaining": remaining,
+        "noncritical_capacity_remaining": None if remaining is None else (0 if int(pending_raw or 0) > 0 else max(0, remaining - PROTECTIVE_WEIGHT_RESERVE)),
         "request_weight_shared": True,
         "request_weight_window_id": stored_window if stored_window is not None else current,
         "request_weight_window_started_at": (stored_window if stored_window is not None else current) * 60,
@@ -595,7 +651,7 @@ class BinanceWeightLimiter:
     async def mark_protective_pending(self, delta: int) -> None:
         if int(delta) > 0:
             await self.r.incr(PROTECTIVE_KEY)
-            await self.r.expire(PROTECTIVE_KEY, 30)
+            await self.r.expire(PROTECTIVE_KEY, 120)
             return
         value = int(await self.r.decr(PROTECTIVE_KEY) or 0)
         if value < 0:
@@ -617,6 +673,7 @@ class BinanceWeightLimiter:
         weight: int | None = None,
         wait: bool = True,
         timeout: float = 5.0,
+        priority: str = "background",
     ) -> None:
         global _weight_log_last_time
 
@@ -639,12 +696,14 @@ class BinanceWeightLimiter:
         while True:
             granted = await self.r.eval(
                 _CONSUME_LUA,
-                11,
+                15,
                 *_consume_keys(path),
                 str(time.time()),
                 int(WEIGHT_BUDGET_PER_MIN),
                 int(weight or 1),
                 str(VENUE_SAMPLE_MAX_AGE_SEC),
+                str(_PRIORITY_CODE.get(priority, 0)),
+                str(PROTECTIVE_WEIGHT_RESERVE),
             )
             if int(granted or 0) == 1:
                 with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):

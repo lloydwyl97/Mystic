@@ -11,15 +11,21 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from backend.config.protected_execution import MANDATORY_EXIT_SAME_CALL_ATTEMPTS
+from backend.services.portfolio_engine import COMBINED_ENGINE_MAX_POSITIONS
 from backend.services.venue_order_budget import VenueOrderBudget
 from backend.utils.binance_weight_limiter import (
     ACCOUNT_WEIGHT,
+    DEPTH_WEIGHT,
     ENDPOINT_WEIGHTS,
     EXCHANGE_INFO_WEIGHT,
+    MY_TRADES_WEIGHT,
     OPEN_ORDERS_ALL_SYMBOLS_WEIGHT,
+    ORDER_CANCEL_WEIGHT,
     ORDER_STATUS_WEIGHT,
     ORDER_SUBMIT_WEIGHT,
     ORDER_USAGE_WEIGHT,
+    PROTECTIVE_WEIGHT_RESERVE,
     RateLimited,
     alignment_state,
     apply_venue_header,
@@ -28,6 +34,7 @@ from backend.utils.binance_weight_limiter import (
     header_used_weight,
     kline_request_weight,
     remaining_after_venue,
+    weight_grant_allowed,
     window_id,
 )
 
@@ -145,6 +152,45 @@ def test_callers_share_one_carried_budget() -> None:
     assert alignment_state(11, 11, 10) == "ALIGNED"
     assert alignment_state(11, None, None) == "UNKNOWN"
     assert alignment_state(11, 12, 10) == "LOCAL_AHEAD"
+
+
+def test_protective_reserve_covers_one_full_cycle_plus_one_recovery() -> None:
+    clean = DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT
+    recovery = ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT
+    assert COMBINED_ENGINE_MAX_POSITIONS * MANDATORY_EXIT_SAME_CALL_ATTEMPTS * clean + recovery == PROTECTIVE_WEIGHT_RESERVE
+    assert PROTECTIVE_WEIGHT_RESERVE < 1100
+
+
+def test_background_cannot_take_the_exit_reserve() -> None:
+    reserve = PROTECTIVE_WEIGHT_RESERVE
+    for used in (1070, 1080, 1090, 1095, 1099):
+        remaining = 1100 - used
+        assert weight_grant_allowed(remaining, 5, priority="exit", reserve=reserve, pending=False) is (remaining >= 5)
+        assert weight_grant_allowed(remaining, 2, priority="background", reserve=reserve, pending=False) is False
+        assert weight_grant_allowed(remaining, 1, priority="entry", reserve=reserve, pending=False) is False
+        assert weight_grant_allowed(remaining, 10, priority="background", reserve=reserve, pending=False) is False
+        assert weight_grant_allowed(remaining, 20, priority="background", reserve=reserve, pending=False) is False
+        assert weight_grant_allowed(remaining, 40, priority="background", reserve=reserve, pending=False) is False
+
+
+def test_pending_sell_refuses_entry_and_background() -> None:
+    assert weight_grant_allowed(500, 1, priority="entry", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is False
+    assert weight_grant_allowed(500, 2, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is False
+    assert weight_grant_allowed(500, 5, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is True
+    assert weight_grant_allowed(4, 5, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is False
+
+
+def test_eight_clean_attempts_fit_in_the_reserve() -> None:
+    remaining = PROTECTIVE_WEIGHT_RESERVE
+    clean = DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT
+    for _position in range(COMBINED_ENGINE_MAX_POSITIONS):
+        for _attempt in range(MANDATORY_EXIT_SAME_CALL_ATTEMPTS):
+            assert weight_grant_allowed(remaining, DEPTH_WEIGHT, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True)
+            remaining -= DEPTH_WEIGHT
+            assert weight_grant_allowed(remaining, ORDER_SUBMIT_WEIGHT, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True)
+            remaining -= ORDER_SUBMIT_WEIGHT
+            assert clean == DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT
+    assert remaining == ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT
 
 
 def test_weight_header_parser() -> None:

@@ -255,9 +255,9 @@ class LiveTradingService:
                 self._limiter = await BinanceWeightLimiter.create()
         return self._limiter
 
-    async def _charge_weight(self, path: str, weight: int, *, wait: bool = True, timeout: float = 5.0) -> None:
+    async def _charge_weight(self, path: str, weight: int, *, wait: bool = True, timeout: float = 5.0, priority: str = "background") -> None:
         limiter = await self._get_limiter()
-        await limiter.consume(path, weight=weight, wait=wait, timeout=timeout)
+        await limiter.consume(path, weight=weight, wait=wait, timeout=timeout, priority=priority)
 
     async def _note_response_weight(self, headers: Any) -> None:
         from backend.utils.binance_weight_limiter import observe_headers
@@ -680,8 +680,8 @@ class LiveTradingService:
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
                 try:
                     if not getattr(self.binance, "markets", None):
-                        await self._charge_weight("/api/v3/exchangeInfo", 20)
-                    await self._charge_weight("/api/v3/order", ORDER_SUBMIT_WEIGHT)
+                        await self._charge_weight("/api/v3/exchangeInfo", 20, priority=priority)
+                    await self._charge_weight("/api/v3/order", ORDER_SUBMIT_WEIGHT, priority=priority)
                 except (RateLimitedError, CircuitOpenError) as e:
                     return {
                         "status": "error",
@@ -761,13 +761,21 @@ class LiveTradingService:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-    async def fetch_order(self, exchange: str, order_id: str, symbol: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def fetch_order(
+        self,
+        exchange: str,
+        order_id: str,
+        symbol: str,
+        params: dict[str, Any] | None = None,
+        *,
+        priority: str = "background",
+    ) -> dict[str, Any]:
         """Fetch order status. Numeric ids use orderId; others use origClientOrderId."""
         _mark_order_activity(self, symbol, 0)
         try:
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
-                await self._charge_weight("/api/v3/order", 4)
+                await self._charge_weight("/api/v3/order", 4, priority=priority)
                 pair = _to_binance_pair(symbol)
                 extra = dict(params or {})
                 ref = str(order_id or "").strip()
@@ -802,7 +810,7 @@ class LiveTradingService:
                 "rate_limited": isinstance(e, (RateLimitedError, CircuitOpenError)),
             }
 
-    async def fetch_order_trades(self, exchange: str, symbol: str, order_id: str) -> dict[str, Any]:
+    async def fetch_order_trades(self, exchange: str, symbol: str, order_id: str, *, priority: str = "background") -> dict[str, Any]:
         """Fetch the venue's per-fill trade records for one order.
 
         Binance.US ``GET /api/v3/myTrades`` is the authoritative source for
@@ -815,7 +823,7 @@ class LiveTradingService:
             await self._ensure_initialized()
             if exchange.lower() not in {EXCHANGE_ID.lower(), "binance", "binanceus"} or not self.binance:
                 return {"status": "error", "message": "Exchange not available"}
-            await self._charge_weight("/api/v3/myTrades", 20)
+            await self._charge_weight("/api/v3/myTrades", 20, priority=priority)
             pair = _to_binance_pair(symbol)
             trades = await asyncio.to_thread(
                 self.binance.fetch_my_trades,
@@ -855,14 +863,14 @@ class LiveTradingService:
                 "rate_limited": isinstance(e, (RateLimitedError, CircuitOpenError)),
             }
 
-    async def cancel_order(self, exchange: str, order_id: str, symbol: str) -> dict[str, Any]:
+    async def cancel_order(self, exchange: str, order_id: str, symbol: str, *, priority: str = "background") -> dict[str, Any]:
         """Cancel an existing spot order on Binance.US."""
         try:
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
                 from backend.utils.binance_weight_limiter import ORDER_CANCEL_WEIGHT
 
-                await self._charge_weight("/api/v3/order", ORDER_CANCEL_WEIGHT)
+                await self._charge_weight("/api/v3/order", ORDER_CANCEL_WEIGHT, priority=priority)
                 pair = _to_binance_pair(symbol)
                 await asyncio.to_thread(self.binance.cancel_order, id=order_id, symbol=pair)
                 await self._note_exchange_weight()

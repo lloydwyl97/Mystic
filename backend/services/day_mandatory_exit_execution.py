@@ -264,63 +264,79 @@ async def run_mandatory_exit_ioc_loop(
         out.abandoned_reason = "zero_qty"
         return out
 
-    for i in range(max(1, int(max_attempts))):
-        if not is_meaningful(remaining):
-            break
-        impact = impact_for_attempt(i)
-        out.attempts = i + 1
-        pf = await preflight(remaining, impact)
-        if pf is None or not bool(getattr(pf, "passed", False)):
-            out.abandoned_reason = str(getattr(pf, "reject_reason", "") or "preflight_failed")
-            logger.warning(
-                "MANDATORY_EXIT_PREFLIGHT_HOLD attempt=%s reason=%s remaining=%.8f",
-                i + 1,
-                out.abandoned_reason,
-                remaining,
-            )
-            break
-        chunk = float(getattr(pf, "executable_qty", 0.0) or getattr(pf, "quantity", 0.0) or 0.0)
-        chunk = min(chunk, remaining)
-        limit = float(getattr(pf, "protected_limit_price", 0.0) or 0.0)
-        if chunk <= 0 or limit <= 0:
-            out.abandoned_reason = "no_executable_chunk"
-            continue
-        order = stamp_preflight(await place_ioc(chunk, limit), pf)
-        from backend.services.protected_limit_execution import LIVE_OUTCOME_RATE_LIMITED, last_live_order_outcome
+    limiter = None
+    try:
+        from backend.utils.binance_weight_limiter import BinanceWeightLimiter
 
-        if last_live_order_outcome() == LIVE_OUTCOME_RATE_LIMITED:
-            out.abandoned_reason = "venue_rate_limit"
-            logger.warning("MANDATORY_EXIT_RATE_LIMIT attempt=%s remaining=%.8f", i + 1, remaining)
-            break
-        filled = float((order or {}).get("filled") or 0.0)
-        if order is None or filled <= 0:
+        limiter = await BinanceWeightLimiter.create()
+        await limiter.mark_protective_pending(1)
+    except Exception:
+        logger.warning("PROTECTIVE_PENDING_UNAVAILABLE")
+        limiter = None
+    try:
+        for i in range(max(1, int(max_attempts))):
+            if not is_meaningful(remaining):
+                break
+            impact = impact_for_attempt(i)
+            out.attempts = i + 1
+            pf = await preflight(remaining, impact)
+            if pf is None or not bool(getattr(pf, "passed", False)):
+                out.abandoned_reason = str(getattr(pf, "reject_reason", "") or "preflight_failed")
+                logger.warning(
+                    "MANDATORY_EXIT_PREFLIGHT_HOLD attempt=%s reason=%s remaining=%.8f",
+                    i + 1,
+                    out.abandoned_reason,
+                    remaining,
+                )
+                break
+            chunk = float(getattr(pf, "executable_qty", 0.0) or getattr(pf, "quantity", 0.0) or 0.0)
+            chunk = min(chunk, remaining)
+            limit = float(getattr(pf, "protected_limit_price", 0.0) or 0.0)
+            if chunk <= 0 or limit <= 0:
+                out.abandoned_reason = "no_executable_chunk"
+                continue
+            order = stamp_preflight(await place_ioc(chunk, limit), pf)
+            from backend.services.protected_limit_execution import LIVE_OUTCOME_RATE_LIMITED, last_live_order_outcome
+
+            if last_live_order_outcome() == LIVE_OUTCOME_RATE_LIMITED:
+                out.abandoned_reason = "venue_rate_limit"
+                logger.warning("MANDATORY_EXIT_RATE_LIMIT attempt=%s remaining=%.8f", i + 1, remaining)
+                break
+            filled = float((order or {}).get("filled") or 0.0)
+            if order is None or filled <= 0:
+                logger.warning(
+                    "MANDATORY_EXIT_IOC_ZERO attempt=%s chunk=%.8f limit=%.8f remaining=%.8f",
+                    i + 1,
+                    chunk,
+                    limit,
+                    remaining,
+                )
+                continue
+            if filled > remaining + 1e-12:
+                filled = remaining
+                order = dict(order)
+                order["filled"] = filled
+            out.orders.append(order)
+            remaining -= filled
+            out.filled_qty += filled
+            out.remaining_qty = max(0.0, remaining)
             logger.warning(
-                "MANDATORY_EXIT_IOC_ZERO attempt=%s chunk=%.8f limit=%.8f remaining=%.8f",
+                "MANDATORY_EXIT_IOC_FILL attempt=%s filled=%.8f remaining=%.8f limit=%.8f",
                 i + 1,
-                chunk,
+                filled,
+                remaining,
                 limit,
-                remaining,
             )
-            continue
-        if filled > remaining + 1e-12:
-            filled = remaining
-            order = dict(order)
-            order["filled"] = filled
-        out.orders.append(order)
-        remaining -= filled
-        out.filled_qty += filled
-        out.remaining_qty = max(0.0, remaining)
-        logger.warning(
-            "MANDATORY_EXIT_IOC_FILL attempt=%s filled=%.8f remaining=%.8f limit=%.8f",
-            i + 1,
-            filled,
-            remaining,
-            limit,
-        )
 
-    out.combined_order = _combine_orders(out.orders, requested)
-    if out.combined_order:
-        out.average_price = float(out.combined_order.get("average") or 0.0)
-    if out.remaining_qty > 0 and is_meaningful(out.remaining_qty) and not out.abandoned_reason:
-        out.abandoned_reason = "residual_after_same_call"
-    return out
+        out.combined_order = _combine_orders(out.orders, requested)
+        if out.combined_order:
+            out.average_price = float(out.combined_order.get("average") or 0.0)
+        if out.remaining_qty > 0 and is_meaningful(out.remaining_qty) and not out.abandoned_reason:
+            out.abandoned_reason = "residual_after_same_call"
+        return out
+    finally:
+        if limiter is not None:
+            try:
+                await limiter.mark_protective_pending(-1)
+            except Exception:
+                logger.warning("PROTECTIVE_PENDING_CLEAR_FAILED")
