@@ -811,7 +811,7 @@ class LiveTradingService:
                 "rate_limited": isinstance(e, (RateLimitedError, CircuitOpenError)),
             }
 
-    async def fetch_order_trades(self, exchange: str, symbol: str, order_id: str, *, priority: str = "background") -> dict[str, Any]:
+    async def fetch_order_trades(self, exchange: str, symbol: str, order_id: str, *, priority: str = "background", wait: bool = True) -> dict[str, Any]:
         """Fetch the venue's per-fill trade records for one order.
 
         Binance.US ``GET /api/v3/myTrades`` is the authoritative source for
@@ -824,7 +824,7 @@ class LiveTradingService:
             await self._ensure_initialized()
             if exchange.lower() not in {EXCHANGE_ID.lower(), "binance", "binanceus"} or not self.binance:
                 return {"status": "error", "message": "Exchange not available"}
-            await self._charge_weight("/api/v3/myTrades", 20, priority=priority)
+            await self._charge_weight("/api/v3/myTrades", 20, priority=priority, wait=wait)
             pair = _to_binance_pair(symbol)
             trades = await asyncio.to_thread(
                 self.binance.fetch_my_trades,

@@ -208,19 +208,20 @@ def _combine_orders(orders: list[dict[str, Any]], requested: float) -> dict[str,
                 ccy = str(f.get("commissionAsset") or "").upper()
                 fee_by_ccy[ccy] = fee_by_ccy.get(ccy, 0.0) + _f(f.get("commission"))
         else:
-            pairs = _order_fee_pairs(o)
+            pairs = [(amt, ccy) for amt, ccy in _order_fee_pairs(o) if ccy]
             for amt, ccy in pairs:
                 fee_by_ccy[ccy] = fee_by_ccy.get(ccy, 0.0) + amt
-            fills.append(
-                {
-                    "price": str(px),
-                    "qty": str(fq),
-                    "commission": str(sum(a for a, _c in pairs)),
-                    "commissionAsset": pairs[0][1] if pairs else "",
-                    "orderId": oid,
-                    "_mystic_synthetic": True,
-                }
-            )
+            if pairs:
+                fills.append(
+                    {
+                        "price": str(px),
+                        "qty": str(fq),
+                        "commission": str(sum(a for a, _c in pairs)),
+                        "commissionAsset": pairs[0][1],
+                        "orderId": oid,
+                        "_mystic_synthetic": True,
+                    }
+                )
         for t in o.get("trades") or []:
             if isinstance(t, dict):
                 trades.append(dict(t))
@@ -242,6 +243,7 @@ def _combine_orders(orders: list[dict[str, Any]], requested: float) -> dict[str,
     if chunk_preflights:
         last[PREFLIGHT_CHUNKS_KEY] = chunk_preflights
     last["_mystic_order_ids"] = order_ids
+    last["_mystic_child_orders"] = [dict(child) for child in used]
     last["_mystic_mandatory_flatten_fills"] = len(used)
     last["_mystic_partial_fill"] = tot + 1e-12 < float(requested)
     last["_mystic_ioc_incomplete"] = bool(last.get("_mystic_partial_fill"))
@@ -296,11 +298,19 @@ async def run_mandatory_exit_ioc_loop(
                 out.abandoned_reason = "no_executable_chunk"
                 continue
             order = stamp_preflight(await place_ioc(chunk, limit), pf)
-            from backend.services.protected_limit_execution import LIVE_OUTCOME_RATE_LIMITED, last_live_order_outcome
+            from backend.services.protected_limit_execution import (
+                LIVE_OUTCOME_RATE_LIMITED,
+                LIVE_OUTCOME_UNCONFIRMED,
+                last_live_order_outcome,
+            )
 
             if last_live_order_outcome() == LIVE_OUTCOME_RATE_LIMITED:
                 out.abandoned_reason = "venue_rate_limit"
                 logger.warning("MANDATORY_EXIT_RATE_LIMIT attempt=%s remaining=%.8f", i + 1, remaining)
+                break
+            if order is None and last_live_order_outcome() == LIVE_OUTCOME_UNCONFIRMED:
+                out.abandoned_reason = "venue_unconfirmed"
+                logger.warning("MANDATORY_EXIT_UNCONFIRMED attempt=%s remaining=%.8f", i + 1, remaining)
                 break
             filled = float((order or {}).get("filled") or 0.0)
             if order is None or filled <= 0:

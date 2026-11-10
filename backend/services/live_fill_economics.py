@@ -89,6 +89,16 @@ def _as_float(raw: Any) -> float | None:
         return None
 
 
+def _explicit_commission(fill: dict[str, Any]) -> float | None:
+    """A commission the venue actually sent, including an explicit zero."""
+    if "commission" in fill and fill.get("commission") is not None:
+        return _as_float(fill.get("commission"))
+    fee = fill.get("fee") if isinstance(fill.get("fee"), dict) else None
+    if isinstance(fee, dict) and fee.get("cost") is not None:
+        return _as_float(fee.get("cost"))
+    return None
+
+
 def _fee_pairs_from_fills(fills: Any) -> list[tuple[float, str]]:
     out: list[tuple[float, str]] = []
     if not isinstance(fills, list):
@@ -96,8 +106,12 @@ def _fee_pairs_from_fills(fills: Any) -> list[tuple[float, str]]:
     for fill in fills:
         if not isinstance(fill, dict):
             continue
-        qty = _as_float(fill.get("commission") if fill.get("commission") is not None else fill.get("amount"))
         asset = str(fill.get("commissionAsset") or fill.get("asset") or fill.get("currency") or "").upper()
+        explicit = _explicit_commission(fill)
+        if explicit is not None and asset:
+            out.append((abs(explicit), asset))
+            continue
+        qty = _as_float(fill.get("amount"))
         if qty and asset:
             out.append((abs(qty), asset))
     return out
@@ -112,15 +126,19 @@ def _fee_pairs_from_trades(trades: Any) -> list[tuple[float, str]]:
             continue
         tfee = trade.get("fee")
         if isinstance(tfee, dict):
-            qty = _as_float(tfee.get("cost") if tfee.get("cost") is not None else tfee.get("amount"))
             asset = str(tfee.get("currency") or tfee.get("asset") or "").upper()
+            explicit = _as_float(tfee.get("cost")) if tfee.get("cost") is not None else None
+            if explicit is not None and asset:
+                out.append((abs(explicit), asset))
+                continue
+            qty = _as_float(tfee.get("amount"))
             if qty and asset:
                 out.append((abs(qty), asset))
                 continue
-        qty = _as_float(trade.get("commission"))
+        explicit = _as_float(trade.get("commission")) if trade.get("commission") is not None else None
         asset = str(trade.get("commissionAsset") or "").upper()
-        if qty and asset:
-            out.append((abs(qty), asset))
+        if explicit is not None and asset:
+            out.append((abs(explicit), asset))
     return out
 
 
@@ -139,9 +157,10 @@ def _iter_fee_items(order: dict[str, Any] | None) -> list[tuple[float, str]]:
 
     def _add(amount: Any, asset: Any) -> None:
         qty = _as_float(amount)
-        if qty is None or qty == 0:
+        label = str(asset or "").upper()
+        if qty is None or not label:
             return
-        out.append((abs(qty), str(asset or "").upper()))
+        out.append((abs(qty), label))
 
     raw_fee = order.get("fee")
     if isinstance(raw_fee, dict):
@@ -383,13 +402,127 @@ def commission_parts(
     return {"base_fee": base_fee, "quote_fee": quote_fee, "other_assets": other}
 
 
+def _positive(raw: Any) -> float:
+    try:
+        value = float(raw or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0.0 else 0.0
+
+
+def _fill_qty(fill: dict[str, Any]) -> float:
+    return _positive(fill.get("qty") if fill.get("qty") is not None else fill.get("amount"))
+
+
+def _fill_asset(fill: dict[str, Any]) -> str:
+    fee = fill.get("fee") if isinstance(fill.get("fee"), dict) else {}
+    return str(fill.get("commissionAsset") or fill.get("commission_asset") or fee.get("currency") or fill.get("asset") or "").upper()
+
+
+def _order_fills(order: dict[str, Any]) -> list[dict[str, Any]]:
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    rows = [dict(row) for row in (info.get("fills") or []) if isinstance(row, dict)]
+    if rows:
+        return rows
+    return [dict(row) for row in (order.get("trades") or []) if isinstance(row, dict)]
+
+
+def proven_sell_base_qty(order: dict[str, Any] | None) -> float:
+    """Base the venue says was sold.
+
+    ``executedQty`` is the venue field. A larger CCXT ``filled`` is not used
+    in its place. Fill rows are used only when the venue summary has no
+    executed quantity.
+    """
+    if not isinstance(order, dict):
+        return 0.0
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    executed = _positive(info.get("executedQty"))
+    if executed > 0.0:
+        return executed
+    real = [row for row in _order_fills(order) if not row.get("_mystic_synthetic") and _fill_qty(row) > 0.0]
+    if real:
+        return sum(_fill_qty(row) for row in real)
+    return _positive(order.get("filled"))
+
+
+def proven_sell_quote(order: dict[str, Any] | None) -> float:
+    """Quote proceeds before the fee is known. Fills win, then the venue cumulative."""
+    if not isinstance(order, dict):
+        return 0.0
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    real = [row for row in _order_fills(order) if not row.get("_mystic_synthetic") and _fill_qty(row) > 0.0]
+    if real:
+        quote = 0.0
+        for row in real:
+            quote += _positive(row.get("quoteQty") or row.get("quote_qty") or row.get("cost")) or _fill_qty(row) * _positive(row.get("price"))
+        if quote > 0.0:
+            return quote
+    cumulative = _positive(info.get("cummulativeQuoteQty") or order.get("cost"))
+    if cumulative > 0.0:
+        return cumulative
+    qty = proven_sell_base_qty(order)
+    return qty * _positive(order.get("average") or order.get("price"))
+
+
+def sell_commission_known(order: dict[str, Any] | None) -> bool:
+    """True when every sold unit has a venue commission asset, including an explicit zero."""
+    if not isinstance(order, dict):
+        return False
+    qty = proven_sell_base_qty(order)
+    if qty <= 0.0:
+        return False
+    backed = 0.0
+    saw_unbacked = False
+    for row in _order_fills(order):
+        part = _fill_qty(row)
+        if part <= 0.0:
+            continue
+        if _fill_asset(row):
+            backed += part
+        else:
+            saw_unbacked = True
+    if _order_fills(order) and not saw_unbacked and backed + 1e-8 >= qty:
+        return True
+    if _order_fills(order):
+        return False
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    fee = order.get("fee") if isinstance(order.get("fee"), dict) else {}
+    asset = str(fee.get("currency") or order.get("commissionAsset") or info.get("commissionAsset") or "").upper()
+    return bool(asset)
+
+
+def align_proven_sell_qty(order: dict[str, Any] | None) -> dict[str, Any]:
+    """Book the proven base, when the summary fields disagree."""
+    if not isinstance(order, dict):
+        return {}
+    proven = proven_sell_base_qty(order)
+    if proven <= 0.0:
+        return order
+    current = _positive(order.get("filled"))
+    if current <= 0.0 or abs(current - proven) > 1e-8:
+        aligned = dict(order)
+        aligned["filled"] = proven
+        return aligned
+    return order
+
+
+def sell_attempt_disposition(order: dict[str, Any] | None, outcome: str) -> str:
+    """What a protected SELL attempt may do with its intent. Accounting is separate."""
+    if proven_sell_base_qty(order) > 0.0:
+        return "filled" if sell_commission_known(order) else "fee_pending"
+    if str(outcome or "") in {"EXPIRED_UNFILLED", "TIMEOUT_CANCELED_UNFILLED", "EXCHANGE_REJECTED"}:
+        return "release"
+    return "keep"
+
+
 def merge_venue_trades_into_order(order: dict[str, Any] | None, trades: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """Attach myTrades onto a GET /order payload that omitted fills."""
+    """Attach myTrades onto a payload that does not already name every commission."""
     raw = dict(order) if isinstance(order, dict) else {}
     rows = [t for t in (trades or []) if isinstance(t, dict)]
     if not rows:
         return raw
-    if raw.get("trades") or (isinstance(raw.get("info"), dict) and raw["info"].get("fills")):
+    if sell_commission_known(raw):
         return raw
     fills: list[dict[str, Any]] = []
     normalized: list[dict[str, Any]] = []

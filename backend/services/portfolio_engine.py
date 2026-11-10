@@ -8752,21 +8752,26 @@ class PortfolioEngine:
         if not order_id or not self._live_service:
             return order
         weight_priority = "exit" if str(side).lower() == "sell" else "entry"
+        # A sell must not sit on the limiter. The create body is kept when the
+        # read cannot be paid immediately.
+        weight_wait = weight_priority != "exit"
         if len(order.get("_mystic_order_ids") or []) > 1:
             # Combined multi-order close: a GET on the last id would replace the
-            # aggregate filled/cost with that single chunk.
-            return order
-        order = await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority)
+            # aggregate filled/cost with that single chunk. Each chunk is read
+            # on its own when that chunk's commission is still missing.
+            return await self._attach_chunk_trades(order, exchange_symbol, priority=weight_priority, wait=weight_wait)
+        order = await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority, wait=weight_wait)
         status = (order.get("status") or "").lower()
         if status in ("closed", "filled", "canceled", "cancelled", "expired"):
-            return await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority)
+            return await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority, wait=weight_wait)
         for _ in range(2):
             await asyncio.sleep(0.2 + 0.2 * random.random())
             res = await self._live_service.fetch_order(
                 "binanceus",
                 str(order_id),
                 exchange_symbol,
-                priority="exit" if str(side).lower() == "sell" else "entry",
+                priority=weight_priority,
+                wait=weight_wait,
             )
             if res.get("status") != "success":
                 break
@@ -8798,22 +8803,43 @@ class PortfolioEngine:
                 order_id,
                 float(filled) if filled else 0,
             )
-        return await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority)
+        return await self._attach_venue_trades(order, exchange_symbol, priority=weight_priority, wait=weight_wait)
 
-    async def _attach_venue_trades(self, order: dict[str, Any], exchange_symbol: str, *, priority: str = "background") -> dict[str, Any]:
-        """GET /order omits fills. myTrades is the venue commission authority."""
+    async def _attach_chunk_trades(self, order: dict[str, Any], exchange_symbol: str, *, priority: str, wait: bool) -> dict[str, Any]:
+        """Read each chunk of a combined close. One id's trades must not replace the others."""
+        from backend.services.day_mandatory_exit_execution import _combine_orders
+        from backend.services.live_fill_economics import sell_commission_known
+
+        if sell_commission_known(order):
+            return order
+        children = [dict(child) for child in (order.get("_mystic_child_orders") or []) if isinstance(child, dict)]
+        if not children:
+            return order
+        enriched = []
+        for child in children:
+            enriched.append(await self._attach_venue_trades(child, exchange_symbol, priority=priority, wait=wait))
+        combined = _combine_orders(enriched, float(order.get("amount") or order.get("filled") or 0.0))
+        return combined or order
+
+    async def _attach_venue_trades(self, order: dict[str, Any], exchange_symbol: str, *, priority: str = "background", wait: bool = True) -> dict[str, Any]:
+        """GET /order omits fills. myTrades is the venue commission authority.
+
+        A sell that already names its commission does not spend the 20-weight
+        read. A sell that does not spends it only when the weight is available:
+        ``wait=False`` returns the order unchanged instead of holding the next lot.
+        """
         if not order or not self._live_service:
             return order
-        info = order.get("info") if isinstance(order.get("info"), dict) else {}
-        if order.get("trades") or info.get("fills"):
+        from backend.services.live_fill_economics import merge_venue_trades_into_order, sell_commission_known
+
+        if sell_commission_known(order):
             return order
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
         oid = str(order.get("id") or info.get("orderId") or "").strip()
         if not oid:
             return order
         try:
-            from backend.services.live_fill_economics import merge_venue_trades_into_order
-
-            res = await self._live_service.fetch_order_trades("binanceus", exchange_symbol, oid, priority=priority)
+            res = await self._live_service.fetch_order_trades("binanceus", exchange_symbol, oid, priority=priority, wait=wait)
             if res.get("status") != "success":
                 return order
             return merge_venue_trades_into_order(order, res.get("trades") or [])
@@ -9526,7 +9552,7 @@ class PortfolioEngine:
             return {"absent": True}
         return {"unconfirmed": True}
 
-    async def _apply_probed_order(self, order: dict[str, Any], symbol: str, client_order_id: str = "") -> dict[str, Any]:
+    async def _apply_probed_order(self, order: dict[str, Any], symbol: str, client_order_id: str = "", *, wait: bool = True) -> dict[str, Any]:
         from backend.services.live_fill_economics import merge_venue_trades_into_order
         from backend.services.strategy_order_intent import apply_venue_order
 
@@ -9534,7 +9560,14 @@ class PortfolioEngine:
             order["clientOrderId"] = client_order_id
         applied = apply_venue_order(self.db_path, order)
         if applied.get("reason") == "NEEDS_TRADES":
-            trades = await self._live_service.fetch_order_trades("binanceus", symbol, str(order.get("id") or ""))
+            priority = "exit" if str(order.get("side") or "").lower() == "sell" else "background"
+            trades = await self._live_service.fetch_order_trades(
+                "binanceus",
+                symbol,
+                str(order.get("id") or ""),
+                priority=priority,
+                wait=wait,
+            )
             if str(trades.get("status") or "") == "success":
                 applied = apply_venue_order(self.db_path, merge_venue_trades_into_order(order, trades.get("trades")))
         return applied
@@ -9560,6 +9593,50 @@ class PortfolioEngine:
         freshness["best_ask"] = ask
         return freshness
 
+    def _settle_sell_attempt(self, client_order_id: str, order: dict[str, Any] | None) -> str:
+        """Record the attempt without treating a missing commission as a close."""
+        from backend.services.protected_limit_execution import last_live_order_outcome
+        from backend.services.strategy_order_intent import record_sell_attempt_result
+
+        if not client_order_id or not getattr(self, "db_path", None):
+            return ""
+        return record_sell_attempt_result(
+            self.db_path,
+            client_order_id=client_order_id,
+            order=order if isinstance(order, dict) else None,
+            outcome=last_live_order_outcome(),
+        )
+
+    async def _canonical_pending_sell(self, position: Any) -> dict[str, Any] | None:
+        """One already-filled sell whose commission can now be read. No waiting."""
+        from backend.services.live_fill_economics import sell_commission_known
+        from backend.services.strategy_order_intent import unbooked_protective_sells
+
+        trade_id = str(getattr(position, "trade_id", "") or "")
+        if not trade_id or self._live_service is None or not getattr(self, "db_path", None):
+            return None
+        symbol = str(getattr(position, "symbol", "") or "")
+        for intent in unbooked_protective_sells(self.db_path, trade_id):
+            oid = str(intent.get("exchange_order_id") or "")
+            qty = float(intent.get("filled_qty") or 0.0)
+            quote = float(intent.get("filled_cost") or 0.0)
+            if not oid or qty <= 0.0:
+                continue
+            order = {
+                "id": oid,
+                "clientOrderId": str(intent.get("client_order_id") or ""),
+                "filled": qty,
+                "cost": quote,
+                "average": (quote / qty) if qty else 0.0,
+                "status": "closed",
+                "info": {"executedQty": str(qty), "cummulativeQuoteQty": str(quote), "orderId": oid},
+            }
+            order = await self._attach_venue_trades(order, symbol, priority="exit", wait=False)
+            if sell_commission_known(order):
+                order["_mystic_recovered_fill"] = True
+                return order
+        return None
+
     async def _progress_working_sell(self, symbol: str, *, allow_cancel: bool) -> None:
         """Adopt fills on a live protective SELL. Cancel it only after its own timeout and a fresh book.
 
@@ -9581,7 +9658,7 @@ class PortfolioEngine:
                 mark_intent_absent(self.db_path, str(intent.get("client_order_id") or ""))
                 continue
             order = probed["order"]
-            await self._apply_probed_order(order, str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""))
+            await self._apply_probed_order(order, str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""), wait=False)
             if not order_is_working(order):
                 continue
             age = time.time() - float(intent.get("created_at") or time.time())
@@ -9614,7 +9691,7 @@ class PortfolioEngine:
                 continue
             if str(again.get("status") or "") != "success" or not isinstance(again.get("order"), dict):
                 continue
-            await self._apply_probed_order(again["order"], str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""))
+            await self._apply_probed_order(again["order"], str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""), wait=False)
 
     async def _recover_strategy_order_intents(self) -> int:
         """Find venue orders for intents that died before a fill was stored, then book them once."""
@@ -14420,12 +14497,19 @@ class PortfolioEngine:
         _venue_sell_budget: list[float] = []
 
         async def _protected_live_sell(qty: float) -> dict[str, Any] | None:
+            # A fill whose fee is now known is booked before any new order.
+            ready = await self._canonical_pending_sell(position)
+            if ready is not None:
+                return ready
             # Every venue SELL of this call draws on one budget: the lot's own
-            # fill-proven quantity. Mandatory, residual, dust and cleanup
-            # exits have no bypass.
+            # fill-proven quantity, minus base already sent and not yet closed.
+            # Mandatory, residual, dust and cleanup exits have no bypass.
             if not _venue_sell_budget:
+                from backend.services.strategy_order_intent import reserved_unbooked_sell_qty
+
                 _owned = self._fill_owned_qty(position)
                 _booked = float(getattr(position, "quantity", 0) or 0)
+                _booked = max(0.0, _booked - reserved_unbooked_sell_qty(self.db_path, str(getattr(position, "trade_id", "") or "")))
                 _venue_sell_budget.append(min(_booked, _owned) if _owned is not None else _booked)
             if float(qty or 0) > _venue_sell_budget[0] + 1e-15:
                 logger.error(
@@ -14469,13 +14553,32 @@ class PortfolioEngine:
                     )
 
                 async def _place(q: float, limit: float):
-                    return await execute_protected_limit_live(
+                    from backend.services.strategy_order_intent import allocate_intent
+
+                    sell_client_id = ""
+                    if str(getattr(position, "trade_id", "") or ""):
+                        sell_client_id = allocate_intent(
+                            self.db_path,
+                            engine_id=str(getattr(position, "engine_id", "") or "DAY_V2"),
+                            trade_id=str(position.trade_id),
+                            decision_id=str(getattr(position, "entry_decision_id", "") or ""),
+                            symbol=symbol,
+                            side="SELL",
+                            quantity=float(q),
+                            limit_price=float(limit or 0.0),
+                            setup=str(getattr(position, "entry_thesis", "") or ""),
+                        )
+                    order = await execute_protected_limit_live(
                         self._live_service,
                         symbol=_to_api_symbol(symbol),
                         side="sell",
                         quantity=q,
                         limit_price=limit,
+                        client_order_id=sell_client_id or None,
                     )
+                    if sell_client_id:
+                        self._settle_sell_attempt(sell_client_id, order if isinstance(order, dict) else None)
+                    return order
 
                 def _meaningful(q: float) -> bool:
                     return is_meaningful_residual(
@@ -14611,8 +14714,10 @@ class PortfolioEngine:
                 with contextlib.suppress(Exception):
                     mark_exchange_order(self.db_path, sell_client_id, str(order.get("id") or ""), status="ACKED")
             elif sell_client_id:
-                with contextlib.suppress(Exception):
-                    await self._progress_working_sell(symbol, allow_cancel=False)
+                disposition = self._settle_sell_attempt(sell_client_id, None)
+                if disposition == "keep":
+                    with contextlib.suppress(Exception):
+                        await self._progress_working_sell(symbol, allow_cancel=False)
             return stamp_preflight(order, pf)
 
         hold_time_seconds = time.time() - position.entry_time
@@ -15381,6 +15486,9 @@ class PortfolioEngine:
                     live_order_sell = await _protected_live_sell(actual_sold_qty)
                     if live_order_sell:
                         live_order_sell = await self._verify_order_fill(live_order_sell, exchange_symbol, "sell")
+                        from backend.services.live_fill_economics import align_proven_sell_qty
+
+                        live_order_sell = align_proven_sell_qty(live_order_sell)
                         filled_qty = live_order_sell.get("filled", actual_sold_qty)
                         if filled_qty and float(filled_qty) > 0:
                             actual_sold_qty = float(filled_qty)
@@ -15472,6 +15580,9 @@ class PortfolioEngine:
                             live_order_sell = await _protected_live_sell(actual_sold_qty)
                             if live_order_sell:
                                 live_order_sell = await self._verify_order_fill(live_order_sell, exchange_symbol, "sell")
+                                from backend.services.live_fill_economics import align_proven_sell_qty
+
+                                live_order_sell = align_proven_sell_qty(live_order_sell)
                                 filled_qty = live_order_sell.get("filled", actual_sold_qty)
                                 if filled_qty and float(filled_qty) > 0:
                                     actual_sold_qty = float(filled_qty)
@@ -15525,6 +15636,9 @@ class PortfolioEngine:
                                     live_order_sell = await _protected_live_sell(actual_sold_qty)
                                     if live_order_sell:
                                         live_order_sell = await self._verify_order_fill(live_order_sell, exchange_symbol, "sell")
+                                        from backend.services.live_fill_economics import align_proven_sell_qty
+
+                                        live_order_sell = align_proven_sell_qty(live_order_sell)
                                         filled_qty = live_order_sell.get("filled", actual_sold_qty)
                                         if filled_qty and float(filled_qty) > 0:
                                             actual_sold_qty = float(filled_qty)
@@ -15644,6 +15758,37 @@ class PortfolioEngine:
                     float(actual_sold_qty or 0.0),
                 )
                 return None
+            from backend.services.live_fill_economics import align_proven_sell_qty, sell_commission_known
+
+            if not sell_commission_known(live_order_sell):
+                # Executed quantity is known. The commission is not. Do not
+                # finish the close with a modeled fee, and do not send this
+                # base again. A chunk that already has its commission is booked
+                # on its own. The rest is read from myTrades on a later pass,
+                # without waiting out the limiter.
+                children = [row for row in ((live_order_sell or {}).get("_mystic_child_orders") or []) if isinstance(row, dict)]
+                ready = None
+                if children:
+                    for child in children:
+                        self._settle_sell_attempt(str(child.get("clientOrderId") or ""), child)
+                        aligned = align_proven_sell_qty(child)
+                        if ready is None and sell_commission_known(aligned):
+                            ready = aligned
+                else:
+                    self._settle_sell_attempt(str((live_order_sell or {}).get("clientOrderId") or ""), live_order_sell)
+                if ready is None:
+                    if mandatory_flatten:
+                        mark_exit_residual_pending(position, exit_trigger)
+                        await self._persist_position_to_sqlite(position)
+                    logger.warning(
+                        "SELL_FEE_PENDING symbol=%s order=%s qty=%.8f — close waits for venue commission",
+                        normalized_symbol,
+                        (live_order_sell or {}).get("id"),
+                        float((live_order_sell or {}).get("filled") or 0.0),
+                    )
+                    return None
+                live_order_sell = ready
+                actual_sold_qty = float(ready.get("filled") or 0.0)
             oid = str((live_order_sell or {}).get("id") or "").strip()
             if not claim_economic_close(
                 self.db_path,
@@ -16259,7 +16404,7 @@ class PortfolioEngine:
                 event_key=f"live-close:{oid}" if oid else None,
             )
             if oid:
-                from backend.services.strategy_order_intent import complete_intent
+                from backend.services.strategy_order_intent import close_sell_order_ids, complete_intent
 
                 complete_intent(
                     self.db_path,
@@ -16267,6 +16412,11 @@ class PortfolioEngine:
                     side="SELL",
                     exchange_order_id=oid,
                     status="CLOSED",
+                )
+                close_sell_order_ids(
+                    self.db_path,
+                    str(getattr(position, "trade_id", "") or ""),
+                    [oid, *((live_order_sell or {}).get("_mystic_order_ids") or [])],
                 )
 
         with contextlib.suppress(Exception):

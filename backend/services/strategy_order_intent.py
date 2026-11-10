@@ -894,6 +894,144 @@ def materialize_buy_custody(db_path: str) -> int:
     return written
 
 
+FEE_PENDING_STATUS = "FEE_PENDING"
+_UNBOOKED_SELL_STATUSES = ("FEE_PENDING", "FILLED")
+
+
+def _intent_quote_and_qty(order: dict[str, Any]) -> tuple[float, float]:
+    from backend.services.live_fill_economics import proven_sell_base_qty, proven_sell_quote
+
+    return proven_sell_base_qty(order), proven_sell_quote(order)
+
+
+def record_sell_attempt_result(
+    db_path: str,
+    *,
+    client_order_id: str,
+    order: dict[str, Any] | None,
+    outcome: str,
+) -> str:
+    """Keep a working id only while the venue result is still unknown.
+
+    A zero-fill that the venue already closed releases the id. A fill whose
+    commission asset is missing stays recoverable and does not block the next
+    attempt's id. It is not a booked close.
+    """
+    from backend.services.live_fill_economics import sell_attempt_disposition
+
+    cid = normalize_client_order_id(client_order_id)
+    disposition = sell_attempt_disposition(order if isinstance(order, dict) else None, outcome)
+    if not cid:
+        return disposition
+    if disposition == "release":
+        label = "REJECTED" if str(outcome or "") == "EXCHANGE_REJECTED" else "EXPIRED" if str(outcome or "") == "EXPIRED_UNFILLED" else "CANCELED"
+        release_unfilled_intent(db_path, cid, label, str((order or {}).get("id") or "") if isinstance(order, dict) else "")
+        return disposition
+    if disposition == "keep":
+        return disposition
+    qty, quote = _intent_quote_and_qty(order or {})
+    status = FEE_PENDING_STATUS if disposition == "fee_pending" else "FILLED"
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE strategy_order_intents
+            SET exchange_order_id=CASE WHEN ? != '' THEN ? ELSE exchange_order_id END,
+                status=?, filled_qty=?, filled_cost=?, updated_at=?
+            WHERE client_order_id=? AND status NOT IN ('CLOSED', 'COMMITTED', 'CANCELED', 'EXPIRED', 'REJECTED', 'NO_VENUE_ORDER')
+            """,
+            (
+                str((order or {}).get("id") or ""),
+                str((order or {}).get("id") or ""),
+                status,
+                qty,
+                quote,
+                time.time(),
+                cid,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return disposition
+
+
+def reserved_unbooked_sell_qty(db_path: str, trade_id: str) -> float:
+    """Base already sent or sold, and not yet written as a close."""
+    if not str(trade_id or ""):
+        return 0.0
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT status, quantity, filled_qty, exchange_order_id
+            FROM strategy_order_intents
+            WHERE trade_id=? AND side='SELL'
+              AND status IN ('FEE_PENDING', 'FILLED', 'PENDING', 'ACKED', 'OPEN', 'PARTIAL', 'WORKING')
+            """,
+            (str(trade_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+    total = 0.0
+    for row in rows:
+        status = str(row["status"] or "")
+        oid = str(row["exchange_order_id"] or "")
+        if status in _UNBOOKED_SELL_STATUSES:
+            if oid and sell_order_already_booked(db_path, oid):
+                continue
+            total += float(row["filled_qty"] or 0.0)
+            continue
+        if float(row["filled_qty"] or 0.0) <= 0.0:
+            total += float(row["quantity"] or 0.0)
+    return total
+
+
+def unbooked_protective_sells(db_path: str, trade_id: str) -> list[dict[str, Any]]:
+    """Fills waiting for a commission asset, oldest first."""
+    if not str(trade_id or ""):
+        return []
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM strategy_order_intents
+            WHERE trade_id=? AND side='SELL' AND status IN ('FEE_PENDING', 'FILLED') AND filled_qty > 0
+            ORDER BY created_at
+            """,
+            (str(trade_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        intent = dict(row)
+        if sell_order_already_booked(db_path, str(intent.get("exchange_order_id") or "")):
+            continue
+        out.append(intent)
+    return out
+
+
+def close_sell_order_ids(db_path: str, trade_id: str, order_ids: list[str]) -> None:
+    """A booked close owns every chunk id, so none of them can be booked again."""
+    ids = [str(oid or "").strip() for oid in order_ids if str(oid or "").strip()]
+    if not ids or not str(trade_id or ""):
+        return
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            f"""
+            UPDATE strategy_order_intents
+            SET status='CLOSED', updated_at=?
+            WHERE trade_id=? AND side='SELL' AND exchange_order_id IN ({", ".join("?" for _ in ids)})
+            """,
+            (time.time(), str(trade_id), *ids),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def sell_order_already_booked(db_path: str, exchange_order_id: str) -> bool:
     oid = str(exchange_order_id or "").strip()
     if not oid:
