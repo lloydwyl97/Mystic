@@ -3215,9 +3215,16 @@ class PortfolioEngine:
             new_equity = usdt_balance + self._positions_value
             _ = (old_principal, new_equity)
 
-            # CRITICAL: Use FREE USDT so free_usdt in governor matches Binance US "free" balance
-            self.cash_balance = usdt_balance
-            self._available_balance = usdt_balance
+            # CRITICAL: Use FREE USDT so free_usdt in governor matches Binance US "free" balance.
+            # An unbooked sell's proceeds are already in that free balance. Adopting it
+            # and later crediting the close would count the same USDT twice.
+            from backend.services.strategy_order_intent import has_unbooked_executed_sell
+
+            if has_unbooked_executed_sell(self.db_path):
+                logger.warning("CASH_SYNC_HELD_UNBOOKED_SELL source=principal_sync local=%.8f venue_free=%.8f", float(self.cash_balance or 0.0), usdt_balance)
+            else:
+                self.cash_balance = usdt_balance
+                self._available_balance = usdt_balance
 
             # Log cash balance update (always)
             if abs(self.cash_balance - old_cash) > 0.01:
@@ -3311,11 +3318,23 @@ class PortfolioEngine:
 
                 exchange_qty = max(0.0, float(total_balances.get(base_asset, 0) or 0) - protected_quantity(self.db_path, symbol))
                 await self._enforce_lot_ownership([position])
-                self._check_single_lot_shortfall(symbol, position, exchange_qty)
                 db_qty = position.quantity
                 await self._ensure_symbol_constraints(symbol)
                 constraints = self._symbol_constraints.get(symbol) or {}
                 qty_step = float(constraints.get("qty_step") or 0)  # LOT_SIZE.stepSize
+                from backend.services.strategy_order_intent import reserved_unbooked_sell_qty
+
+                _reserved = reserved_unbooked_sell_qty(self.db_path, str(getattr(position, "trade_id", "") or ""))
+                self._check_single_lot_shortfall(symbol, position, exchange_qty, reserved_qty=_reserved)
+                if _reserved > 0.0 and exchange_qty <= qty_epsilon and _reserved + 1e-8 >= float(db_qty or 0.0):
+                    logger.warning(
+                        "RECONCILE_HELD_UNBOOKED_SELL symbol=%s ledger=%.12g reserved=%.12g ex_qty=%.12g — lot not vanished",
+                        symbol,
+                        float(db_qty or 0.0),
+                        _reserved,
+                        exchange_qty,
+                    )
+                    continue
                 # Rule 1: Exchange 0 (or below epsilon) -> position vanished.
                 # DUST_PENDING -> dust writeoff (existing path).
                 # ACTIVE -> HUMAN_MANUAL_SELL (human closed on Binance.US);
@@ -3328,6 +3347,19 @@ class PortfolioEngine:
                     continue
                 # Rule 2 & 3: Exchange > 0
                 snapped = self._floor_to_step(exchange_qty, qty_step) if qty_step > 0 else exchange_qty
+                from backend.services.live_fill_economics import reconcile_lot_decision
+
+                _decision = reconcile_lot_decision(booked_qty=db_qty, exchange_qty=exchange_qty, reserved_qty=_reserved, qty_step=qty_step)
+                if _reserved > 0.0 and _decision in {"keep", "shortfall_hold"}:
+                    logger.info(
+                        "RECONCILE_RESERVATION_EXPLAINS symbol=%s ledger=%.12g reserved=%.12g ex_qty=%.12g decision=%s",
+                        symbol,
+                        float(db_qty or 0.0),
+                        _reserved,
+                        exchange_qty,
+                        _decision,
+                    )
+                    continue
                 # Rule 3: Dust -> DUST_PENDING (never pause for dust)
                 # BUG #12 FIX: Ensure pause logic does not apply to DUST_PENDING
                 # DUST_PENDING is excluded from all pause checks by design
@@ -3361,9 +3393,7 @@ class PortfolioEngine:
                     # Coordinate: Skip pause logic for dust (continue without pause)
                     continue
                 # Rule 2: DB differs -> set DB = exchange snapped, ACTIVE
-                from backend.services.live_fill_economics import active_lot_keeps_booked_qty
-
-                if str(getattr(position, "status", "") or "ACTIVE").upper() == "ACTIVE" and active_lot_keeps_booked_qty(booked_qty=db_qty, exchange_qty=exchange_qty):
+                if str(getattr(position, "status", "") or "ACTIVE").upper() == "ACTIVE" and _decision == "keep":
                     try:
                         from backend.services.day_entry_spendable import money as _money_surplus
                         from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
@@ -3391,8 +3421,13 @@ class PortfolioEngine:
             await self._recompute_positions_values()
             # Set cash/available from FREE USDT so governor free_usdt matches Binance at startup
             usdt_free = float(free_balances.get("USDT", 0) or 0)
-            self.cash_balance = usdt_free
-            self._available_balance = max(0.0, usdt_free)
+            from backend.services.strategy_order_intent import has_unbooked_executed_sell
+
+            if has_unbooked_executed_sell(self.db_path):
+                logger.warning("CASH_SYNC_HELD_UNBOOKED_SELL source=bootstrap local=%.8f venue_free=%.8f", float(self.cash_balance or 0.0), usdt_free)
+            else:
+                self.cash_balance = usdt_free
+                self._available_balance = max(0.0, usdt_free)
             # Recompute equity with fresh Binance cash. Never overwrite contributed principal.
             self._total_equity = self.cash_balance + self._positions_value
             await self._reconcile_shortfall_pause(total_balances)
@@ -3872,6 +3907,10 @@ class PortfolioEngine:
         tol = (float(qty_step) / 2.0) if qty_step and float(qty_step) > 0 else 1e-9
         await self._enforce_lot_ownership(lots)
         engine_sum = sum(float(getattr(p, "quantity", 0) or 0) for p in lots)
+        from backend.services.strategy_order_intent import reserved_unbooked_sell_qty
+
+        reserved = sum(reserved_unbooked_sell_qty(self.db_path, str(getattr(p, "trade_id", "") or "")) for p in lots)
+        expected = max(0.0, engine_sum - reserved)
         try:
             held_dust = self._held_engine_dust_qty(symbol)
         except ReconcileStateUnknownError:
@@ -3879,7 +3918,7 @@ class PortfolioEngine:
             return
         snapped = self._floor_to_step(exchange_qty, float(qty_step)) if qty_step and float(qty_step) > 0 else exchange_qty
         engines = sorted({str(getattr(p, "engine_id", "") or "") for p in lots})
-        if float(exchange_qty or 0) <= 1e-10:
+        if float(exchange_qty or 0) <= 1e-10 and not (reserved > 0.0 and reserved + tol >= engine_sum):
             for lot in lots:
                 await self._handle_vanished_exchange_position(symbol, lot, source=source)
                 self._metrics_reconciliation_adjustments += 1
@@ -3891,6 +3930,16 @@ class PortfolioEngine:
                 )
             return
         owned = engine_sum + held_dust
+        if reserved > 0.0 and float(exchange_qty) + tol >= expected:
+            logger.info(
+                "DUAL_LOT_RESERVATION_EXPLAINS symbol=%s engine_sum=%.12g reserved=%.12g ex_qty=%.12g",
+                symbol,
+                engine_sum,
+                reserved,
+                exchange_qty,
+            )
+            self._clear_shortfall_pause(symbol)
+            return
         # Dust lots are sub-step by nature: an exact match against the raw
         # balance is healthy even when the step-floored balance differs.
         if abs(owned - float(exchange_qty)) <= max(1e-12, 1e-9 * float(exchange_qty)) or abs(owned - snapped) <= tol:
@@ -3955,13 +4004,13 @@ class PortfolioEngine:
                 self._pause_reason = f"{SHORTFALL_PAUSE_PREFIX}{symbol}"
             logger.critical("ENGINE_QTY_SHORTFALL_PAUSE symbol=%s missing=%.12g usd=%.2f", symbol, owned - float(exchange_qty), (owned - float(exchange_qty)) * mark)
 
-    def _check_single_lot_shortfall(self, symbol: str, position: Any, exchange_qty: float) -> None:
+    def _check_single_lot_shortfall(self, symbol: str, position: Any, exchange_qty: float, reserved_qty: float = 0.0) -> None:
         """Lot plus held engine dust above the balance is never cut by guessing; it pauses entries."""
         try:
             held = float(self._held_engine_dust_qty(symbol) or 0.0)
         except ReconcileStateUnknownError:
             return
-        missing = float(getattr(position, "quantity", 0.0) or 0.0) + held - float(exchange_qty or 0.0)
+        missing = float(getattr(position, "quantity", 0.0) or 0.0) + held - float(reserved_qty or 0.0) - float(exchange_qty or 0.0)
         mark = float((getattr(self, "_position_mark_prices", None) or {}).get(symbol) or 0.0) or float(getattr(position, "entry_price", 0.0) or 0.0)
         if held > 0 and missing * mark > SHORTFALL_PAUSE_USD:
             if not self._trading_paused:
@@ -4095,12 +4144,37 @@ class PortfolioEngine:
             await self._ensure_symbol_constraints(symbol)
             constraints = self._symbol_constraints.get(symbol) or {}
             qty_step = float(constraints.get("qty_step") or 0)  # LOT_SIZE.stepSize
+            from backend.services.strategy_order_intent import reserved_unbooked_sell_qty
+
+            _reserved = reserved_unbooked_sell_qty(self.db_path, str(getattr(position, "trade_id", "") or ""))
+            if _reserved > 0.0 and exchange_qty <= qty_epsilon and _reserved + 1e-8 >= float(db_qty or 0.0):
+                logger.warning(
+                    "RECONCILE_HELD_UNBOOKED_SELL symbol=%s ledger=%.12g reserved=%.12g ex_qty=%.12g — lot not vanished",
+                    symbol,
+                    float(db_qty or 0.0),
+                    _reserved,
+                    exchange_qty,
+                )
+                continue
             if exchange_qty <= qty_epsilon:
                 await self._handle_vanished_exchange_position(symbol, position, source="periodic_reconcile")
                 self._metrics_reconciliation_adjustments += 1
                 logger.info("REMOVED:%s ex_qty=0 status=%s", symbol, getattr(position, "status", "ACTIVE"))
                 continue
             snapped = self._floor_to_step(exchange_qty, qty_step) if qty_step > 0 else exchange_qty
+            from backend.services.live_fill_economics import reconcile_lot_decision
+
+            _decision = reconcile_lot_decision(booked_qty=db_qty, exchange_qty=exchange_qty, reserved_qty=_reserved, qty_step=qty_step)
+            if _reserved > 0.0 and _decision in {"keep", "shortfall_hold"}:
+                logger.info(
+                    "RECONCILE_RESERVATION_EXPLAINS symbol=%s ledger=%.12g reserved=%.12g ex_qty=%.12g decision=%s",
+                    symbol,
+                    float(db_qty or 0.0),
+                    _reserved,
+                    exchange_qty,
+                    _decision,
+                )
+                continue
             price = getattr(position, "entry_price", 0) or 0
             is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped if snapped > 0 else exchange_qty, price)
             if is_dust or str(getattr(position, "status", "") or "") == "DUST_PENDING":
@@ -4131,9 +4205,7 @@ class PortfolioEngine:
                 logger.info("DUST_PENDING:%s ex_qty=%s reason=%s", symbol, exact, dust_reason or "below min")
                 await self._sync_protected_remainder(symbol, exchange_qty, [position], qty_step)
                 continue
-            from backend.services.live_fill_economics import active_lot_keeps_booked_qty
-
-            if str(getattr(position, "status", "") or "ACTIVE").upper() == "ACTIVE" and active_lot_keeps_booked_qty(booked_qty=db_qty, exchange_qty=exchange_qty):
+            elif str(getattr(position, "status", "") or "ACTIVE").upper() == "ACTIVE" and _decision == "keep":
                 try:
                     from backend.services.day_entry_spendable import money as _money_surplus
                     from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
@@ -4196,6 +4268,11 @@ class PortfolioEngine:
         threshold = float(os.getenv("CASH_DRIFT_THRESHOLD_USD", "1.00"))
         require_no_orders = os.getenv("CASH_SYNC_REQUIRE_NO_OPEN_ORDERS", "true").lower() == "true"
 
+        from backend.services.strategy_order_intent import has_unbooked_executed_sell
+
+        if has_unbooked_executed_sell(self.db_path):
+            self._cash_sync_skip_log("UNBOOKED_SELL", venue=f"{float(exchange_usdt):.2f}", local=f"{float(self.cash_balance or 0.0):.2f}")
+            return False
         local_before = self.cash_balance
         drift = abs(float(exchange_usdt) - local_before)
         if drift < threshold:
@@ -5161,11 +5238,24 @@ class PortfolioEngine:
         self._sleeve_unrealized_cache = {Sleeve.CORE.value: 0.0, Sleeve.ACTIVE.value: 0.0}
         self._sleeve_market_notional_cache = {Sleeve.CORE.value: 0.0, Sleeve.ACTIVE.value: 0.0}
 
+        economic_qty: dict[int, float] = {}
+        try:
+            from backend.services.strategy_order_intent import sell_quantity_state
+
+            for _pos in self.open_positions.values():
+                state = sell_quantity_state(self.db_path, str(getattr(_pos, "trade_id", "") or ""), float(_pos.quantity or 0.0))
+                economic_qty[id(_pos)] = float(state["economic_open_qty"])
+        except Exception:
+            economic_qty = {}
+
+        def _open_qty(pos: Any) -> float:
+            return float(economic_qty.get(id(pos), float(getattr(pos, "quantity", 0.0) or 0.0)))
+
         cost_basis = 0.0
         for _cost_key, _cost_pos in self.open_positions.items():
             if not position_mtm_symbol(_cost_pos, str(_cost_key)):
                 continue
-            cost_basis += _cost_pos.entry_price * _cost_pos.quantity
+            cost_basis += _cost_pos.entry_price * _open_qty(_cost_pos)
         if not self.open_positions:
             return self._add_protected_equity(0.0, 0.0, prices)
 
@@ -5176,12 +5266,13 @@ class PortfolioEngine:
             if current_price <= 0:
                 current_price = pos.entry_price
             self._position_mark_prices[symbol] = current_price
-            positions_value_market += pos.quantity * current_price
+            qty = _open_qty(pos)
+            positions_value_market += qty * current_price
             slv = getattr(pos, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
             if slv not in self._sleeve_unrealized_cache:
                 slv = Sleeve.ACTIVE.value
-            self._sleeve_unrealized_cache[slv] += (current_price - pos.entry_price) * pos.quantity
-            self._sleeve_market_notional_cache[slv] += current_price * pos.quantity
+            self._sleeve_unrealized_cache[slv] += (current_price - pos.entry_price) * qty
+            self._sleeve_market_notional_cache[slv] += current_price * qty
 
         if prices:
             for _key, pos in self.open_positions.items():
@@ -14498,6 +14589,10 @@ class PortfolioEngine:
 
         async def _protected_live_sell(qty: float) -> dict[str, Any] | None:
             # A fill whose fee is now known is booked before any new order.
+            staged = getattr(position, "_ready_pending_sell", None)
+            if isinstance(staged, dict):
+                position._ready_pending_sell = None
+                return staged
             ready = await self._canonical_pending_sell(position)
             if ready is not None:
                 return ready
@@ -17505,6 +17600,25 @@ class PortfolioEngine:
                 continue
 
             current_price = float(mark_info["mark_used"])
+            try:
+                from backend.services.strategy_order_intent import unbooked_protective_sells
+
+                if unbooked_protective_sells(self.db_path, str(getattr(position, "trade_id", "") or "")):
+                    ready_pending = await self._canonical_pending_sell(position)
+                    if isinstance(ready_pending, dict):
+                        position._ready_pending_sell = ready_pending
+                        await self.execute_sell_fifo(
+                            symbol,
+                            float(position.quantity or 0.0),
+                            current_price,
+                            ExitType.STRATEGY,
+                            "FEE_PENDING_ENRICHED",
+                            current_bar=current_bar,
+                            force_sell=True,
+                            engine_id=str(getattr(position, "engine_id", "") or ""),
+                        )
+            except Exception:
+                logger.warning("FEE_PENDING_ENRICH_FAILED symbol=%s", symbol, exc_info=True)
             obs_ts = mark_info.get("mark_timestamp")
             last_obs = getattr(position, "_last_mark_ts", None)
             if isinstance(obs_ts, (int, float)) and isinstance(last_obs, (int, float)) and float(obs_ts) < float(last_obs):
@@ -23358,7 +23472,11 @@ class PortfolioEngine:
         mark = float(self._position_mark_prices.get(symbol, pos.entry_price) or pos.entry_price)
         q = float(pos.quantity or 0)
         ep = float(pos.entry_price or 0)
-        u_pnl = (mark - ep) * q
+        from backend.services.strategy_order_intent import sell_quantity_state
+
+        qty_state = sell_quantity_state(self.db_path, str(getattr(pos, "trade_id", "") or ""), q)
+        economic_qty = float(qty_state["economic_open_qty"])
+        u_pnl = (mark - ep) * economic_qty
         stop = float(pos.stop_price or 0)
         tp1 = float(pos.take_profit_1_price or 0)
         tp2 = float(pos.take_profit_2_price or 0)
@@ -23404,6 +23522,13 @@ class PortfolioEngine:
         row = {
             "symbol": symbol,
             "quantity": q,
+            "ledger_position_qty": q,
+            "venue_equivalent_qty": economic_qty,
+            "executed_unbooked_sell_qty": qty_state["executed_unbooked_qty"],
+            "working_sell_qty": qty_state["working_sell_qty"],
+            "reserved_sell_qty": qty_state["reserved_qty"],
+            "available_to_sell_qty": qty_state["available_to_sell_qty"],
+            "fee_pending_qty": qty_state["executed_unbooked_qty"],
             "entry_price": ep,
             "avg_entry_price": ep,
             "average_price": ep,

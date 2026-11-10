@@ -687,6 +687,30 @@ def active_lot_keeps_booked_qty(*, booked_qty: object, exchange_qty: object) -> 
     return exchange + Decimal("0.000000000001") >= booked
 
 
+def reconcile_lot_decision(*, booked_qty: object, exchange_qty: object, reserved_qty: object = 0, qty_step: object = 0) -> str:
+    """How a live reconcile may treat one lot.
+
+    ``keep`` leaves the ledger quantity. ``shrink`` is the existing alignment
+    to the venue. ``shortfall_hold`` means the venue is below even the
+    unbooked-sell explanation, so the ledger is not guessed downward.
+    """
+    booked = money(booked_qty)
+    exchange = money(exchange_qty)
+    reserved = money(reserved_qty)
+    step = money(qty_step)
+    tol = (step / Decimal("2")) if step > 0 else Decimal("0.000000001")
+    expected = booked - reserved
+    if expected < 0:
+        expected = Decimal("0")
+    if reserved > 0 and exchange + tol >= expected:
+        return "keep"
+    if reserved > 0 and exchange + tol < expected:
+        return "shortfall_hold"
+    if active_lot_keeps_booked_qty(booked_qty=booked, exchange_qty=exchange):
+        return "keep"
+    return "shrink"
+
+
 def eth_captured_buy_1587754176() -> dict[str, Any]:
     """Authoritative Binance.US fill for BUY 1587754176."""
     gross = money("0.0227")

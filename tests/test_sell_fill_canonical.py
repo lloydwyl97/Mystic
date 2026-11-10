@@ -14,15 +14,20 @@ from backend.services.live_fill_economics import (
     merge_venue_trades_into_order,
     proven_sell_base_qty,
     proven_sell_quote,
+    reconcile_lot_decision,
     sell_attempt_disposition,
     sell_commission_known,
 )
 from backend.services.protected_limit_execution import _LIVE_ORDER_OUTCOME, LIVE_OUTCOME_UNCONFIRMED
 from backend.services.strategy_order_intent import (
+    _finish_venue_lifecycle,
     allocate_intent,
     close_sell_order_ids,
+    has_unbooked_executed_sell,
+    mark_exchange_order,
     record_sell_attempt_result,
     reserved_unbooked_sell_qty,
+    sell_quantity_state,
     unbooked_protective_sells,
 )
 
@@ -235,3 +240,69 @@ async def test_unconfirmed_attempt_does_not_place_a_second_order():
     assert calls["n"] == 1
     assert out.abandoned_reason == "venue_unconfirmed"
     assert out.filled_qty == 0.0
+
+
+def test_reconcile_does_not_shrink_a_fee_pending_lot():
+    assert reconcile_lot_decision(booked_qty=1.0, exchange_qty=0.6, reserved_qty=0.4) == "keep"
+    assert reconcile_lot_decision(booked_qty=1.0, exchange_qty=0.6, reserved_qty=0.0) == "shrink"
+    assert reconcile_lot_decision(booked_qty=1.0, exchange_qty=0.5, reserved_qty=0.4) == "shortfall_hold"
+    assert reconcile_lot_decision(booked_qty=1.0, exchange_qty=1.0, reserved_qty=0.0) == "keep"
+
+
+def test_two_fee_pending_fills_reserve_both_and_survive_a_booked_id(tmp_path):
+    db = str(tmp_path / "two.db")
+    first = allocate_intent(db, engine_id="DAY_V2", trade_id="lot", symbol="SOL/USDT", side="SELL", quantity=0.25, limit_price=10.0)
+    record_sell_attempt_result(db, client_order_id=first, order={"id": "A", "filled": 0.25, "info": {"executedQty": "0.25", "cummulativeQuoteQty": "2.5"}}, outcome="")
+    second = allocate_intent(db, engine_id="DAY_V2", trade_id="lot", symbol="SOL/USDT", side="SELL", quantity=0.30, limit_price=10.0)
+    record_sell_attempt_result(db, client_order_id=second, order={"id": "B", "filled": 0.30, "info": {"executedQty": "0.30", "cummulativeQuoteQty": "3"}}, outcome="")
+    state = sell_quantity_state(db, "lot", 1.0)
+    assert state["executed_unbooked_qty"] == pytest.approx(0.55)
+    assert state["available_to_sell_qty"] == pytest.approx(0.45)
+    assert state["economic_open_qty"] == pytest.approx(0.45)
+    assert state["ledger_qty"] == pytest.approx(1.0)
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE paper_trades (order_id TEXT, side TEXT)")
+        conn.execute("INSERT INTO paper_trades (order_id, side) VALUES ('A', 'SELL')")
+        conn.commit()
+    after = sell_quantity_state(db, "lot", 1.0)
+    assert after["executed_unbooked_qty"] == pytest.approx(0.30)
+    assert after["reserved_qty"] == pytest.approx(0.30)
+
+
+def test_resting_partial_reserves_the_executed_and_the_open_remainder(tmp_path):
+    db = str(tmp_path / "rest.db")
+    cid = allocate_intent(db, engine_id="DAY_V2", trade_id="lot", symbol="SOL/USDT", side="SELL", quantity=0.6, limit_price=10.0)
+    mark_exchange_order(db, cid, "R", status="PARTIAL")
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE strategy_order_intents SET filled_qty=0.2, filled_cost=2.0 WHERE client_order_id=?", (cid,))
+        conn.commit()
+    state = sell_quantity_state(db, "lot", 1.0)
+    assert state["executed_unbooked_qty"] == pytest.approx(0.2)
+    assert state["working_sell_qty"] == pytest.approx(0.4)
+    assert state["available_to_sell_qty"] == pytest.approx(0.4)
+    _finish_venue_lifecycle(db, {"id": "R", "clientOrderId": cid, "filled": 0.2, "status": "canceled", "info": {"executedQty": "0.2", "cummulativeQuoteQty": "2"}}, {"adopted": False})
+    canceled = sell_quantity_state(db, "lot", 1.0)
+    assert canceled["working_sell_qty"] == pytest.approx(0.0)
+    assert canceled["executed_unbooked_qty"] == pytest.approx(0.2)
+    assert canceled["available_to_sell_qty"] == pytest.approx(0.8)
+    assert has_unbooked_executed_sell(db) is True
+
+
+def test_partial_mytrades_does_not_become_a_close_and_empty_read_is_not_a_zero_fill():
+    summary = {"id": "77", "filled": 0.4, "status": "expired", "info": {"executedQty": "0.4", "cummulativeQuoteQty": "40"}}
+    partial = merge_venue_trades_into_order(summary, [{"trade_id": "1", "qty": "0.25", "price": "100", "commission": "0.025", "commission_asset": "USDT"}])
+    assert proven_sell_base_qty(partial) == pytest.approx(0.4)
+    assert sell_commission_known(partial) is False
+    assert sell_attempt_disposition(partial, "") == "fee_pending"
+    untouched = merge_venue_trades_into_order(summary, [])
+    assert untouched["info"]["executedQty"] == "0.4"
+    assert sell_attempt_disposition(untouched, "") == "fee_pending"
+    complete = merge_venue_trades_into_order(
+        summary,
+        [
+            {"trade_id": "1", "qty": "0.25", "price": "100", "commission": "0.025", "commission_asset": "USDT"},
+            {"trade_id": "2", "qty": "0.15", "price": "100", "commission": "0.015", "commission_asset": "USDT"},
+        ],
+    )
+    assert sell_commission_known(complete) is True
+    assert extract_live_commission(complete, symbol="SOL/USDT", fill_price=100.0).usd == pytest.approx(0.04)

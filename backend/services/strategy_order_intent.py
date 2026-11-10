@@ -629,6 +629,27 @@ def _finish_venue_lifecycle(db_path: str, order: dict[str, Any], result: dict[st
         out["released"] = True
         out["reason"] = label
         return out
+    if cid and filled > 0.0 and not order_is_working(order):
+        # The resting remainder is dead. The executed base stays reserved
+        # until its own close, and it no longer blocks the unsold base.
+        from backend.services.live_fill_economics import proven_sell_quote, sell_commission_known
+
+        status = "FILLED" if sell_commission_known(order) else FEE_PENDING_STATUS
+        conn = _connect(db_path)
+        try:
+            conn.execute(
+                """
+                UPDATE strategy_order_intents
+                SET exchange_order_id=CASE WHEN ? != '' THEN ? ELSE exchange_order_id END,
+                    status=?, filled_qty=?, filled_cost=CASE WHEN ? > 0 THEN ? ELSE filled_cost END, updated_at=?
+                WHERE client_order_id=? AND status NOT IN ('CLOSED', 'COMMITTED', 'CANCELED', 'EXPIRED', 'REJECTED', 'NO_VENUE_ORDER')
+                """,
+                (oid, oid, status, filled, proven_sell_quote(order), proven_sell_quote(order), time.time(), normalize_client_order_id(cid)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return result
     if order_is_working(order) and cid:
         mark_working_sell(db_path, cid, "PARTIAL" if filled > 0.0 else "OPEN", oid)
     return result
@@ -673,6 +694,10 @@ def sell_protection_snapshot(db_path: str) -> dict[str, Any]:
             "partial_sell_count": 0,
             "remaining_sell_qty": 0.0,
             "venue_order_status": [],
+            "fee_pending_qty": 0.0,
+            "executed_unbooked_sell_qty": 0.0,
+            "working_sell_qty": 0.0,
+            "fee_pending_count": 0,
         }
     now = time.time()
     ages = [max(0.0, now - float(row.get("created_at") or now)) for row in rows]
@@ -683,6 +708,24 @@ def sell_protection_snapshot(db_path: str) -> dict[str, Any]:
         if str(row.get("status") or "") == "PARTIAL" or filled > 0.0:
             partial += 1
         remaining += max(0.0, float(row.get("quantity") or 0.0) - filled)
+    executed = 0.0
+    working = 0.0
+    fee_pending_qty = 0.0
+    fee_pending_count = 0
+    oldest_fee = None
+    try:
+        pending_rows = _unbooked_sell_rows(db_path)
+    except Exception:
+        pending_rows = []
+    for row in pending_rows:
+        sold, resting = _row_sell_parts(db_path, row)
+        executed += sold
+        working += resting
+        if str(row["status"] or "") == FEE_PENDING_STATUS and sold > 0.0:
+            fee_pending_qty += sold
+            fee_pending_count += 1
+            age = max(0.0, now - float(row["created_at"] or now))
+            oldest_fee = age if oldest_fee is None else max(oldest_fee, age)
     return {
         "active_sell_intents": len(rows),
         "oldest_sell_intent_age_sec": max(ages) if ages else None,
@@ -690,6 +733,12 @@ def sell_protection_snapshot(db_path: str) -> dict[str, Any]:
         "remaining_sell_qty": remaining,
         "venue_order_status": [str(row.get("status") or "") for row in rows],
         "limit_prices": [float(row.get("limit_price") or 0.0) for row in rows],
+        "fee_pending_qty": fee_pending_qty,
+        "fee_pending_count": fee_pending_count,
+        "oldest_fee_pending_age_sec": oldest_fee,
+        "executed_unbooked_sell_qty": executed,
+        "working_sell_qty": working,
+        "cash_sync_held": executed > 0.0,
     }
 
 
@@ -956,35 +1005,83 @@ def record_sell_attempt_result(
     return disposition
 
 
+def _unbooked_sell_rows(db_path: str, trade_id: str = "") -> list[sqlite3.Row]:
+    conn = _connect(db_path)
+    try:
+        if trade_id:
+            rows = conn.execute(
+                """
+                SELECT status, quantity, filled_qty, filled_cost, exchange_order_id, created_at
+                FROM strategy_order_intents
+                WHERE trade_id=? AND side='SELL'
+                  AND status IN ('FEE_PENDING', 'FILLED', 'PENDING', 'ACKED', 'OPEN', 'PARTIAL', 'WORKING')
+                """,
+                (str(trade_id),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT status, quantity, filled_qty, filled_cost, exchange_order_id, created_at
+                FROM strategy_order_intents
+                WHERE side='SELL'
+                  AND status IN ('FEE_PENDING', 'FILLED', 'PENDING', 'ACKED', 'OPEN', 'PARTIAL', 'WORKING')
+                """
+            ).fetchall()
+    finally:
+        conn.close()
+    return list(rows)
+
+
+def _row_sell_parts(db_path: str, row: sqlite3.Row) -> tuple[float, float]:
+    """Executed-but-unbooked base, and base still resting on a live order."""
+    status = str(row["status"] or "")
+    oid = str(row["exchange_order_id"] or "")
+    filled = max(0.0, float(row["filled_qty"] or 0.0))
+    ordered = max(0.0, float(row["quantity"] or 0.0))
+    if oid and sell_order_already_booked(db_path, oid):
+        return 0.0, 0.0
+    if status in _UNBOOKED_SELL_STATUSES:
+        return filled, 0.0
+    if status in _WORKING_SELL_STATUSES:
+        # The resting remainder can still fill. The executed part is already sold.
+        return filled, max(0.0, ordered - filled)
+    return 0.0, 0.0
+
+
+def sell_quantity_state(db_path: str, trade_id: str, ledger_qty: float) -> dict[str, float]:
+    """Ledger quantity stays intact. Reservation is what the venue no longer offers."""
+    executed = 0.0
+    working = 0.0
+    for row in _unbooked_sell_rows(db_path, trade_id):
+        sold, resting = _row_sell_parts(db_path, row)
+        executed += sold
+        working += resting
+    ledger = max(0.0, float(ledger_qty or 0.0))
+    reserved = executed + working
+    return {
+        "ledger_qty": ledger,
+        "executed_unbooked_qty": executed,
+        "working_sell_qty": working,
+        "reserved_qty": reserved,
+        "available_to_sell_qty": max(0.0, ledger - reserved),
+        "economic_open_qty": max(0.0, ledger - executed),
+    }
+
+
 def reserved_unbooked_sell_qty(db_path: str, trade_id: str) -> float:
     """Base already sent or sold, and not yet written as a close."""
     if not str(trade_id or ""):
         return 0.0
-    conn = _connect(db_path)
-    try:
-        rows = conn.execute(
-            """
-            SELECT status, quantity, filled_qty, exchange_order_id
-            FROM strategy_order_intents
-            WHERE trade_id=? AND side='SELL'
-              AND status IN ('FEE_PENDING', 'FILLED', 'PENDING', 'ACKED', 'OPEN', 'PARTIAL', 'WORKING')
-            """,
-            (str(trade_id),),
-        ).fetchall()
-    finally:
-        conn.close()
-    total = 0.0
-    for row in rows:
-        status = str(row["status"] or "")
-        oid = str(row["exchange_order_id"] or "")
-        if status in _UNBOOKED_SELL_STATUSES:
-            if oid and sell_order_already_booked(db_path, oid):
-                continue
-            total += float(row["filled_qty"] or 0.0)
-            continue
-        if float(row["filled_qty"] or 0.0) <= 0.0:
-            total += float(row["quantity"] or 0.0)
-    return total
+    return float(sell_quantity_state(db_path, trade_id, 0.0)["reserved_qty"])
+
+
+def has_unbooked_executed_sell(db_path: str) -> bool:
+    """True while a venue fill is still waiting to credit cash and cut the lot."""
+    for row in _unbooked_sell_rows(db_path):
+        sold, _resting = _row_sell_parts(db_path, row)
+        if sold > 0.0:
+            return True
+    return False
 
 
 def unbooked_protective_sells(db_path: str, trade_id: str) -> list[dict[str, Any]]:
