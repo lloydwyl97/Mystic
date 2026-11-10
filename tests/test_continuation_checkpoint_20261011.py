@@ -1038,3 +1038,155 @@ def test_day_term_structure_and_scalp_policy_calibration_deadlock_repairs_202611
     v_with = cv.value("unused", "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", hold_st, ent_with, model=vm)["advantage"]
     v_without = cv.value("unused", "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", hold_st, ent_without, model=vm)["advantage"]
     assert v_with - v_without == pytest.approx(pos_move["key_policy_calibration"] * 0.60, abs=1e-12)
+
+
+def test_periodic_checkpoint_matches_the_live_surface_and_does_not_rewrite_it(tmp_path, monkeypatch):
+    from backend.services.adaptive_learning import day_decision
+    from backend.services.continuation_backfill import AdvantageLabel, fold_advantages_once
+    from backend.services.continuation_checkpoint import checkpoint_status, maybe_checkpoint_live_surface
+
+    db = str(tmp_path / "periodic.db")
+    _ready(db)
+    features = dict.fromkeys(FEATURE_NAMES, 0.001)
+
+    def _label(setup: str, when: float) -> AdvantageLabel:
+        return AdvantageLabel(DAY, "BTCUSDT", setup, "btcup_vollo", f"lot-{setup}", when, when, 900, 0.001, 1.0, features)
+
+    assert fold_advantages_once(db, [_label("S0", _NOW)]) == 1
+    write_checkpoint(db)
+    assert fold_advantages_once(db, [_label("S1", _NOW + 5)]) == 1
+    assert maybe_checkpoint_live_surface(db) is None
+    monkeypatch.setattr("backend.services.continuation_checkpoint.CHECKPOINT_EVENT_LAG_LIMIT", 1)
+    conn = sqlite3.connect(db)
+    before = conn.execute("SELECT symbol, setup, regime, metric, n, ewma, m2 FROM adaptive_metric_state ORDER BY 1,2,3,4").fetchall()
+    covered = conn.execute("SELECT MAX(rowid) FROM continuation_advantage_log").fetchone()[0]
+    conn.close()
+    expected = day_decision(db, "BTCUSDT", "S1", "btcup_vollo")["expected_net"]
+    written = maybe_checkpoint_live_surface(db)
+    assert written is not None
+    status = checkpoint_status(db)
+    assert status["event_lag"] == 0
+    assert status["checkpoint_event_id"] == covered
+    assert status["latest_event_id"] == covered
+    assert status["last_verification_status"] in (None, "ok")
+    conn = sqlite3.connect(db)
+    payload = json.loads(conn.execute("SELECT payload_json, last_event_id FROM continuation_checkpoint ORDER BY id DESC LIMIT 1").fetchone()[0])
+    column_event = conn.execute("SELECT last_event_id FROM continuation_checkpoint ORDER BY id DESC LIMIT 1").fetchone()[0]
+    after = conn.execute("SELECT symbol, setup, regime, metric, n, ewma, m2 FROM adaptive_metric_state ORDER BY 1,2,3,4").fetchall()
+    conn.close()
+    assert column_event == covered
+    assert payload["last_event_id"] == covered
+    assert after == before
+    assert day_decision(db, "BTCUSDT", "S1", "btcup_vollo")["expected_net"] == expected
+    assert maybe_checkpoint_live_surface(db) is None
+
+
+def test_checkpoint_insert_failure_keeps_the_previous_row(tmp_path, monkeypatch):
+    from backend.services import continuation_checkpoint as checkpoint
+
+    db = str(tmp_path / "crash.db")
+    _ready(db)
+    _fold(db, setup="S0", horizon=900, now=_NOW)
+    write_checkpoint(db)
+    conn = sqlite3.connect(db)
+    before = conn.execute("SELECT COUNT(*), MAX(last_event_id) FROM continuation_checkpoint").fetchone()
+    conn.close()
+    real_connect = checkpoint._connect
+
+    def _connect_commit_fails(path: str):
+        inner = real_connect(path)
+
+        class _Proxy:
+            def execute(self, *args, **kwargs):
+                return inner.execute(*args, **kwargs)
+
+            def commit(self):
+                raise sqlite3.OperationalError("injected before commit")
+
+            def rollback(self):
+                inner.rollback()
+
+            def close(self):
+                inner.close()
+
+        return _Proxy()
+
+    monkeypatch.setattr(checkpoint, "_connect", _connect_commit_fails)
+    with pytest.raises(sqlite3.OperationalError):
+        write_checkpoint(db)
+    conn = sqlite3.connect(db)
+    after = conn.execute("SELECT COUNT(*), MAX(last_event_id) FROM continuation_checkpoint").fetchone()
+    conn.close()
+    assert after == before
+
+
+def test_changed_hold_advantage_fails_closed_without_advancing(tmp_path):
+    from backend.services.continuation_backfill import AdvantageLabel, fold_advantages_once
+
+    db = str(tmp_path / "mismatch.db")
+    _ready(db)
+    features = dict.fromkeys(FEATURE_NAMES, 0.001)
+    fold_advantages_once(db, [AdvantageLabel(DAY, "BTCUSDT", "S0", "btcup_vollo", "lot", _NOW, _NOW, 900, 0.001, 1.0, features)])
+    write_checkpoint(db)
+    fold_advantages_once(db, [AdvantageLabel(DAY, "BTCUSDT", "S1", "btcup_vollo", "lot2", _NOW + 5, _NOW + 5, 900, 0.002, 1.0, features)])
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE adaptive_metric_state SET ewma = ewma + 0.01 WHERE metric LIKE 'hold_adv_%'")
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM continuation_checkpoint").fetchone()[0]
+    conn.close()
+    result = recover_continuation(db)
+    assert result["status"] == RECOVERY_FAILED
+    assert result.get("advanced_checkpoint_id") is None
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM continuation_checkpoint").fetchone()[0] == count
+    conn.close()
+
+
+def test_batched_scratch_replay_matches_per_event_replay(tmp_path):
+    from backend.services.adaptive_learning import _connect as connect_learning
+    from backend.services.continuation_backfill import AdvantageLabel, fold_advantages_once
+    from backend.services.continuation_checkpoint import _connect, _install_document, apply_event, events_after, live_document, materialize
+
+    db = str(tmp_path / "live.db")
+    _ready(db)
+    features = dict.fromkeys(FEATURE_NAMES, 0.002)
+    fold_advantages_once(db, [AdvantageLabel(DAY, "BTCUSDT", "S0", "btcup_vollo", "a", _NOW, _NOW, 900, 0.001, 1.0, features)])
+    saved = write_checkpoint(db)
+    fold_advantages_once(
+        db,
+        [
+            AdvantageLabel(DAY, "BTCUSDT", "S1", "btcup_vollo", "b", _NOW + 5, _NOW + 5, 1800, 0.002, 1.0, features),
+            AdvantageLabel(DAY, "ETHUSDT", "S2", "btcup_vollo", "c", _NOW + 6, _NOW + 6, 900, -0.001, 1.0, features),
+        ],
+    )
+    conn = _connect(db)
+    try:
+        events = events_after(conn, int(saved["last_event_id"]) if "last_event_id" in saved else 0)
+        base = latest_checkpoint(conn)["document"]
+        # write_checkpoint return does not include last_event_id; read it.
+        base_event = int(conn.execute("SELECT last_event_id FROM continuation_checkpoint ORDER BY id DESC LIMIT 1").fetchone()[0])
+        # The checkpoint above was taken before the two extra folds, so re-read that row.
+        first = conn.execute("SELECT last_event_id, payload_json FROM continuation_checkpoint ORDER BY id ASC LIMIT 1").fetchone()
+        events = events_after(conn, int(first[0]))
+        base = json.loads(first[1])
+        current = live_document(conn)
+    finally:
+        conn.close()
+    batched = materialize(str(tmp_path / "batch.db"), base, events)
+    sequential_path = str(tmp_path / "seq.db")
+    connect_learning(sequential_path).close()
+    seq = _connect(sequential_path)
+    seq.execute("BEGIN IMMEDIATE")
+    _install_document(seq, base)
+    seq.commit()
+    seq.close()
+    for event in events:
+        apply_event(sequential_path, event)
+    seq = _connect(sequential_path)
+    try:
+        sequential = live_document(seq)
+    finally:
+        seq.close()
+    assert documents_match(batched, sequential)
+    assert documents_match(batched, current)
+    assert base_event >= 0

@@ -402,3 +402,42 @@ def test_integration_uses_fast_pending_retry():
     src = inspect.getsource(PortfolioEngineIntegration._position_monitor_loop)
     assert "MANDATORY_EXIT_PENDING_RETRY_SEC" in src
     assert "has_exit_residual_pending" in src
+    assert src.index("_monitor_positions_once") < src.index("_scalp_fast_exit_wait")
+
+
+async def test_first_exit_pass_runs_before_the_interval_and_releases_entry():
+    import asyncio
+
+    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
+
+    integ = object.__new__(PortfolioEngineIntegration)
+    integ.is_running = True
+    integ.engine = None
+    integ._exit_monitor_interval = 45
+    integ._exit_protection_ready = asyncio.Event()
+    order: list[str] = []
+
+    async def _purge():
+        return None
+
+    async def _once(**_kwargs):
+        order.append("exit")
+        integ.is_running = False
+
+    async def _wait(sec):
+        order.append(f"sleep:{sec}")
+
+    integ._purge_stale_bd_exit_hard_pause_state = _purge
+    integ._monitor_positions_once = _once
+    integ._scalp_fast_exit_wait = _wait
+
+    async def _buy():
+        await integ._await_exit_protection()
+        order.append("buy")
+
+    await asyncio.gather(integ._position_monitor_loop(), _buy())
+    assert order[0] == "exit"
+    assert "buy" in order
+    assert order.index("buy") > order.index("exit")
+    assert any(item.startswith("sleep:45") for item in order)
+    assert integ._exit_protection_ready.is_set()

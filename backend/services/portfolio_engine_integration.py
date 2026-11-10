@@ -209,6 +209,14 @@ def resolve_learning_labels(db_path: str) -> None:
             fold_recent_advantages(db_path)
         except Exception:
             logger.warning("CONTINUATION_FOLD_FAILED", exc_info=True)
+        try:
+            from backend.services.continuation_checkpoint import maybe_checkpoint_live_surface
+
+            written = maybe_checkpoint_live_surface(db_path)
+            if written is not None:
+                logger.info("CONTINUATION_CHECKPOINT id=%s key_count=%s", written.get("id"), written.get("key_count"))
+        except Exception:
+            logger.warning("CONTINUATION_CHECKPOINT_FAILED", exc_info=True)
     finally:
         _LABEL_RESOLVE_LOCK.release()
 
@@ -247,6 +255,11 @@ class PortfolioEngineIntegration:
         self._scalp_router_executor: ThreadPoolExecutor | None = None
         self._scalp_v2_halt_reason = ""
         self._scalp_v2_halt_until = ""
+        # Set until start() launches the exit monitor. Tests that never start
+        # the loop are not blocked. start() clears it so a new entry waits
+        # for the first exit pass.
+        self._exit_protection_ready = asyncio.Event()
+        self._exit_protection_ready.set()
 
         # Price cache for monitoring
         self.current_prices: dict[str, float] = {}
@@ -370,6 +383,7 @@ class PortfolioEngineIntegration:
 
         # Start background tasks (only if not already started)
         if not hasattr(self, "_monitor_task") or self._monitor_task is None:
+            self._exit_protection_ready_event().clear()
             self._monitor_task = asyncio.create_task(self._position_monitor_loop(), name="portfolio_engine:monitor")
             self._bar_processor_task = asyncio.create_task(self._bar_processor_loop(), name="portfolio_engine:bar_processor")
             self._trailing_buy_task = asyncio.create_task(self._trailing_buy_loop(), name="portfolio_engine:trailing_buy")
@@ -2003,8 +2017,21 @@ class PortfolioEngineIntegration:
             features=cand.get("state_features") or None,
         )
 
+    def _exit_protection_ready_event(self) -> asyncio.Event:
+        event = getattr(self, "_exit_protection_ready", None)
+        if event is None:
+            event = asyncio.Event()
+            event.set()
+            self._exit_protection_ready = event
+        return event
+
+    async def _await_exit_protection(self) -> None:
+        """Block a new entry until the first post-recovery exit pass has run."""
+        await self._exit_protection_ready_event().wait()
+
     async def _fund_day_v2_candidate(self, cand: dict[str, Any], db_path: str) -> None:
         """Size one ranked DAY V2 candidate from the remaining DAY sleeve and submit it."""
+        await self._await_exit_protection()
 
         def _note_exact(path: str, candidate: dict[str, Any], *, funded: bool, reason: str, trade_id: str = "") -> None:
             try:
@@ -2672,6 +2699,7 @@ class PortfolioEngineIntegration:
                             size_mult=view.get("size_mult"),
                         ),
                     }
+                await self._await_exit_protection()
                 result = await self.engine.execute_scalp_v2_buy_live(
                     norm,
                     qty,
@@ -3123,9 +3151,13 @@ class PortfolioEngineIntegration:
         """Monitor positions and execute exits"""
         await self._purge_stale_bd_exit_hard_pause_state()
         logger.info("EXIT_MONITOR_LOOP interval_sec=%s", self._exit_monitor_interval)
+        first_pass = True
         while self.is_running:
             try:
                 await self._monitor_positions_once(refresh_market_data=False)
+                if first_pass:
+                    first_pass = False
+                    self._exit_protection_ready_event().set()
                 if self.engine is not None:
                     try:
                         from backend.config.research_flags import policy_research_enabled
@@ -3146,9 +3178,14 @@ class PortfolioEngineIntegration:
                 await self._scalp_fast_exit_wait(float(MANDATORY_EXIT_PENDING_RETRY_SEC) if pending else self._exit_monitor_interval)
 
             except asyncio.CancelledError:
+                if first_pass:
+                    self._exit_protection_ready_event().set()
                 break
             except Exception as e:
                 logger.exception(f"Error in position monitor: {e}")
+                if first_pass:
+                    first_pass = False
+                    self._exit_protection_ready_event().set()
                 await asyncio.sleep(5)
 
     async def _refresh_prices(self) -> None:

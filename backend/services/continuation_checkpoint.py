@@ -22,6 +22,12 @@ DAY_ENGINE = "DAY_V2"
 RECOVERY_OK = "ok"
 RECOVERY_FAILED = "CONTINUATION_RECOVERY_FAILED"
 _FLOAT_TOL = 1e-9
+# Measured 2026-11-10: 54,562 events took 215.027s and 1,579,020,288 scratch
+# bytes, 3.94ms and about 29KB each. 400 events is about 1.6s of that replay.
+# The following week produced 269 events/hour, so the one-hour age bound fires
+# first in normal trade and still stays inside the event bound.
+CHECKPOINT_EVENT_LAG_LIMIT = 400
+CHECKPOINT_MAX_AGE_SEC = 3600.0
 
 
 def feature_contract() -> str:
@@ -188,7 +194,8 @@ def write_checkpoint(
     *,
     document: dict[str, Any] | None = None,
     last_event_id: int | None = None,
-) -> dict[str, Any]:
+    only_if_newer: bool = False,
+) -> dict[str, Any] | None:
     """Snapshot the installed surface. Metric rows and the ridge are not modified.
 
     ``document`` and ``last_event_id`` store a surface that has already been
@@ -206,6 +213,14 @@ def write_checkpoint(
             document = dict(document)
             event_id = int(last_event_id if last_event_id is not None else document.get("last_event_id") or 0)
         document["last_event_id"] = event_id
+        if only_if_newer:
+            prior = conn.execute(
+                "SELECT id, last_event_id FROM continuation_checkpoint WHERE engine_id=? ORDER BY id DESC LIMIT 1",
+                (engine,),
+            ).fetchone()
+            if prior is not None and int(prior["last_event_id"]) >= event_id:
+                conn.rollback()
+                return None
         digest = state_hash(document)
         payload = _canon(document)
         checksum = hashlib.sha256(payload.encode()).hexdigest()
@@ -432,8 +447,21 @@ def materialize(db_path: str, document: dict[str, Any], events: list[dict[str, A
         raise
     finally:
         conn.close()
-    for event in events:
-        apply_event(db_path, event)
+    if events:
+        conn = _connect(db_path)
+        try:
+            # Scratch verification only. One commit, same fold order, so the
+            # resulting surface matches a per-event commit. The main database
+            # is not this connection.
+            conn.execute("BEGIN IMMEDIATE")
+            for event in events:
+                apply_event(db_path, event, conn=conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
     conn = _connect(db_path)
     try:
         return live_document(conn, str(document["engine_id"]))
@@ -527,7 +555,7 @@ def recover_continuation(db_path: str, engine: str = DAY_ENGINE) -> dict[str, An
         # The verified surface already contains these events. A later restart
         # replays only events after this id. The installed rows are not written.
         if covered > int(saved["last_event_id"]):
-            advanced = write_checkpoint(db_path, engine, document=rebuilt, last_event_id=covered)
+            advanced = write_checkpoint(db_path, engine, document=rebuilt, last_event_id=covered, only_if_newer=True)
         conn = _connect(db_path)
         try:
             detail = f"checkpoint {saved['id']} matches live plus {len(events)} events"
@@ -584,3 +612,74 @@ def sync_checkpoint_if_present(db_path: str, engine: str = DAY_ENGINE) -> dict[s
     finally:
         conn.close()
     return written
+
+
+def _checkpoint_age_sec(created_at: str, now: float) -> float:
+    import calendar
+
+    try:
+        parsed = time.strptime(str(created_at), "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return CHECKPOINT_MAX_AGE_SEC
+    return max(0.0, now - float(calendar.timegm(parsed)))
+
+
+def checkpoint_status(db_path: str, engine: str = DAY_ENGINE) -> dict[str, Any]:
+    """Read-only lag between the newest fold and the newest checkpoint. Not a trading gate."""
+    out: dict[str, Any] = {
+        "engine_id": engine,
+        "checkpoint_id": None,
+        "checkpoint_event_id": None,
+        "latest_event_id": None,
+        "event_lag": None,
+        "checkpoint_age_sec": None,
+        "last_verification_status": None,
+    }
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return out
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            saved = conn.execute(
+                "SELECT id, created_at, last_event_id FROM continuation_checkpoint WHERE engine_id=? ORDER BY id DESC LIMIT 1",
+                (engine,),
+            ).fetchone()
+            latest = conn.execute("SELECT MAX(rowid) FROM continuation_advantage_log").fetchone()
+            status = conn.execute("SELECT status FROM continuation_recovery WHERE engine_id=?", (engine,)).fetchone()
+        except sqlite3.Error:
+            return out
+    finally:
+        conn.close()
+    latest_id = int(latest[0]) if latest is not None and latest[0] is not None else 0
+    out["latest_event_id"] = latest_id
+    if saved is not None:
+        out["checkpoint_id"] = int(saved["id"])
+        out["checkpoint_event_id"] = int(saved["last_event_id"])
+        out["event_lag"] = latest_id - int(saved["last_event_id"])
+        out["checkpoint_age_sec"] = round(_checkpoint_age_sec(str(saved["created_at"]), time.time()), 1)
+    if status is not None:
+        out["last_verification_status"] = str(status["status"])
+    return out
+
+
+def maybe_checkpoint_live_surface(db_path: str, engine: str = DAY_ENGINE) -> dict[str, Any] | None:
+    """Checkpoint the committed surface once the restart replay would cost about a second.
+
+    The inserted row is one transaction: the surface payload and the highest
+    event id read under the same write lock. Hold-advantage rows are not updated.
+    """
+    status = checkpoint_status(db_path, engine)
+    latest = status.get("latest_event_id")
+    if latest is None:
+        return None
+    checkpoint_event = status.get("checkpoint_event_id")
+    lag = int(latest) - int(-1 if checkpoint_event is None else checkpoint_event)
+    if lag <= 0:
+        return None
+    age = status.get("checkpoint_age_sec")
+    age_sec = CHECKPOINT_MAX_AGE_SEC if age is None else float(age)
+    if checkpoint_event is not None and lag < CHECKPOINT_EVENT_LAG_LIMIT and age_sec < CHECKPOINT_MAX_AGE_SEC:
+        return None
+    return write_checkpoint(db_path, engine, only_if_newer=True)

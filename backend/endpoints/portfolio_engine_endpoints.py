@@ -905,6 +905,14 @@ async def get_portfolio_status() -> dict[str, Any]:
         except Exception as exc:
             status["maintenance"] = {"error": str(exc)[:200]}
 
+        try:
+            from backend.database_schema import DATABASE_PATH
+            from backend.services.continuation_checkpoint import checkpoint_status
+
+            status["continuation_checkpoint"] = await asyncio.to_thread(checkpoint_status, str(DATABASE_PATH))
+        except Exception as exc:
+            status["continuation_checkpoint"] = {"error": str(exc)[:200]}
+
         # Ensure we show non-zero equity from adopted data
         return {
             "success": True,
