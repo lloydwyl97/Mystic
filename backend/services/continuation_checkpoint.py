@@ -182,14 +182,30 @@ def _max_event_id(conn: sqlite3.Connection) -> int:
     return int(row[0] or 0) if row else 0
 
 
-def write_checkpoint(db_path: str, engine: str = DAY_ENGINE) -> dict[str, Any]:
-    """Snapshot the installed surface. Metric rows and the ridge are not modified."""
+def write_checkpoint(
+    db_path: str,
+    engine: str = DAY_ENGINE,
+    *,
+    document: dict[str, Any] | None = None,
+    last_event_id: int | None = None,
+) -> dict[str, Any]:
+    """Snapshot the installed surface. Metric rows and the ridge are not modified.
+
+    ``document`` and ``last_event_id`` store a surface that has already been
+    verified against exactly those events. The default reads the live surface
+    and the newest event id in one transaction.
+    """
     conn = _connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         ensure_checkpoint_tables(conn)
-        document = live_document(conn, engine)
-        document["last_event_id"] = _max_event_id(conn)
+        if document is None:
+            document = live_document(conn, engine)
+            event_id = _max_event_id(conn) if last_event_id is None else int(last_event_id)
+        else:
+            document = dict(document)
+            event_id = int(last_event_id if last_event_id is not None else document.get("last_event_id") or 0)
+        document["last_event_id"] = event_id
         digest = state_hash(document)
         payload = _canon(document)
         checksum = hashlib.sha256(payload.encode()).hexdigest()
@@ -207,7 +223,7 @@ def write_checkpoint(db_path: str, engine: str = DAY_ENGINE) -> dict[str, Any]:
                 ADVANTAGE_VERSION,
                 feature_contract(),
                 str(document["economic_version"]),
-                int(document["last_event_id"]),
+                int(event_id),
                 digest,
                 int(document["key_count"]),
                 float(document["effective_weight"]),
@@ -504,13 +520,28 @@ def recover_continuation(db_path: str, engine: str = DAY_ENGINE) -> dict[str, An
         except OSError:
             pass
     if documents_match(current, rebuilt):
+        covered = int(saved["last_event_id"])
+        if events:
+            covered = max(covered, *(int(item["event_id"]) for item in events))
+        advanced = None
+        # The verified surface already contains these events. A later restart
+        # replays only events after this id. The installed rows are not written.
+        if covered > int(saved["last_event_id"]):
+            advanced = write_checkpoint(db_path, engine, document=rebuilt, last_event_id=covered)
         conn = _connect(db_path)
         try:
-            _mark(conn, engine, RECOVERY_OK, f"checkpoint {saved['id']} matches live plus {len(events)} events")
+            detail = f"checkpoint {saved['id']} matches live plus {len(events)} events"
+            if advanced is not None:
+                detail += f"; advanced to checkpoint {advanced['id']} event {covered}"
+            _mark(conn, engine, RECOVERY_OK, detail)
             conn.commit()
         finally:
             conn.close()
-        return {"status": RECOVERY_OK, "checkpoint_id": saved["id"], "events": len(events), "state_hash": state_hash(current)}
+        out = {"status": RECOVERY_OK, "checkpoint_id": saved["id"], "events": len(events), "state_hash": state_hash(current)}
+        if advanced is not None:
+            out["advanced_checkpoint_id"] = advanced["id"]
+            out["advanced_to_event"] = covered
+        return out
     if int(current["key_count"]) == 0 and int(rebuilt["key_count"]) > 0:
         conn = _connect(db_path)
         try:

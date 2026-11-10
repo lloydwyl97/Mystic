@@ -237,6 +237,48 @@ def test_second_checkpoint_is_the_one_recovery_uses(tmp_path):
     assert recover_continuation(db)["checkpoint_id"] == second["id"]
 
 
+def test_successful_recovery_advances_the_checkpoint_without_rewriting_state(tmp_path):
+    from backend.services.adaptive_learning import day_decision
+    from backend.services.continuation_backfill import AdvantageLabel, fold_advantages_once
+
+    db = str(tmp_path / "advance.db")
+    _ready(db)
+    features = dict.fromkeys(FEATURE_NAMES, 0.001)
+
+    def _label(setup: str, horizon: int, when: float, advantage: float) -> AdvantageLabel:
+        return AdvantageLabel(DAY, "BTCUSDT", setup, "btcup_vollo", f"lot-{setup}", when, when, horizon, advantage, 1.0, features)
+
+    assert fold_advantages_once(db, [_label("S0", 900, _NOW, 0.0011)]) == 1
+    first = write_checkpoint(db)
+    assert fold_advantages_once(db, [_label("S1", 1800, _NOW + 5, 0.0022)]) == 1
+    conn = sqlite3.connect(db)
+    before = conn.execute("SELECT symbol, setup, regime, metric, n, ewma, m2 FROM adaptive_metric_state ORDER BY 1, 2, 3, 4").fetchall()
+    covered = conn.execute("SELECT MAX(rowid) FROM continuation_advantage_log").fetchone()[0]
+    conn.close()
+    expected = day_decision(db, "BTCUSDT", "S1", "btcup_vollo")["expected_net"]
+    result = recover_continuation(db)
+    assert result["status"] == "ok"
+    assert result["events"] == 1
+    assert result["advanced_to_event"] == covered
+    assert result["checkpoint_id"] == first["id"]
+    conn = sqlite3.connect(db)
+    after = conn.execute("SELECT symbol, setup, regime, metric, n, ewma, m2 FROM adaptive_metric_state ORDER BY 1, 2, 3, 4").fetchall()
+    saved = latest_checkpoint(conn)
+    count = conn.execute("SELECT COUNT(*) FROM continuation_checkpoint").fetchone()[0]
+    conn.close()
+    assert after == before
+    assert saved["last_event_id"] == covered
+    assert saved["id"] == result["advanced_checkpoint_id"]
+    assert day_decision(db, "BTCUSDT", "S1", "btcup_vollo")["expected_net"] == expected
+    again = recover_continuation(db)
+    assert again["status"] == "ok"
+    assert again.get("advanced_checkpoint_id") is None
+    assert again["events"] == 0
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM continuation_checkpoint").fetchone()[0] == count
+    conn.close()
+
+
 def test_real_and_counterfactual_call_the_same_continuation_decision():
     import inspect
 

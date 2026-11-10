@@ -2890,13 +2890,24 @@ class PortfolioEngine:
         logger.info("=" * 60)
 
         # Ensure DB schema exists
+        phase_started = time.perf_counter()
         self._ensure_db_schema()
+        schema_ms = (time.perf_counter() - phase_started) * 1000.0
         self._load_churn_guard_state()
         if not self.test_mode:
             try:
                 from backend.services.continuation_checkpoint import recover_continuation
 
+                phase_started = time.perf_counter()
                 recovery = recover_continuation(self.db_path)
+                logger.info(
+                    "STARTUP_PHASE schema_ms=%.0f continuation_ms=%.0f continuation_status=%s continuation_events=%s advanced_to_event=%s",
+                    schema_ms,
+                    (time.perf_counter() - phase_started) * 1000.0,
+                    recovery.get("status"),
+                    recovery.get("events"),
+                    recovery.get("advanced_to_event"),
+                )
                 if recovery.get("status") != "ok":
                     logger.critical("CONTINUATION_RECOVERY_FAILED %s", recovery)
             except Exception:
