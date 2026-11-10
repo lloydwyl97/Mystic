@@ -95,6 +95,10 @@ class VenueOrderBudget:
         self._day_count = 0
         self._day_key = ""
         self._day_from_disk = False
+        self._day_from_venue = False
+        self._short_from_venue = False
+        self._venue_short_read_at = -1.0
+        self._external_detected = False
         self.last_rate_limit_error = ""
         self.last_rate_limit_at: float | None = None
         self.protective_sell_attempts = 0
@@ -203,6 +207,53 @@ class VenueOrderBudget:
         self._day_count += 1
         self._save_day()
 
+    def apply_venue_usage(self, rows: list[dict[str, Any]] | None) -> bool:
+        """Raise local usage to the venue's reported count. Never lower it."""
+        with self._lock:
+            now = float(self._clock())
+            applied = False
+            for row in rows or []:
+                if str(row.get("rateLimitType") or "").upper() != "ORDERS":
+                    continue
+                unit = _INTERVAL_SEC.get(str(row.get("interval") or "").upper())
+                if unit is None:
+                    continue
+                try:
+                    window = float(row.get("intervalNum") or 1) * unit
+                    count = int(row.get("count") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if window <= 0 or count < 0:
+                    continue
+                if window >= 86400:
+                    if count > self._day_count:
+                        self._external_detected = True
+                    self._day_count = max(self._day_count, count)
+                    self._day_key = self._utc_day()
+                    self._day_from_disk = True
+                    self._day_from_venue = True
+                    self._save_day()
+                else:
+                    local = sum(1 for stamp in self._stamps if now - stamp < window)
+                    if count > local:
+                        self._external_detected = True
+                        self._stamps.extend([now] * (count - local))
+                    self._short_from_venue = True
+                    self._venue_short_read_at = now
+                applied = True
+            if applied:
+                self._blackout_until = 0.0
+            return applied
+
+    async def refresh_order_usage(self) -> bool:
+        """Read account order-count usage. Does not place an order."""
+        try:
+            rows = await asyncio.to_thread(_fetch_order_usage)
+        except Exception:
+            logger.warning("VENUE_ORDER_USAGE_UNAVAILABLE", exc_info=True)
+            return False
+        return self.apply_venue_usage(rows)
+
     def try_acquire(self, priority: str) -> bool:
         with self._lock:
             if not self._loaded:
@@ -214,6 +265,11 @@ class VenueOrderBudget:
             return True
 
     async def acquire(self, priority: str) -> None:
+        if self._loaded:
+            now = float(self._clock())
+            stale = self._venue_short_read_at < 0 or now - self._venue_short_read_at >= self._short_window_unlocked()
+            if stale:
+                await self.refresh_order_usage()
         while True:
             with self._lock:
                 if not self._loaded:
@@ -265,13 +321,17 @@ class VenueOrderBudget:
             limit_day = next((limit for window, limit in self._limits if window >= 86400), None)
             return {
                 "order_limits_loaded": self._loaded,
+                "orders_used_10s_local": None if blackout or not self._loaded else used_10,
                 "orders_used_10s": None if blackout or not self._loaded else used_10,
                 "orders_limit_10s": limit_10,
-                "orders_10s_authoritative": bool(self._loaded and not blackout),
-                "orders_used_day": None if not self._day_from_disk else self._day_count,
+                "orders_10s_authoritative": bool(self._short_from_venue and not blackout),
+                "orders_used_day_local": self._day_count if (self._day_from_disk or self._day_from_venue or self._day_count > 0) else None,
+                "orders_used_day": self._day_count if (self._day_from_disk or self._day_from_venue or self._day_count > 0) else None,
                 "orders_limit_day": limit_day,
-                "orders_day_authoritative": bool(self._day_from_disk),
-                "orders_day_scope": "mystic_recorded",
+                "orders_day_authoritative": bool(self._day_from_venue),
+                "orders_day_scope": "venue_account" if self._day_from_venue else "mystic_recorded",
+                "external_order_activity_detected": self._external_detected,
+                "account_exclusive_assumption": False,
                 "exit_reserved": exit_reserve_slots() if self._loaded else None,
                 "next_slot_available_at": None if wait <= 0 else time.time() + wait,
                 "protective_sell_attempts": self.protective_sell_attempts,
@@ -280,6 +340,28 @@ class VenueOrderBudget:
                 "last_rate_limit_error": self.last_rate_limit_error,
                 "last_rate_limit_at": self.last_rate_limit_at,
             }
+
+
+def _fetch_order_usage() -> list[dict[str, Any]]:
+    import hashlib
+    import hmac
+    import urllib.parse
+
+    from backend.utils.binance_credentials import get_binance_us_credentials
+
+    api_key, secret = get_binance_us_credentials()
+    if not api_key or not secret:
+        raise RuntimeError("missing_binance_credentials")
+    params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+    query = urllib.parse.urlencode(params)
+    signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    request = urllib.request.Request(
+        "https://api.binance.us/api/v3/rateLimit/order?" + query + "&signature=" + signature,
+        headers={"X-MBX-APIKEY": api_key},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode())
+    return payload if isinstance(payload, list) else []
 
 
 def _fetch_exchange_limits() -> list[dict[str, Any]]:

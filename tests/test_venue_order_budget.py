@@ -156,8 +156,9 @@ def test_restart_does_not_report_an_empty_10_second_window():
     assert budget.try_acquire("exit") is False
     clock["t"] = 15.0
     assert budget.try_acquire("exit") is True
-    assert budget.snapshot()["orders_10s_authoritative"] is True
-    assert budget.snapshot()["orders_used_10s"] == 1
+    assert budget.snapshot()["orders_10s_authoritative"] is False
+    assert budget.snapshot()["orders_used_10s_local"] == 1
+    assert budget.snapshot()["account_exclusive_assumption"] is False
 
 
 def test_10_second_boundary_uses_the_monotonic_clock():
@@ -184,8 +185,8 @@ def test_daily_count_survives_restart_and_resets_on_the_utc_day(tmp_path):
     restarted = VenueOrderBudget(clock=lambda: clock["t"], state_path=str(path), day_fn=lambda: day["value"])
     restarted.set_limits(VENUE)
     view = restarted.snapshot()
-    assert view["orders_used_day"] == 2
-    assert view["orders_day_authoritative"] is True
+    assert view["orders_used_day_local"] == 2
+    assert view["orders_day_authoritative"] is False
     assert view["orders_limit_day"] == 200000
     day["value"] = "2026-11-11"
     assert restarted.try_acquire("exit") is True
@@ -241,6 +242,34 @@ def test_concurrent_reservations_stay_inside_the_limit():
         thread.join()
     assert sum(1 for _priority, ok in results if ok) <= 10
     assert sum(1 for priority, ok in results if priority == "entry" and ok) <= 2
+
+
+def test_venue_usage_raises_local_count_and_never_lowers_it():
+    budget = VenueOrderBudget(clock=lambda: 0.0)
+    budget.set_limits(VENUE)
+    for _ in range(40):
+        assert budget.try_acquire("exit") is True
+    assert budget.apply_venue_usage(
+        [
+            {"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": 100, "count": 63},
+            {"rateLimitType": "ORDERS", "interval": "DAY", "intervalNum": 1, "limit": 200000, "count": 70},
+        ]
+    )
+    view = budget.snapshot()
+    assert view["orders_used_10s_local"] == 63
+    assert view["orders_used_day_local"] == 70
+    assert view["orders_10s_authoritative"] is True
+    assert view["orders_day_authoritative"] is True
+    assert view["external_order_activity_detected"] is True
+    assert budget.apply_venue_usage(
+        [
+            {"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": 100, "count": 10},
+            {"rateLimitType": "ORDERS", "interval": "DAY", "intervalNum": 1, "limit": 200000, "count": 5},
+        ]
+    )
+    later = budget.snapshot()
+    assert later["orders_used_10s_local"] == 63
+    assert later["orders_used_day_local"] == 70
 
 
 def test_second_portfolio_writer_fails_closed(tmp_path):

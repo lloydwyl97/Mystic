@@ -201,6 +201,7 @@ async def main():
 
         await venue_order_budget.ensure_limits()
         venue_order_budget.arm_restart_blackout()
+        await venue_order_budget.refresh_order_usage()
 
         # Start the service
         integration = await start_portfolio_integration()
