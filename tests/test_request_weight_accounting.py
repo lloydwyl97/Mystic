@@ -193,6 +193,15 @@ def test_eight_clean_attempts_fit_in_the_reserve() -> None:
     assert remaining == ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT
 
 
+def test_exit_decision_mark_can_use_the_reserve_and_a_feature_read_cannot() -> None:
+    remaining = 1100 - 800
+    assert weight_grant_allowed(remaining, 2, priority="exit_decision", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is True
+    assert weight_grant_allowed(remaining, 2, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    assert weight_grant_allowed(remaining, 2, priority="exit_decision", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is True
+    assert weight_grant_allowed(remaining, 5, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is True
+    assert weight_grant_allowed(4, 5, priority="exit_decision", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+
+
 def test_weight_header_parser() -> None:
     assert header_used_weight({"x-mbx-used-weight-1m": "64"}) == 64
     assert header_used_weight({"X-MBX-USED-WEIGHT-1M": "8"}) == 8

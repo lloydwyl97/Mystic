@@ -5398,7 +5398,7 @@ class PortfolioEngine:
         )
 
         ns = normalize_symbol(symbol)
-        mark = await fetch_canonical_mark(symbol, use_cache=False)
+        mark = await fetch_canonical_mark(symbol, use_cache=False, priority="exit_decision")
         fields = canonical_mark_to_exit_telemetry_fields(mark)
         if mark is not None and mark.mark > 0 and mark.fresh:
             self._price_cache.set(ns, mark.mark)

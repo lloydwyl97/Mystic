@@ -102,7 +102,7 @@ PROTECTIVE_POSITION_SLOTS = 8
 PROTECTIVE_ATTEMPT_WEIGHT = DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT
 PROTECTIVE_RECOVERY_WEIGHT = ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT
 PROTECTIVE_WEIGHT_RESERVE = PROTECTIVE_POSITION_SLOTS * MANDATORY_EXIT_SAME_CALL_ATTEMPTS * PROTECTIVE_ATTEMPT_WEIGHT + PROTECTIVE_RECOVERY_WEIGHT
-_PRIORITY_CODE = {"background": 0, "entry": 1, "exit": 2}
+_PRIORITY_CODE = {"background": 0, "entry": 1, "exit": 2, "exit_decision": 2}
 # A venue minute is 60 seconds. A sample older than that cannot still be the open minute.
 VENUE_SAMPLE_MAX_AGE_SEC = 60
 
@@ -437,7 +437,7 @@ def weight_grant_allowed(tokens: int, weight: int, *, priority: str, reserve: in
     """Who may spend the shared minute. Exit may use the reserve. A pending sell blocks the rest."""
     if weight <= 0 or int(tokens) < int(weight):
         return False
-    if priority == "exit":
+    if priority in ("exit", "exit_decision"):
         return True
     if pending:
         return False

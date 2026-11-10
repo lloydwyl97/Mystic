@@ -50,13 +50,13 @@ def _decode_redis_val(raw: Any) -> str:
     return str(raw)
 
 
-async def _limited_binance_get(path: str, weight: int, params: dict[str, str]) -> Any:
+async def _limited_binance_get(path: str, weight: int, params: dict[str, str], *, priority: str = "background") -> Any:
     from backend.services.canonical_http_client import get_http_client
     from backend.utils.binance_weight_limiter import BinanceWeightLimiter, observe_headers
 
     started = time.time()
     limiter = await BinanceWeightLimiter.create()
-    await limiter.consume(path, weight=weight, wait=True, timeout=5.0)
+    await limiter.consume(path, weight=weight, wait=True, timeout=5.0, priority=priority)
     client = await get_http_client()
     resp = await client.get("https://api.binance.us" + path, params=params, timeout=10.0)
     await observe_headers(getattr(resp, "headers", None), started_at=started)
@@ -64,8 +64,8 @@ async def _limited_binance_get(path: str, weight: int, params: dict[str, str]) -
     return resp
 
 
-async def _fetch_binance_book_ticker(bus: str) -> dict[str, float] | None:
-    resp = await _limited_binance_get("/api/v3/ticker/bookTicker", 2, {"symbol": bus})
+async def _fetch_binance_book_ticker(bus: str, *, priority: str = "background") -> dict[str, float] | None:
+    resp = await _limited_binance_get("/api/v3/ticker/bookTicker", 2, {"symbol": bus}, priority=priority)
     data = resp.json()
     bid = float(data.get("bidPrice") or 0.0)
     ask = float(data.get("askPrice") or 0.0)
@@ -74,15 +74,15 @@ async def _fetch_binance_book_ticker(bus: str) -> dict[str, float] | None:
     return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2.0}
 
 
-async def _fetch_binance_last_price(bus: str) -> float | None:
-    resp = await _limited_binance_get("/api/v3/ticker/24hr", 2, {"symbol": bus})
+async def _fetch_binance_last_price(bus: str, *, priority: str = "background") -> float | None:
+    resp = await _limited_binance_get("/api/v3/ticker/24hr", 2, {"symbol": bus}, priority=priority)
     data = resp.json()
     last_px = float(data.get("lastPrice") or 0.0)
     return last_px if last_px > 0 else None
 
 
-async def _fetch_binance_1m_kline(bus: str) -> dict[str, float] | None:
-    resp = await _limited_binance_get("/api/v3/klines", 2, {"symbol": bus, "interval": "1m", "limit": "1"})
+async def _fetch_binance_1m_kline(bus: str, *, priority: str = "background") -> dict[str, float] | None:
+    resp = await _limited_binance_get("/api/v3/klines", 2, {"symbol": bus, "interval": "1m", "limit": "1"}, priority=priority)
     rows = resp.json()
     if not rows:
         return None
@@ -147,7 +147,7 @@ async def _fetch_redis_price_hash(bus: str, now: float) -> CanonicalMark | None:
         return None
 
 
-async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> CanonicalMark | None:
+async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True, priority: str = "background") -> CanonicalMark | None:
     """
     Return the canonical current mark for *symbol* (CCXT or BUS format).
 
@@ -173,7 +173,7 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
     source = "missing"
 
     try:
-        book = await _fetch_binance_book_ticker(bus)
+        book = await _fetch_binance_book_ticker(bus, priority=priority)
         if book:
             bid, ask, mid = book["bid"], book["ask"], book["mid"]
             source = "binance_book_ticker_mid"
@@ -182,7 +182,7 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
 
     if mid is None or mid <= 0:
         try:
-            last = await _fetch_binance_last_price(bus)
+            last = await _fetch_binance_last_price(bus, priority=priority)
             if last and last > 0:
                 mid = last
                 source = "binance_ticker_24hr_last"
@@ -201,7 +201,7 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
     kline_high = None
     kline_open = None
     try:
-        kline = await _fetch_binance_1m_kline(bus)
+        kline = await _fetch_binance_1m_kline(bus, priority=priority)
         if kline:
             kline_close = float(kline.get("close") or 0.0) or None
             kline_high = float(kline.get("high") or 0.0) or None
