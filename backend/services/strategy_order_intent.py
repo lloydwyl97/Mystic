@@ -91,7 +91,7 @@ def allocate_intent(
             (str(engine_id), str(trade_id), side_u),
         ).fetchall()
         for prior in existing:
-            if float(prior["filled_qty"] or 0.0) <= 0.0 and str(prior["status"] or "") in {"PENDING", "ACKED"}:
+            if str(prior["status"] or "") in _WORKING_SELL_STATUSES:
                 return str(prior["client_order_id"])
         cid = client_order_id_for(engine_id=engine_id, trade_id=trade_id, side=side_u, attempt=len(existing))
         conn.execute(
@@ -478,7 +478,7 @@ def apply_venue_order(db_path: str, order: dict[str, Any]) -> dict[str, Any]:
                 fee=fee,
                 fee_asset=asset,
             )
-        return last
+        return _finish_venue_lifecycle(db_path, order, last)
     filled = float(order.get("filled") or 0.0)
     average = float(order.get("average") or order.get("price") or 0.0)
     fee_raw = order.get("fee") if isinstance(order.get("fee"), dict) else {}
@@ -488,21 +488,30 @@ def apply_venue_order(db_path: str, order: dict[str, Any]) -> dict[str, Any]:
             fee = float(fee_raw.get("cost") if fee_raw.get("cost") is not None else order.get("commission") or info.get("commission") or 0.0)
         except (TypeError, ValueError):
             fee = 0.0
-        return adopt_venue_fill(
+        return _finish_venue_lifecycle(
             db_path,
-            client_order_id=cid,
-            exchange_order_id=oid,
-            fill_id=f"order:{oid}",
-            quantity=filled,
-            price=average,
-            fee=fee,
-            fee_asset=asset,
+            order,
+            adopt_venue_fill(
+                db_path,
+                client_order_id=cid,
+                exchange_order_id=oid,
+                fill_id=f"order:{oid}",
+                quantity=filled,
+                price=average,
+                fee=fee,
+                fee_asset=asset,
+            ),
         )
-    if oid and cid:
-        mark_exchange_order(db_path, normalize_client_order_id(cid), oid, status="ACKED")
     if filled > 0 and not asset:
-        return {"adopted": False, "reason": "NEEDS_TRADES", "exchange_order_id": oid, "client_order_id": normalize_client_order_id(cid)}
-    return last
+        return _finish_venue_lifecycle(
+            db_path,
+            order,
+            {"adopted": False, "reason": "NEEDS_TRADES", "exchange_order_id": oid, "client_order_id": normalize_client_order_id(cid)},
+        )
+    if oid and cid and order_is_working(order):
+        mark_exchange_order(db_path, normalize_client_order_id(cid), oid, status="OPEN")
+        return {"adopted": False, "reason": "NO_FILL", "exchange_order_id": oid, "client_order_id": normalize_client_order_id(cid)}
+    return _finish_venue_lifecycle(db_path, order, last)
 
 
 def intents_to_probe(db_path: str, *, max_age_sec: float = 172800, limit: int = 16) -> list[dict[str, Any]]:
@@ -522,6 +531,166 @@ def intents_to_probe(db_path: str, *, max_age_sec: float = 172800, limit: int = 
     finally:
         conn.close()
     return [dict(row) for row in rows]
+
+
+_WORKING_SELL_STATUSES = ("PENDING", "ACKED", "OPEN", "PARTIAL", "WORKING")
+_TERMINAL_VENUE_STATUSES = {"canceled", "cancelled", "expired", "rejected", "closed", "filled"}
+
+
+def venue_order_status(order: dict[str, Any] | None) -> str:
+    if not isinstance(order, dict):
+        return ""
+    return str(order.get("status") or "").strip().lower()
+
+
+def order_is_working(order: dict[str, Any] | None) -> bool:
+    """True while the venue can still fill this order. An unknown status stays working."""
+    return venue_order_status(order) not in _TERMINAL_VENUE_STATUSES
+
+
+def terminal_unfilled_label(order: dict[str, Any] | None, filled: float) -> str | None:
+    """A venue order that can accept no more size and has no fill."""
+    if float(filled or 0.0) > 0.0 or order_is_working(order):
+        return None
+    status = venue_order_status(order)
+    if status == "expired":
+        return "EXPIRED"
+    if status == "rejected":
+        return "REJECTED"
+    if status in {"canceled", "cancelled", "closed", "filled"}:
+        return "CANCELED"
+    return None
+
+
+def release_unfilled_intent(db_path: str, client_order_id: str, status: str, exchange_order_id: str = "") -> None:
+    """A confirmed dead order must not keep its client id or block the next protective sell."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            f"""
+            UPDATE strategy_order_intents
+            SET status=?, exchange_order_id=CASE WHEN ? != '' THEN ? ELSE exchange_order_id END, updated_at=?
+            WHERE client_order_id=? AND filled_qty <= 0 AND status IN ({", ".join("?" for _ in _WORKING_SELL_STATUSES)})
+            """,
+            (
+                str(status),
+                str(exchange_order_id or ""),
+                str(exchange_order_id or ""),
+                time.time(),
+                normalize_client_order_id(client_order_id),
+                *_WORKING_SELL_STATUSES,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_working_sell(db_path: str, client_order_id: str, status: str, exchange_order_id: str = "") -> None:
+    """The venue order can still fill. A just-adopted FILLED row is put back to PARTIAL."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE strategy_order_intents
+            SET status=?, exchange_order_id=CASE WHEN ? != '' THEN ? ELSE exchange_order_id END, updated_at=?
+            WHERE client_order_id=? AND status NOT IN ('CLOSED', 'COMMITTED', 'CANCELED', 'EXPIRED', 'REJECTED', 'NO_VENUE_ORDER')
+            """,
+            (
+                str(status),
+                str(exchange_order_id or ""),
+                str(exchange_order_id or ""),
+                time.time(),
+                normalize_client_order_id(client_order_id),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _finish_venue_lifecycle(db_path: str, order: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """Record whether the venue order is still able to fill. A dead zero-fill releases the intent."""
+    cid = str(order.get("clientOrderId") or order.get("client_order_id") or "")
+    oid = str(order.get("id") or "")
+    try:
+        filled = float(order.get("filled") or 0.0)
+    except (TypeError, ValueError):
+        filled = 0.0
+    if isinstance(result, dict):
+        try:
+            filled = max(filled, float(result.get("filled_qty") or 0.0))
+        except (TypeError, ValueError):
+            pass
+    label = terminal_unfilled_label(order, filled)
+    if label:
+        release_unfilled_intent(db_path, cid, label, oid)
+        out = dict(result or {})
+        out["released"] = True
+        out["reason"] = label
+        return out
+    if order_is_working(order) and cid:
+        mark_working_sell(db_path, cid, "PARTIAL" if filled > 0.0 else "OPEN", oid)
+    return result
+
+
+def working_sell_intents(db_path: str, symbol: str | None = None) -> list[dict[str, Any]]:
+    """SELL intents that can still fill or have not been classified. No age cutoff."""
+    from backend.utils.symbols import normalize_symbol
+
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM strategy_order_intents
+            WHERE side='SELL' AND status IN ({", ".join("?" for _ in _WORKING_SELL_STATUSES)})
+            ORDER BY created_at
+            """,
+            _WORKING_SELL_STATUSES,
+        ).fetchall()
+    finally:
+        conn.close()
+    out = [dict(row) for row in rows]
+    if not symbol:
+        return out
+    want = normalize_symbol(symbol)
+    return [row for row in out if normalize_symbol(str(row.get("symbol") or "")) == want]
+
+
+def sell_intent_blocks(db_path: str, symbol: str) -> bool:
+    """True while a SELL for this symbol is submitted and its venue result is not final."""
+    return bool(working_sell_intents(db_path, symbol))
+
+
+def sell_protection_snapshot(db_path: str) -> dict[str, Any]:
+    """Operational view of working protective sells. No strategy decision."""
+    try:
+        rows = working_sell_intents(db_path)
+    except Exception:
+        return {
+            "active_sell_intents": 0,
+            "oldest_sell_intent_age_sec": None,
+            "partial_sell_count": 0,
+            "remaining_sell_qty": 0.0,
+            "venue_order_status": [],
+        }
+    now = time.time()
+    ages = [max(0.0, now - float(row.get("created_at") or now)) for row in rows]
+    partial = 0
+    remaining = 0.0
+    for row in rows:
+        filled = float(row.get("filled_qty") or 0.0)
+        if str(row.get("status") or "") == "PARTIAL" or filled > 0.0:
+            partial += 1
+        remaining += max(0.0, float(row.get("quantity") or 0.0) - filled)
+    return {
+        "active_sell_intents": len(rows),
+        "oldest_sell_intent_age_sec": max(ages) if ages else None,
+        "partial_sell_count": partial,
+        "remaining_sell_qty": remaining,
+        "venue_order_status": [str(row.get("status") or "") for row in rows],
+        "limit_prices": [float(row.get("limit_price") or 0.0) for row in rows],
+    }
 
 
 def mark_intent_absent(db_path: str, client_order_id: str) -> None:
@@ -763,7 +932,7 @@ def recovered_sell_order(db_path: str, trade_id: str, *, requested_qty: float) -
     for row in rows:
         intent = dict(row)
         qty = float(intent["filled_qty"] or 0.0)
-        if qty + 1e-9 < float(requested_qty or 0.0):
+        if qty <= 0.0:
             continue
         if sell_order_already_booked(db_path, str(intent["exchange_order_id"])):
             continue

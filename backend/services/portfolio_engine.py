@@ -2564,22 +2564,15 @@ class PriceCache:
 
 
 def _unresolved_sell_intent(db_path: str, symbol: str) -> bool:
-    """True when a SELL for this symbol was sent and the venue has not classified it."""
+    """True while a SELL for this symbol can still fill or has not been classified."""
     try:
-        from backend.services.strategy_order_intent import intents_to_probe
+        from backend.services.strategy_order_intent import sell_intent_blocks
     except Exception:
         return False
-    want = normalize_symbol(symbol)
     try:
-        pending = intents_to_probe(db_path)
+        return sell_intent_blocks(db_path, symbol)
     except Exception:
         return False
-    for intent in pending:
-        if str(intent.get("side") or "").upper() != "SELL":
-            continue
-        if normalize_symbol(str(intent.get("symbol") or "")) == want:
-            return True
-    return False
 
 
 def _exit_mark_is_usable(mark_info: dict[str, Any] | None) -> bool:
@@ -4277,6 +4270,15 @@ class PortfolioEngine:
                 "protection_ready": protection,
                 "entry_ready": account_status == "ok" and protection,
             }
+            with contextlib.suppress(Exception):
+                from backend.services.strategy_order_intent import sell_protection_snapshot
+
+                snap = sell_protection_snapshot(self.db_path)
+                snap["last_order_probe_epoch"] = getattr(self, "_last_sell_probe_epoch", None)
+                probe = getattr(self, "_last_sell_probe", None)
+                if isinstance(probe, dict):
+                    snap["last_order_probe"] = probe
+                payload["sell_protection"] = snap
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)
             logger.info("LIVE_RECONCILE_STATE_WRITTEN path=%s time=%s actions=%s", path, now_utc, actions)
@@ -9488,40 +9490,142 @@ class PortfolioEngine:
                 )
         return booked
 
+    async def _probe_intent(self, intent: dict[str, Any]) -> dict[str, Any]:
+        """Fetch both attempt ids. A network failure is not absence. -2013 on both is absence."""
+        cid = str(intent.get("client_order_id") or "")
+        symbol = str(intent.get("symbol") or "")
+        absent = 0
+        for suffix in ("-i", "-g"):
+            try:
+                res = await self._live_service.fetch_order("binanceus", f"{cid}{suffix}", symbol)
+            except Exception:
+                logger.warning("STRATEGY_INTENT_PROBE_FAILED trade=%s", intent.get("trade_id"), exc_info=True)
+                return {"unconfirmed": True}
+            if str(res.get("status") or "") == "success" and isinstance(res.get("order"), dict):
+                return {"found": True, "order": res["order"]}
+            if str(res.get("code") or "") == "-2013":
+                absent += 1
+        if absent == 2:
+            return {"absent": True}
+        return {"unconfirmed": True}
+
+    async def _apply_probed_order(self, order: dict[str, Any], symbol: str, client_order_id: str = "") -> dict[str, Any]:
+        from backend.services.live_fill_economics import merge_venue_trades_into_order
+        from backend.services.strategy_order_intent import apply_venue_order
+
+        if client_order_id and not order.get("clientOrderId") and not order.get("client_order_id"):
+            order["clientOrderId"] = client_order_id
+        applied = apply_venue_order(self.db_path, order)
+        if applied.get("reason") == "NEEDS_TRADES":
+            trades = await self._live_service.fetch_order_trades("binanceus", symbol, str(order.get("id") or ""))
+            if str(trades.get("status") or "") == "success":
+                applied = apply_venue_order(self.db_path, merge_venue_trades_into_order(order, trades.get("trades")))
+        return applied
+
+    async def _execution_book_is_fresh(self, symbol: str) -> dict[str, Any] | None:
+        """The book a replacement would use. None when it is missing or stale."""
+        from backend.services.protected_limit_execution import FRESHNESS_FRESH, _fetch_order_book, assess_book_freshness
+
+        book = await _fetch_order_book(symbol)
+        if book is None or not book.bids or not book.asks:
+            return None
+        freshness = assess_book_freshness(symbol, book)
+        if freshness.get("freshness_result") != FRESHNESS_FRESH:
+            return None
+        try:
+            bid = float(book.bids[0][0])
+            ask = float(book.asks[0][0])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if bid <= 0.0 or ask <= 0.0:
+            return None
+        freshness["best_bid"] = bid
+        freshness["best_ask"] = ask
+        return freshness
+
+    async def _progress_working_sell(self, symbol: str, *, allow_cancel: bool) -> None:
+        """Adopt fills on a live protective SELL. Cancel it only after its own timeout and a fresh book.
+
+        A dead order releases its client id so the next exit pass can submit at the fresh book.
+        An order whose cancel cannot be confirmed stays blocking. No second order is sent here.
+        """
+        from backend.config.protected_execution import PROTECTED_LIMIT_ORDER_TIMEOUT_SEC
+        from backend.services.strategy_order_intent import mark_intent_absent, order_is_working, working_sell_intents
+
+        if getattr(self, "_live_service", None) is None or not getattr(self, "db_path", None):
+            return
+        self._last_sell_probe_epoch = time.time()
+        timeout = float(PROTECTED_LIMIT_ORDER_TIMEOUT_SEC)
+        for intent in working_sell_intents(self.db_path, symbol):
+            probed = await self._probe_intent(intent)
+            if probed.get("unconfirmed"):
+                continue
+            if probed.get("absent"):
+                mark_intent_absent(self.db_path, str(intent.get("client_order_id") or ""))
+                continue
+            order = probed["order"]
+            await self._apply_probed_order(order, str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""))
+            if not order_is_working(order):
+                continue
+            age = time.time() - float(intent.get("created_at") or time.time())
+            if not allow_cancel or age < timeout:
+                continue
+            book = await self._execution_book_is_fresh(symbol)
+            if book is None:
+                continue
+            limit_px = float(intent.get("limit_price") or 0.0)
+            bid = float(book.get("best_bid") or 0.0)
+            self._last_sell_probe = {
+                "epoch": time.time(),
+                "symbol": symbol,
+                "bid": bid,
+                "ask": float(book.get("best_ask") or 0.0),
+                "book_age_ms": book.get("book_age_ms"),
+                "limit_price": limit_px,
+                "drift_bps": ((limit_px - bid) / bid * 10000.0) if bid > 0.0 and limit_px > 0.0 else None,
+                "remaining_qty": max(0.0, float(intent.get("quantity") or 0.0) - float(intent.get("filled_qty") or 0.0)),
+            }
+            oid = str(order.get("id") or intent.get("exchange_order_id") or "")
+            if not oid:
+                continue
+            with contextlib.suppress(Exception):
+                await self._live_service.cancel_order("binanceus", oid, str(intent.get("symbol") or symbol))
+            try:
+                again = await self._live_service.fetch_order("binanceus", oid, str(intent.get("symbol") or symbol))
+            except Exception:
+                logger.warning("SELL_CANCEL_CONFIRM_FAILED symbol=%s order=%s", symbol, oid, exc_info=True)
+                continue
+            if str(again.get("status") or "") != "success" or not isinstance(again.get("order"), dict):
+                continue
+            await self._apply_probed_order(again["order"], str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""))
+
     async def _recover_strategy_order_intents(self) -> int:
         """Find venue orders for intents that died before a fill was stored, then book them once."""
-        from backend.services.strategy_order_intent import apply_venue_order, intents_to_probe, mark_intent_absent
+        from backend.services.strategy_order_intent import intents_to_probe, mark_intent_absent, working_sell_intents
 
         if self._live_service is None:
             return 0
+        self._last_sell_probe_epoch = time.time()
         probed = 0
-        for intent in intents_to_probe(self.db_path):
+        seen: set[str] = set()
+        batch: list[dict[str, Any]] = []
+        for intent in list(intents_to_probe(self.db_path)) + working_sell_intents(self.db_path):
+            cid = str(intent.get("client_order_id") or "")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            batch.append(intent)
+        for intent in batch:
             cid = str(intent.get("client_order_id") or "")
             symbol = str(intent.get("symbol") or "")
-            absent = 0
-            found = False
-            for suffix in ("-i", "-g"):
-                try:
-                    res = await self._live_service.fetch_order("binanceus", f"{cid}{suffix}", symbol)
-                except Exception:
-                    logger.warning("STRATEGY_INTENT_PROBE_FAILED trade=%s", intent.get("trade_id"), exc_info=True)
-                    break
-                if str(res.get("status") or "") == "success" and isinstance(res.get("order"), dict):
-                    from backend.services.live_fill_economics import merge_venue_trades_into_order
-
-                    order = res["order"]
-                    applied = apply_venue_order(self.db_path, order)
-                    if applied.get("reason") == "NEEDS_TRADES":
-                        trades = await self._live_service.fetch_order_trades("binanceus", symbol, str(order.get("id") or ""))
-                        if str(trades.get("status") or "") == "success":
-                            apply_venue_order(self.db_path, merge_venue_trades_into_order(order, trades.get("trades")))
-                    found = True
-                    probed += 1
-                    break
-                if str(res.get("code") or "") == "-2013":
-                    absent += 1
-            if not found and absent == 2:
+            found = await self._probe_intent(intent)
+            if found.get("unconfirmed"):
+                continue
+            if found.get("absent"):
                 mark_intent_absent(self.db_path, cid)
+                continue
+            await self._apply_probed_order(found["order"], symbol, cid)
+            probed += 1
         booked = await self.restore_filled_asset_custody()
         if booked:
             await self._load_positions_from_sqlite()
@@ -14477,9 +14581,21 @@ class PortfolioEngine:
                 limit_price=pf.protected_limit_price,
                 client_order_id=sell_client_id or None,
             )
+            if isinstance(order, dict) and order.get("_mystic_cancel_unconfirmed"):
+                # The resting order can still fill. Keep it tracked and do not book or replace it.
+                from backend.services.strategy_order_intent import apply_venue_order
+
+                if sell_client_id and not order.get("clientOrderId"):
+                    order["clientOrderId"] = f"{sell_client_id}-g"
+                with contextlib.suppress(Exception):
+                    apply_venue_order(self.db_path, order)
+                return None
             if isinstance(order, dict) and order.get("id") and sell_client_id:
                 with contextlib.suppress(Exception):
                     mark_exchange_order(self.db_path, sell_client_id, str(order.get("id") or ""), status="ACKED")
+            elif sell_client_id:
+                with contextlib.suppress(Exception):
+                    await self._progress_working_sell(symbol, allow_cancel=False)
             return stamp_preflight(order, pf)
 
         hold_time_seconds = time.time() - position.entry_time
@@ -17195,11 +17311,20 @@ class PortfolioEngine:
             if _lot_engine == "SCALP_V2":
                 mark_info, executable_bid = await self._scalp_exit_quote(symbol, executable_quote_only=executable_quote_only)
                 if mark_info is None:
+                    try:
+                        await self._progress_working_sell(symbol, allow_cancel=False)
+                    except Exception:
+                        logger.warning("SELL_PROGRESS_FAILED symbol=%s", symbol, exc_info=True)
                     continue
             else:
                 mark_info = await self._resolve_exit_monitor_mark(symbol)
             telemetry = self._build_exit_check_telemetry(position, mark_info)
             self._log_exit_check_telemetry(telemetry)
+
+            try:
+                await self._progress_working_sell(symbol, allow_cancel=_exit_mark_is_usable(mark_info))
+            except Exception:
+                logger.warning("SELL_PROGRESS_FAILED symbol=%s", symbol, exc_info=True)
 
             if not _exit_mark_is_usable(mark_info):
                 any_stale_marks = True

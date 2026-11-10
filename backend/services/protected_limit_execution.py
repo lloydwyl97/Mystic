@@ -1135,9 +1135,6 @@ async def execute_protected_limit_live(
         submit_ts = time.time()
         try:
             await live_service._ensure_initialized()
-            params: dict[str, Any] = {}
-            if tif == "IOC":
-                params["timeInForce"] = "IOC"
             submit_ts = time.time()
             result = await live_service.place_order(
                 exchange="binanceus",
@@ -1147,7 +1144,7 @@ async def execute_protected_limit_live(
                 amount=quantity,
                 price=limit_price,
                 client_order_id=attempt_cid,
-                time_in_force=tif if tif == "IOC" else None,
+                time_in_force=tif,
             )
         except TypeError:
             submit_ts = time.time()
@@ -1193,6 +1190,8 @@ async def execute_protected_limit_live(
 
         response_ts = time.time()
         order = result.get("order") or {}
+        if isinstance(order, dict):
+            order.setdefault("clientOrderId", attempt_cid)
         order_id = str(order.get("id") or "")
         if order_id:
             order = await _enrich_live_order_fills(live_service, order, exchange_symbol)
@@ -1262,7 +1261,10 @@ async def execute_protected_limit_live(
                         break
                 await asyncio.sleep(poll_interval)
             if not closed:
-                # A resting order the engine does not track can fill later. Stop entries until reviewed.
+                # The venue may still fill this order. It stays tracked and blocks a second sell.
+                if isinstance(last, dict):
+                    last["_mystic_cancel_unconfirmed"] = True
+                    last.setdefault("clientOrderId", attempt_cid)
                 logger.critical("PROTECTED_LIMIT_CANCEL_UNCONFIRMED %s %s order_id=%s — entries paused", side_l, exchange_symbol, order_id)
                 with contextlib.suppress(Exception):
                     from backend.services.portfolio_engine import get_portfolio_engine
