@@ -21,10 +21,14 @@ from backend.utils.binance_weight_limiter import (
     ORDER_SUBMIT_WEIGHT,
     ORDER_USAGE_WEIGHT,
     RateLimited,
+    alignment_state,
+    apply_venue_header,
+    carried_remaining,
     depth_request_weight,
     header_used_weight,
     kline_request_weight,
     remaining_after_venue,
+    window_id,
 )
 
 
@@ -55,6 +59,92 @@ def test_venue_header_raises_usage_and_never_lowers_it() -> None:
     assert remaining_after_venue(800, 400, 1100) == 700
     assert remaining_after_venue(100, 50, 1100) == 100
     assert remaining_after_venue(0, 10, 1100) == 0
+
+
+def test_local_roll_keeps_a_fresh_venue_sample() -> None:
+    now = 1_794_337_020.0
+    assert window_id(now) == 1_794_337_020 // 60
+    assert window_id(now - 0.1) == window_id(now) - 1
+    # Five seconds and thirty seconds before the venue minute: still the same fresh sample.
+    assert carried_remaining(1100, 363, now - 5, now) == 737
+    assert carried_remaining(1100, 1050, now - 30, now) == 50
+    assert carried_remaining(1100, 1050, now - 60, now) == 1100
+    assert carried_remaining(1100, None, None, now) == 1100
+
+
+def test_stale_lower_header_does_not_reopen_capacity() -> None:
+    remaining, high_water, _when, hw_window, decision = apply_venue_header(
+        remaining=50,
+        budget=1100,
+        high_water=1050,
+        high_water_at=100.0,
+        high_water_window=10,
+        used=10,
+        request_started_at=90.0,
+        now_window=11,
+    )
+    assert decision == "stale_ignored"
+    assert remaining == 50
+    assert high_water == 1050
+    assert hw_window == 10
+    missing, *_rest = apply_venue_header(
+        remaining=50,
+        budget=1100,
+        high_water=1050,
+        high_water_at=100.0,
+        high_water_window=10,
+        used=10,
+        request_started_at=None,
+        now_window=11,
+    )
+    assert missing == 50
+
+
+def test_proven_minute_reset_reopens_only_the_new_minute() -> None:
+    remaining, high_water, _when, hw_window, decision = apply_venue_header(
+        remaining=30,
+        budget=1100,
+        high_water=1050,
+        high_water_at=100.0,
+        high_water_window=10,
+        used=10,
+        request_started_at=110.0,
+        now_window=11,
+    )
+    assert decision == "reset_confirmed"
+    assert high_water == 10
+    assert hw_window == 11
+    assert remaining == 1070
+    assert remaining <= 1100 - 10
+
+
+def test_higher_header_never_increases_remaining() -> None:
+    remaining, high_water, _when, hw_window, decision = apply_venue_header(
+        remaining=800,
+        budget=1100,
+        high_water=100,
+        high_water_at=1.0,
+        high_water_window=4,
+        used=400,
+        request_started_at=2.0,
+        now_window=4,
+    )
+    assert decision == "raised"
+    assert remaining == 700
+    assert high_water == 400
+    assert hw_window == 4
+
+
+def test_callers_share_one_carried_budget() -> None:
+    remaining = carried_remaining(1100, 1050, 1.0, 2.0)
+    for _ in range(4):
+        assert remaining >= 5
+        remaining -= 5
+    assert remaining == 30
+    assert alignment_state(11, 10, 1050) == "VENUE_AHEAD"
+    assert alignment_state(11, 11, 10) == "ALIGNED"
+    assert alignment_state(11, None, None) == "UNKNOWN"
+    assert alignment_state(11, 12, 10) == "LOCAL_AHEAD"
 
 
 def test_weight_header_parser() -> None:

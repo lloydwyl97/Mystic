@@ -413,20 +413,22 @@ def _fetch_order_usage() -> list[dict[str, Any]]:
         "https://api.binance.us/api/v3/rateLimit/order?" + query + "&signature=" + signature,
         headers={"X-MBX-APIKEY": api_key},
     )
+    started = time.time()
     with urllib.request.urlopen(request, timeout=10) as response:
         from backend.utils.binance_weight_limiter import observe_headers_sync
 
-        observe_headers_sync(response.headers)
+        observe_headers_sync(response.headers, started_at=started)
         payload = json.loads(response.read().decode())
     return payload if isinstance(payload, list) else []
 
 
 def _fetch_exchange_limits() -> list[dict[str, Any]]:
     url = os.getenv("BINANCEUS_EXCHANGE_INFO_URL", "https://api.binance.us/api/v3/exchangeInfo?symbol=BTCUSDT")
+    started = time.time()
     with urllib.request.urlopen(url, timeout=10) as resp:
         from backend.utils.binance_weight_limiter import observe_headers_sync
 
-        observe_headers_sync(resp.headers)
+        observe_headers_sync(resp.headers, started_at=started)
         payload = json.loads(resp.read().decode())
     limits = payload.get("rateLimits")
     return limits if isinstance(limits, list) else []

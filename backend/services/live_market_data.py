@@ -440,11 +440,12 @@ class LiveMarketDataService:
                                 wait=True,
                                 timeout=LIMITER_CONSUME_TIMEOUT_LOOP,
                             )
+                            started = time.time()
                             async with httpx.AsyncClient() as client:
                                 response = await client.get(url, params=params, timeout=10.0)
                                 from backend.utils.binance_weight_limiter import observe_headers
 
-                                await observe_headers(getattr(response, "headers", None))
+                                await observe_headers(getattr(response, "headers", None), started_at=started)
                                 response.raise_for_status()
                                 data = response.json()
 
@@ -552,11 +553,12 @@ class LiveMarketDataService:
                                 wait=True,
                                 timeout=LIMITER_CONSUME_TIMEOUT_LOOP,
                             )
+                            started = time.time()
                             async with httpx.AsyncClient() as client:
                                 response = await client.get(url, params=params, timeout=10.0)
                                 from backend.utils.binance_weight_limiter import observe_headers
 
-                                await observe_headers(getattr(response, "headers", None))
+                                await observe_headers(getattr(response, "headers", None), started_at=started)
                                 response.raise_for_status()
                                 klines_data = response.json()
 
@@ -665,11 +667,12 @@ class LiveMarketDataService:
                     wait=True,
                     timeout=LIMITER_CONSUME_TIMEOUT_LOOP,
                 )
+                started = time.time()
                 async with httpx.AsyncClient() as client:
                     response = await client.get(url, params=params, timeout=10.0)
                     from backend.utils.binance_weight_limiter import observe_headers
 
-                    await observe_headers(getattr(response, "headers", None))
+                    await observe_headers(getattr(response, "headers", None), started_at=started)
                     response.raise_for_status()
                     data = response.json()
 
@@ -858,8 +861,9 @@ class LiveMarketDataService:
                 wait=True,
                 timeout=LIMITER_CONSUME_TIMEOUT_CRITICAL,
             )
+            started = time.time()
             response = await canonical_http_client.make_request("GET", url, params=params)
-            await observe_headers(getattr(response, "headers", None))
+            await observe_headers(getattr(response, "headers", None), started_at=started)
             response.raise_for_status()
             data = response.json()
 
@@ -959,8 +963,9 @@ class LiveMarketDataService:
                     raise RateLimited("exchangeInfo weight unavailable")
             if not try_consume_sync("/api/v3/depth", depth_request_weight(limit)):
                 raise RateLimited("depth weight unavailable")
+            started = time.time()
             ob, call_started, received_ts, sent_ms = await asyncio.to_thread(_fetch_public_order_book, s, limit)
-            observe_headers_sync(getattr(_PUBLIC_BOOK_CLIENT, "last_response_headers", None))
+            observe_headers_sync(getattr(_PUBLIC_BOOK_CLIENT, "last_response_headers", None), started_at=started)
             # Binance.US REST depth carries lastUpdateId but no event time. The
             # depth request's send time is the oldest the snapshot can be.
             request_sent_ts = call_started

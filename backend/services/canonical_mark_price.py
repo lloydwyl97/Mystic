@@ -54,11 +54,12 @@ async def _limited_binance_get(path: str, weight: int, params: dict[str, str]) -
     from backend.services.canonical_http_client import get_http_client
     from backend.utils.binance_weight_limiter import BinanceWeightLimiter, observe_headers
 
+    started = time.time()
     limiter = await BinanceWeightLimiter.create()
     await limiter.consume(path, weight=weight, wait=True, timeout=5.0)
     client = await get_http_client()
     resp = await client.get("https://api.binance.us" + path, params=params, timeout=10.0)
-    await observe_headers(getattr(resp, "headers", None))
+    await observe_headers(getattr(resp, "headers", None), started_at=started)
     resp.raise_for_status()
     return resp
 

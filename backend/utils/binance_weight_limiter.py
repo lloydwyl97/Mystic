@@ -8,8 +8,6 @@ import time
 from collections import defaultdict
 from typing import Any
 
-import redis
-
 from backend.config.mystic_api_schedule import BINANCEUS_WEIGHT_PER_MIN
 from backend.metrics import (
     limiter_circuit_open,
@@ -88,46 +86,48 @@ ORDER_STATUS_WEIGHT = 4
 CHARGED_KEY = "bwl:charged"
 VENUE_USED_KEY = "bwl:venue_used"
 VENUE_USED_AT_KEY = "bwl:venue_used_at"
+VENUE_HW_KEY = "bwl:venue_hw"
+VENUE_HW_AT_KEY = "bwl:venue_hw_at"
+VENUE_HW_WINDOW_KEY = "bwl:venue_hw_window"
+WINDOW_KEY = "bwl:window_id"
 PROTECTIVE_KEY = "bwl:protective_pending"
+# A venue minute is 60 seconds. A sample older than that cannot still be the open minute.
+VENUE_SAMPLE_MAX_AGE_SEC = 60
 
-_NOTE_LUA = """
-local tokens = tonumber(redis.call('GET', KEYS[1]))
-local reset = tonumber(redis.call('GET', KEYS[4]))
-local now = tonumber(ARGV[4])
-local budget = tonumber(ARGV[2])
-if reset == nil or reset <= now then
-  tokens = budget
-  redis.call('SET', KEYS[1], budget)
-  redis.call('SET', KEYS[4], now + 60)
-  redis.call('SET', KEYS[5], 0)
-end
-if tokens == nil then
-  tokens = budget
-end
-local used = tonumber(ARGV[1])
-local cap = budget - used
-if cap < 0 then cap = 0 end
-if cap < tokens then
-  redis.call('SET', KEYS[1], cap)
-end
-redis.call('SET', KEYS[2], ARGV[1])
-redis.call('SET', KEYS[3], ARGV[3])
-return cap
-"""
-
+# Roll and charge are one script so two processes cannot both refill.
 _CONSUME_LUA = """
-local tokens = tonumber(redis.call('GET', KEYS[1]))
-local reset = tonumber(redis.call('GET', KEYS[2]))
 local now = tonumber(ARGV[1])
 local budget = tonumber(ARGV[2])
 local weight = tonumber(ARGV[3])
-if redis.call('GET', KEYS[6]) == '1' then
+local max_age = tonumber(ARGV[4])
+if redis.call('GET', KEYS[7]) == '1' then
   return 0
 end
-if reset == nil or reset <= now then
-  tokens = budget
-  redis.call('SET', KEYS[1], budget)
-  redis.call('SET', KEYS[2], now + 60)
+local window = math.floor(now / 60)
+local stored = tonumber(redis.call('GET', KEYS[4]))
+local tokens = tonumber(redis.call('GET', KEYS[1]))
+if stored == nil or stored ~= window then
+  local hw = tonumber(redis.call('GET', KEYS[5]))
+  local hw_at = tonumber(redis.call('GET', KEYS[6]))
+  if hw == nil then
+    hw = tonumber(redis.call('GET', KEYS[10]))
+    hw_at = tonumber(redis.call('GET', KEYS[11]))
+    if hw ~= nil then
+      redis.call('SET', KEYS[5], hw)
+      if hw_at ~= nil then
+        redis.call('SET', KEYS[6], hw_at)
+      end
+    end
+  end
+  if hw == nil or hw_at == nil or (now - hw_at) >= max_age then
+    tokens = budget
+  else
+    tokens = budget - hw
+    if tokens < 0 then tokens = 0 end
+  end
+  redis.call('SET', KEYS[1], tokens)
+  redis.call('SET', KEYS[4], window)
+  redis.call('SET', KEYS[2], (window + 1) * 60)
   redis.call('SET', KEYS[3], 0)
 end
 if tokens == nil or tokens < weight then
@@ -135,9 +135,134 @@ if tokens == nil or tokens < weight then
 end
 redis.call('DECRBY', KEYS[1], weight)
 redis.call('INCRBY', KEYS[3], weight)
-redis.call('INCRBY', KEYS[4], weight)
-redis.call('INCR', KEYS[5])
+redis.call('INCRBY', KEYS[8], weight)
+redis.call('INCR', KEYS[9])
 return 1
+"""
+
+_ROLL_LUA = """
+local now = tonumber(ARGV[1])
+local budget = tonumber(ARGV[2])
+local max_age = tonumber(ARGV[3])
+local window = math.floor(now / 60)
+local stored = tonumber(redis.call('GET', KEYS[4]))
+if stored ~= nil and stored == window then
+  return tonumber(redis.call('GET', KEYS[1])) or budget
+end
+local hw = tonumber(redis.call('GET', KEYS[5]))
+local hw_at = tonumber(redis.call('GET', KEYS[6]))
+if hw == nil then
+  hw = tonumber(redis.call('GET', KEYS[7]))
+  hw_at = tonumber(redis.call('GET', KEYS[8]))
+  if hw ~= nil then
+    redis.call('SET', KEYS[5], hw)
+    if hw_at ~= nil then
+      redis.call('SET', KEYS[6], hw_at)
+    end
+  end
+end
+local tokens = budget
+if hw ~= nil and hw_at ~= nil and (now - hw_at) < max_age then
+  tokens = budget - hw
+  if tokens < 0 then tokens = 0 end
+end
+redis.call('SET', KEYS[1], tokens)
+redis.call('SET', KEYS[4], window)
+redis.call('SET', KEYS[2], (window + 1) * 60)
+redis.call('SET', KEYS[3], 0)
+return tokens
+"""
+
+_NOTE_LUA = """
+local used = tonumber(ARGV[1])
+local budget = tonumber(ARGV[2])
+local now = tonumber(ARGV[4])
+local started = tonumber(ARGV[5])
+local max_age = tonumber(ARGV[6])
+local window = math.floor(now / 60)
+local stored = tonumber(redis.call('GET', KEYS[4]))
+local tokens = tonumber(redis.call('GET', KEYS[1]))
+if stored == nil or stored ~= window then
+  local hw = tonumber(redis.call('GET', KEYS[5]))
+  local hw_at = tonumber(redis.call('GET', KEYS[6]))
+  if hw == nil then
+    hw = tonumber(redis.call('GET', KEYS[2]))
+    hw_at = tonumber(redis.call('GET', KEYS[3]))
+  end
+  if hw == nil or hw_at == nil or (now - hw_at) >= max_age then
+    tokens = budget
+  else
+    tokens = budget - hw
+    if tokens < 0 then tokens = 0 end
+  end
+  redis.call('SET', KEYS[1], tokens)
+  redis.call('SET', KEYS[4], window)
+  redis.call('SET', KEYS[9], (window + 1) * 60)
+  redis.call('SET', KEYS[8], 0)
+  stored = window
+end
+if tokens == nil then
+  tokens = budget
+end
+local hw = tonumber(redis.call('GET', KEYS[5]))
+local hw_at = tonumber(redis.call('GET', KEYS[6]))
+local hw_window = tonumber(redis.call('GET', KEYS[7]))
+if hw == nil then
+  hw = tonumber(redis.call('GET', KEYS[2]))
+  hw_at = tonumber(redis.call('GET', KEYS[3]))
+  if hw ~= nil then
+    redis.call('SET', KEYS[5], hw)
+    if hw_at ~= nil then
+      redis.call('SET', KEYS[6], hw_at)
+    end
+    if hw_window == nil then
+      if hw_at ~= nil and hw_at >= window * 60 then
+        hw_window = window
+      else
+        hw_window = window - 1
+      end
+      redis.call('SET', KEYS[7], hw_window)
+    end
+  end
+end
+redis.call('SET', KEYS[2], ARGV[1])
+redis.call('SET', KEYS[3], ARGV[3])
+if hw == nil or used >= hw then
+  local cap = budget - used
+  if cap < 0 then cap = 0 end
+  if cap < tokens then
+    tokens = cap
+  end
+  redis.call('SET', KEYS[1], tokens)
+  redis.call('SET', KEYS[5], used)
+  if started >= 0 then
+    redis.call('SET', KEYS[6], ARGV[5])
+  elseif hw_at == nil then
+    redis.call('SET', KEYS[6], ARGV[4])
+  end
+  if hw_window == nil then
+    redis.call('SET', KEYS[7], window)
+  end
+  return tokens
+end
+if started < 0 or hw_at == nil or started < hw_at then
+  return tokens
+end
+local released = hw - used
+local cap = budget - used
+if cap < 0 then cap = 0 end
+tokens = tokens + released
+if tokens > cap then
+  tokens = cap
+end
+if tokens < 0 then
+  tokens = 0
+end
+redis.call('SET', KEYS[1], tokens)
+redis.call('SET', KEYS[5], used)
+redis.call('SET', KEYS[6], ARGV[5])
+redis.call('SET', KEYS[7], window)
+return tokens
 """
 
 
@@ -187,35 +312,124 @@ def header_used_weight(headers: Any) -> int | None:
         return None
 
 
+def window_id(epoch: float) -> int:
+    """Binance.US request-weight minute, observed to open on the Unix minute."""
+    return int(float(epoch) // 60)
+
+
 def remaining_after_venue(local_remaining: int, venue_used: int, budget: int) -> int:
     """Raise usage to the venue header. Never restore capacity the header does not show."""
     cap = max(0, int(budget) - max(0, int(venue_used)))
     return min(max(0, int(local_remaining)), cap)
 
 
-def note_venue_used_sync(used: int) -> None:
-    client = get_sync_redis_service()
-    client.eval(
-        _NOTE_LUA,
-        5,
+def carried_remaining(
+    budget: int,
+    venue_used: int | None,
+    venue_observed_at: float | None,
+    now: float,
+) -> int:
+    """Capacity opened when the local minute rolls.
+
+    A sample younger than one minute may still belong to the venue minute that
+    has not reset. A full budget is opened only when there is no such sample.
+    """
+    if venue_used is None or venue_observed_at is None:
+        return int(budget)
+    if float(now) - float(venue_observed_at) >= VENUE_SAMPLE_MAX_AGE_SEC:
+        return int(budget)
+    return max(0, int(budget) - max(0, int(venue_used)))
+
+
+def apply_venue_header(
+    *,
+    remaining: int,
+    budget: int,
+    high_water: int | None,
+    high_water_at: float | None,
+    high_water_window: int | None,
+    used: int,
+    request_started_at: float | None,
+    now_window: int,
+) -> tuple[int, int, float | None, int | None, str]:
+    """Apply one venue header.
+
+    A lower reading reopens capacity only when the request started at or after
+    the high-water observation. That request cannot be a stale earlier sample,
+    so the counter itself reset. Returns remaining, high water, its time, its
+    window, and a decision name.
+    """
+    used = max(0, int(used))
+    current = max(0, int(remaining))
+    if high_water is None or used >= int(high_water):
+        cap = max(0, int(budget) - used)
+        observed = request_started_at if request_started_at is not None else high_water_at
+        window = high_water_window if high_water_window is not None else int(now_window)
+        decision = "raised" if high_water is None or used > int(high_water) else "same"
+        return min(current, cap), used, observed, window, decision
+    if request_started_at is None or high_water_at is None or float(request_started_at) < float(high_water_at):
+        return current, int(high_water), high_water_at, high_water_window, "stale_ignored"
+    cap = max(0, int(budget) - used)
+    opened = min(cap, current + (int(high_water) - used))
+    return opened, used, float(request_started_at), int(now_window), "reset_confirmed"
+
+
+def alignment_state(current_window: int | None, high_water_window: int | None, high_water: int | None) -> str:
+    if high_water is None or current_window is None or high_water_window is None:
+        return "UNKNOWN"
+    if int(high_water_window) == int(current_window):
+        return "ALIGNED"
+    if int(high_water_window) < int(current_window):
+        return "VENUE_AHEAD"
+    return "LOCAL_AHEAD"
+
+
+def _consume_keys(path: str) -> tuple[str, ...]:
+    return (
         "bwl:tokens",
-        VENUE_USED_KEY,
-        VENUE_USED_AT_KEY,
         "bwl:reset_ts",
         CHARGED_KEY,
-        int(used),
-        int(WEIGHT_BUDGET_PER_MIN),
-        str(time.time()),
-        int(time.time()),
+        WINDOW_KEY,
+        VENUE_HW_KEY,
+        VENUE_HW_AT_KEY,
+        "bwl:circuit_open",
+        f"bwl:usage:{path}",
+        f"bwl:req:{path}",
+        VENUE_USED_KEY,
+        VENUE_USED_AT_KEY,
     )
 
 
-def observe_headers_sync(headers: Any) -> None:
+def note_venue_used_sync(used: int, started_at: float | None = None) -> None:
+    client = get_sync_redis_service()
+    now = time.time()
+    client.eval(
+        _NOTE_LUA,
+        9,
+        "bwl:tokens",
+        VENUE_USED_KEY,
+        VENUE_USED_AT_KEY,
+        WINDOW_KEY,
+        VENUE_HW_KEY,
+        VENUE_HW_AT_KEY,
+        VENUE_HW_WINDOW_KEY,
+        CHARGED_KEY,
+        "bwl:reset_ts",
+        int(used),
+        int(WEIGHT_BUDGET_PER_MIN),
+        str(now),
+        str(now),
+        "-1" if started_at is None else str(float(started_at)),
+        str(VENUE_SAMPLE_MAX_AGE_SEC),
+    )
+
+
+def observe_headers_sync(headers: Any, started_at: float | None = None) -> None:
     used = header_used_weight(headers)
     if used is None:
         return
     try:
-        note_venue_used_sync(used)
+        note_venue_used_sync(used, started_at)
     except Exception:
         logger.debug("venue weight header not applied", exc_info=True)
 
@@ -224,18 +438,15 @@ def try_consume_sync(path: str, weight: int) -> bool:
     """Atomic shared-bucket charge for synchronous callers. False sends nothing."""
     try:
         client = get_sync_redis_service()
+        now = time.time()
         granted = client.eval(
             _CONSUME_LUA,
-            6,
-            "bwl:tokens",
-            "bwl:reset_ts",
-            CHARGED_KEY,
-            f"bwl:usage:{path}",
-            f"bwl:req:{path}",
-            "bwl:circuit_open",
-            int(time.time()),
+            11,
+            *_consume_keys(path),
+            str(now),
             int(WEIGHT_BUDGET_PER_MIN),
             max(1, int(weight)),
+            str(VENUE_SAMPLE_MAX_AGE_SEC),
         )
         return int(granted or 0) == 1
     except Exception:
@@ -265,6 +476,10 @@ def request_weight_status() -> dict[str, Any]:
         observed_raw = client.get(VENUE_USED_AT_KEY)
         charged_raw = client.get(CHARGED_KEY)
         pending_raw = client.get(PROTECTIVE_KEY)
+        window_raw = client.get(WINDOW_KEY)
+        hw_raw = client.get(VENUE_HW_KEY)
+        hw_window_raw = client.get(VENUE_HW_WINDOW_KEY)
+        reset_raw = client.get("bwl:reset_ts")
         ttl = int(client.ttl("bwl:circuit_open") or -1)
     except Exception:
         logger.debug("request weight status unavailable", exc_info=True)
@@ -275,6 +490,10 @@ def request_weight_status() -> dict[str, Any]:
     now = time.time()
     age = None if observed is None else max(0, int((now - observed) * 1000))
     effective = None if remaining is None else max(0, WEIGHT_BUDGET_PER_MIN - remaining)
+    current = window_id(now)
+    stored_window = int(window_raw) if window_raw is not None else None
+    hw = int(hw_raw) if hw_raw is not None else None
+    hw_window = int(hw_window_raw) if hw_window_raw is not None else None
     return {
         "request_weight_charged": int(charged_raw) if charged_raw is not None else 0,
         "request_weight_venue": venue,
@@ -287,16 +506,24 @@ def request_weight_status() -> dict[str, Any]:
         "rate_limited_until": (now + ttl) if ttl > 0 else None,
         "protective_request_pending": int(pending_raw or 0) > 0,
         "request_weight_shared": True,
+        "request_weight_window_id": stored_window if stored_window is not None else current,
+        "request_weight_window_started_at": (stored_window if stored_window is not None else current) * 60,
+        "request_weight_window_resets_at": int(reset_raw) if reset_raw is not None else (current + 1) * 60,
+        "venue_weight_window_id": hw_window,
+        "local_effective_usage": effective,
+        "venue_reported_usage": venue,
+        "venue_high_water": hw,
+        "window_alignment_state": alignment_state(stored_window if stored_window is not None else current, hw_window, hw),
     }
 
 
-async def observe_headers(headers: Any) -> None:
+async def observe_headers(headers: Any, started_at: float | None = None) -> None:
     used = header_used_weight(headers)
     if used is None:
         return
     try:
         limiter = await BinanceWeightLimiter.create()
-        await limiter.note_venue_used_weight(used)
+        await limiter.note_venue_used_weight(used, started_at)
     except Exception:
         logger.debug("venue weight header not applied", exc_info=True)
 
@@ -318,40 +545,51 @@ class BinanceWeightLimiter:
         await inst._ensure_window()
         return inst
 
+    async def _roll_window(self) -> None:
+        now = time.time()
+        await self.r.eval(
+            _ROLL_LUA,
+            8,
+            self.bucket_key,
+            self.reset_key,
+            CHARGED_KEY,
+            WINDOW_KEY,
+            VENUE_HW_KEY,
+            VENUE_HW_AT_KEY,
+            VENUE_USED_KEY,
+            VENUE_USED_AT_KEY,
+            str(now),
+            int(WEIGHT_BUDGET_PER_MIN),
+            str(VENUE_SAMPLE_MAX_AGE_SEC),
+        )
+
     async def _ensure_window(self) -> None:
         async with self._init_lock:
-            now = int(time.time())
-            reset_ts = await self.r.get(self.reset_key)
-            if reset_ts is None or int(reset_ts) <= now:
-                pipe = self.r.pipeline(transaction=True)
-                pipe.set(self.bucket_key, WEIGHT_BUDGET_PER_MIN)
-                pipe.set(self.reset_key, now + 60)
-                pipe.set(CHARGED_KEY, 0)
-                await pipe.execute()
+            await self._roll_window()
 
     async def _tick_window(self) -> None:
-        now = int(time.time())
-        reset_ts = await self.r.get(self.reset_key)
-        if reset_ts is None or int(reset_ts) <= now:
-            pipe = self.r.pipeline(transaction=True)
-            pipe.set(self.bucket_key, WEIGHT_BUDGET_PER_MIN)
-            pipe.set(self.reset_key, now + 60)
-            pipe.set(CHARGED_KEY, 0)
-            await pipe.execute()
+        await self._roll_window()
 
-    async def note_venue_used_weight(self, used: int) -> None:
+    async def note_venue_used_weight(self, used: int, started_at: float | None = None) -> None:
+        now = time.time()
         await self.r.eval(
             _NOTE_LUA,
-            5,
+            9,
             self.bucket_key,
             VENUE_USED_KEY,
             VENUE_USED_AT_KEY,
-            self.reset_key,
+            WINDOW_KEY,
+            VENUE_HW_KEY,
+            VENUE_HW_AT_KEY,
+            VENUE_HW_WINDOW_KEY,
             CHARGED_KEY,
+            self.reset_key,
             int(used),
             int(WEIGHT_BUDGET_PER_MIN),
-            str(time.time()),
-            int(time.time()),
+            str(now),
+            str(now),
+            "-1" if started_at is None else str(float(started_at)),
+            str(VENUE_SAMPLE_MAX_AGE_SEC),
         )
 
     async def mark_protective_pending(self, delta: int) -> None:
@@ -399,44 +637,26 @@ class BinanceWeightLimiter:
         backoff = TOKEN_CHECK_INITIAL_BACKOFF
 
         while True:
-            await self._tick_window()
-            async with self.r.pipeline(transaction=True) as pipe:
-                try:
-                    await pipe.watch(self.bucket_key)
-                    tokens_raw = await pipe.get(self.bucket_key)
-                    tokens = int(tokens_raw) if tokens_raw is not None else 0
-                    with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                        limiter_tokens.set(tokens)
-                    if tokens >= (weight or 1):
-                        pipe.multi()
-                        pipe.decrby(self.bucket_key, weight or 1)
-                        pipe.incrby(CHARGED_KEY, weight or 1)
-                        await pipe.execute()
-                        try:
-                            await self.r.incrby(f"bwl:usage:{path}", weight or 1)
-                            await self.r.incr(f"bwl:req:{path}")
-                        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                            pass
-                        try:
-                            limiter_consume_wait_seconds.labels(path=path).observe(max(0.0, time.time() - start))
-                            limiter_consumes_total.labels(path=path).inc()
-                        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                            pass
-
-                        # Update weight logging counters
-                        now = time.time()
-                        _weight_counters[path]["calls"] += 1
-                        _weight_counters[path]["weight"] += weight or 1
-
-                        # Log summary every 60 seconds
-                        if now - _weight_log_last_time >= _weight_log_interval:
-                            _log_weight_summary()
-                            _weight_log_last_time = now
-
-                        return
-                    await pipe.unwatch()
-                except redis.WatchError:
-                    pass
+            granted = await self.r.eval(
+                _CONSUME_LUA,
+                11,
+                *_consume_keys(path),
+                str(time.time()),
+                int(WEIGHT_BUDGET_PER_MIN),
+                int(weight or 1),
+                str(VENUE_SAMPLE_MAX_AGE_SEC),
+            )
+            if int(granted or 0) == 1:
+                with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
+                    limiter_consume_wait_seconds.labels(path=path).observe(max(0.0, time.time() - start))
+                    limiter_consumes_total.labels(path=path).inc()
+                now = time.time()
+                _weight_counters[path]["calls"] += 1
+                _weight_counters[path]["weight"] += weight or 1
+                if now - _weight_log_last_time >= _weight_log_interval:
+                    _log_weight_summary()
+                    _weight_log_last_time = now
+                return
 
             if not wait:
                 with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
