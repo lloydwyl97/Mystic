@@ -256,10 +256,11 @@ def test_venue_usage_raises_local_count_and_never_lowers_it():
         ]
     )
     view = budget.snapshot()
-    assert view["orders_used_10s_local"] == 63
-    assert view["orders_used_day_local"] == 70
-    assert view["orders_10s_authoritative"] is True
-    assert view["orders_day_authoritative"] is True
+    assert view["orders_used_10s_effective"] == 63
+    assert view["orders_used_day_effective"] == 70
+    assert view["orders_10s_authoritative"] is False
+    assert view["orders_day_authoritative"] is False
+    assert view["venue_count_known"] is True
     assert view["external_order_activity_detected"] is True
     assert budget.apply_venue_usage(
         [
@@ -270,6 +271,35 @@ def test_venue_usage_raises_local_count_and_never_lowers_it():
     later = budget.snapshot()
     assert later["orders_used_10s_local"] == 63
     assert later["orders_used_day_local"] == 70
+
+
+def test_external_burst_after_a_snapshot_merges_to_the_venue_total():
+    clock = {"t": 0.0}
+    budget = VenueOrderBudget(clock=lambda: clock["t"])
+    budget.set_limits(VENUE)
+    budget.apply_venue_usage(
+        [
+            {"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": 100, "count": 10},
+            {"rateLimitType": "ORDERS", "interval": "DAY", "intervalNum": 1, "limit": 200000, "count": 10},
+        ]
+    )
+    for _ in range(5):
+        assert budget.try_acquire("exit") is True
+    budget.apply_venue_usage(
+        [
+            {"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": 100, "count": 35},
+            {"rateLimitType": "ORDERS", "interval": "DAY", "intervalNum": 1, "limit": 200000, "count": 35},
+        ]
+    )
+    view = budget.snapshot()
+    assert view["orders_used_10s_effective"] == 35
+    assert view["orders_used_day_effective"] == 35
+    assert view["local_orders_since_venue_snapshot"] == 0
+    clock["t"] = 10.0
+    aged = budget.snapshot()
+    assert aged["orders_used_10s_effective"] == 0
+    assert aged["venue_count_age_ms"] == 10000.0
+    assert aged["orders_10s_authoritative"] is False
 
 
 def test_second_portfolio_writer_fails_closed(tmp_path):

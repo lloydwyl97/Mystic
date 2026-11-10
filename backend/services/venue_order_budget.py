@@ -88,7 +88,15 @@ class VenueOrderBudget:
         self._day_fn = day_fn or (lambda: time.strftime("%Y-%m-%d", time.gmtime()))
         self._lock = threading.Lock()
         self._limits: list[tuple[float, int]] = []
-        self._stamps: list[float] = []
+        self._stamps: list[tuple[float, int]] = []
+        self._next_id = 0
+        self._snapshot_id = 0
+        self._venue_10s: int | None = None
+        self._venue_day: int | None = None
+        self._observed_mono: float | None = None
+        self._observed_wall: float | None = None
+        self._external_delta = 0
+        self._external_at: float | None = None
         self._loaded = False
         self._load_failed = False
         self._blackout_until = 0.0
@@ -176,7 +184,7 @@ class VenueOrderBudget:
             return self._blackout_until - now
         if not self._limits:
             return -1.0
-        self._stamps = [stamp for stamp in self._stamps if now - stamp < self._short_window_unlocked()]
+        self._stamps = [stamp for stamp in self._stamps if now - stamp[0] < self._short_window_unlocked()]
         today = self._utc_day()
         if self._day_key != today:
             self._day_key = today
@@ -190,15 +198,19 @@ class VenueOrderBudget:
                 if self._day_count >= cap:
                     wait = max(wait, self._seconds_to_utc_midnight())
                 continue
-            in_window = [stamp for stamp in self._stamps if now - stamp < window]
+            in_window = [stamp for stamp in self._stamps if now - stamp[0] < window]
             if len(in_window) < cap:
                 continue
-            wait = max(wait, window - (now - min(in_window)))
+            wait = max(wait, window - (now - min(stamp[0] for stamp in in_window)))
         return wait
+
+    def _stamp_unlocked(self, when: float) -> None:
+        self._next_id += 1
+        self._stamps.append((when, self._next_id))
 
     def _charge_unlocked(self) -> None:
         now = float(self._clock())
-        self._stamps.append(now)
+        self._stamp_unlocked(now)
         today = self._utc_day()
         if self._day_key != today:
             self._day_key = today
@@ -207,11 +219,13 @@ class VenueOrderBudget:
         self._day_count += 1
         self._save_day()
 
-    def apply_venue_usage(self, rows: list[dict[str, Any]] | None) -> bool:
-        """Raise local usage to the venue's reported count. Never lower it."""
+    def apply_venue_usage(self, rows: list[dict[str, Any]] | None, *, snapshot_id: int | None = None, day_at_snapshot: int | None = None) -> bool:
+        """Raise local usage to the venue snapshot plus orders sent after it. Never lower it."""
         with self._lock:
             now = float(self._clock())
             applied = False
+            included_through = self._next_id if snapshot_id is None else int(snapshot_id)
+            day_base = self._day_count if day_at_snapshot is None else int(day_at_snapshot)
             for row in rows or []:
                 if str(row.get("rateLimitType") or "").upper() != "ORDERS":
                     continue
@@ -226,33 +240,52 @@ class VenueOrderBudget:
                 if window <= 0 or count < 0:
                     continue
                 if window >= 86400:
-                    if count > self._day_count:
+                    posted = max(0, self._day_count - day_base)
+                    merged = max(self._day_count, count + posted)
+                    if count > day_base:
                         self._external_detected = True
-                    self._day_count = max(self._day_count, count)
+                        self._external_delta = count - day_base
+                        self._external_at = time.time()
+                    self._day_count = merged
+                    self._venue_day = count
                     self._day_key = self._utc_day()
                     self._day_from_disk = True
                     self._day_from_venue = True
                     self._save_day()
                 else:
-                    local = sum(1 for stamp in self._stamps if now - stamp < window)
-                    if count > local:
+                    pre = [stamp for stamp in self._stamps if stamp[1] <= included_through and now - stamp[0] < window]
+                    post = [stamp for stamp in self._stamps if stamp[1] > included_through and now - stamp[0] < window]
+                    if count > len(pre):
                         self._external_detected = True
-                        self._stamps.extend([now] * (count - local))
+                        self._external_delta = count - len(pre)
+                        self._external_at = time.time()
+                        pre = [*pre, *[(now, included_through) for _ in range(count - len(pre))]]
+                    self._stamps = pre + post
+                    self._venue_10s = count
+                    self._snapshot_id = included_through
                     self._short_from_venue = True
                     self._venue_short_read_at = now
+                    self._observed_mono = now
+                    self._observed_wall = time.time()
                 applied = True
             if applied:
                 self._blackout_until = 0.0
             return applied
 
     async def refresh_order_usage(self) -> bool:
-        """Read account order-count usage. Does not place an order."""
-        try:
-            rows = await asyncio.to_thread(_fetch_order_usage)
-        except Exception:
-            logger.warning("VENUE_ORDER_USAGE_UNAVAILABLE", exc_info=True)
-            return False
-        return self.apply_venue_usage(rows)
+        """Read account order-count usage. Does not place an order. One read at a time."""
+        if getattr(self, "_refresh_gate", None) is None:
+            self._refresh_gate = asyncio.Lock()
+        async with self._refresh_gate:
+            with self._lock:
+                snapshot_id = self._next_id
+                day_at_snapshot = self._day_count
+            try:
+                rows = await asyncio.to_thread(_fetch_order_usage)
+            except Exception:
+                logger.warning("VENUE_ORDER_USAGE_UNAVAILABLE", exc_info=True)
+                return False
+            return self.apply_venue_usage(rows, snapshot_id=snapshot_id, day_at_snapshot=day_at_snapshot)
 
     def try_acquire(self, priority: str) -> bool:
         with self._lock:
@@ -298,10 +331,11 @@ class VenueOrderBudget:
                     self._day_from_disk = True
                     self._save_day()
                 elif window < 86400 and short_hit:
-                    in_window = [stamp for stamp in self._stamps if now - stamp < window]
+                    in_window = [stamp for stamp in self._stamps if now - stamp[0] < window]
                     missing = limit - len(in_window)
                     if missing > 0:
-                        self._stamps.extend([now] * missing)
+                        for _ in range(missing):
+                            self._stamp_unlocked(now)
 
     def note_protective_attempt(self) -> None:
         self.protective_sell_attempts += 1
@@ -316,21 +350,34 @@ class VenueOrderBudget:
             blackout = now < self._blackout_until
             wait = 0.0 if not self._limits else max(0.0, self._wait_unlocked("exit"))
             short = self._short_window_unlocked() if self._limits else 10.0
-            used_10 = sum(1 for stamp in self._stamps if now - stamp < short)
+            used_10 = sum(1 for stamp in self._stamps if now - stamp[0] < short)
+            since = sum(1 for stamp in self._stamps if stamp[1] > self._snapshot_id and now - stamp[0] < short)
+            age_ms = None if self._observed_mono is None else max(0.0, (now - self._observed_mono) * 1000.0)
             limit_10 = next((limit for window, limit in self._limits if abs(window - short) < 1e-9), None)
             limit_day = next((limit for window, limit in self._limits if window >= 86400), None)
+            known = self._observed_mono is not None and not blackout
             return {
                 "order_limits_loaded": self._loaded,
                 "orders_used_10s_local": None if blackout or not self._loaded else used_10,
                 "orders_used_10s": None if blackout or not self._loaded else used_10,
+                "orders_used_10s_effective": None if blackout or not self._loaded else used_10,
                 "orders_limit_10s": limit_10,
-                "orders_10s_authoritative": bool(self._short_from_venue and not blackout),
+                "orders_10s_authoritative": False,
+                "venue_order_count_10s": self._venue_10s,
+                "venue_order_count_day": self._venue_day,
+                "venue_count_observed_at": self._observed_wall,
+                "venue_count_age_ms": None if not known else age_ms,
+                "venue_count_known": known,
+                "local_orders_since_venue_snapshot": since if known else None,
                 "orders_used_day_local": self._day_count if (self._day_from_disk or self._day_from_venue or self._day_count > 0) else None,
                 "orders_used_day": self._day_count if (self._day_from_disk or self._day_from_venue or self._day_count > 0) else None,
+                "orders_used_day_effective": self._day_count if (self._day_from_disk or self._day_from_venue or self._day_count > 0) else None,
                 "orders_limit_day": limit_day,
-                "orders_day_authoritative": bool(self._day_from_venue),
-                "orders_day_scope": "venue_account" if self._day_from_venue else "mystic_recorded",
+                "orders_day_authoritative": False,
+                "orders_day_scope": "venue_account_at_timestamp" if self._day_from_venue else "mystic_recorded",
                 "external_order_activity_detected": self._external_detected,
+                "external_order_delta": self._external_delta if self._external_detected else 0,
+                "external_order_detected_at": self._external_at,
                 "account_exclusive_assumption": False,
                 "exit_reserved": exit_reserve_slots() if self._loaded else None,
                 "next_slot_available_at": None if wait <= 0 else time.time() + wait,
