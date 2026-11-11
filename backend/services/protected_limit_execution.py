@@ -1262,7 +1262,7 @@ async def execute_protected_limit_live(
                 if PROTECTED_LIMIT_ALLOW_PARTIAL or filled + 1e-12 >= amount:
                     return _stamp_latency(o, submit_ts, response_ts)
                 break
-            if status in ("canceled", "cancelled", "expired", "rejected"):
+            if status in ("canceled", "cancelled", "expired", "expired_in_match", "rejected"):
                 break
 
         if order_id:

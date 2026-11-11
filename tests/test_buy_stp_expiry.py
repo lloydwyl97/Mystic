@@ -1,0 +1,119 @@
+"""A protective sell may expire a resting buy. The buy quote follows the venue result."""
+
+from __future__ import annotations
+
+import inspect
+import sqlite3
+
+import pytest
+
+from backend.services.buy_cash_commitment import committed_buy_quote
+from backend.services.day_entry_reservations import create_reservation
+from backend.services.portfolio_engine import PortfolioEngine
+from backend.services.strategy_order_intent import allocate_intent, order_is_working
+
+
+class _Venue:
+    def __init__(self, order: dict):
+        self.order = order
+        self.calls = 0
+
+    async def fetch_order(self, *_args, **_kwargs):
+        self.calls += 1
+        return {"status": "success", "order": self.order}
+
+    async def fetch_order_trades(self, *_args, **_kwargs):
+        return {"status": "success", "trades": []}
+
+
+def _engine(db: str) -> PortfolioEngine:
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = db
+    engine._entry_reservations = {}
+    return engine
+
+
+def _arm(db: str, *, qty: float, limit_px: float) -> str:
+    create_reservation(db, decision_id="buy-1", symbol="BTC/USDT", notional_usd=qty * limit_px, sleeve="SCALP_V2", ttl_sec=3600)
+    return allocate_intent(
+        db,
+        engine_id="SCALP_V2",
+        trade_id="scalp-btc",
+        decision_id="buy-1",
+        symbol="BTC/USDT",
+        side="BUY",
+        quantity=qty,
+        limit_price=limit_px,
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_stp_expiry_releases_the_quote(tmp_path):
+    db = str(tmp_path / "zero.db")
+    cid = _arm(db, qty=1.0, limit_px=400)
+    engine = _engine(db)
+    engine._entry_reservations["SCALP_V2::BTC/USDT"] = {"notional": 400.0, "decision_id": "buy-1", "sleeve": "SCALP_V2"}
+    engine._live_service = _Venue(
+        {
+            "id": "55",
+            "clientOrderId": cid,
+            "status": "expired",
+            "filled": 0,
+            "amount": 1,
+            "side": "buy",
+            "info": {"status": "EXPIRED_IN_MATCH", "executedQty": "0"},
+        }
+    )
+
+    await engine._classify_resting_buys("BTC/USDT")
+
+    assert engine._live_service.calls == 1
+    assert committed_buy_quote(db, memory_reservations=engine._entry_reservations) == 0
+    assert engine._entry_reservations == {}
+    assert engine._buy_stp_expired_count == 1
+    with sqlite3.connect(db) as conn:
+        status = conn.execute("SELECT status FROM strategy_order_intents WHERE client_order_id=?", (cid,)).fetchone()[0]
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        buys = 0 if "paper_trades" not in tables else conn.execute("SELECT COUNT(*) FROM paper_trades WHERE side='BUY'").fetchone()[0]
+    assert status == "EXPIRED"
+    assert buys == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_stp_expiry_books_the_fill_and_releases_the_rest(tmp_path):
+    db = str(tmp_path / "partial.db")
+    cid = _arm(db, qty=1.0, limit_px=100)
+    engine = _engine(db)
+    engine._entry_reservations["SCALP_V2::BTC/USDT"] = {"notional": 100.0, "decision_id": "buy-1", "sleeve": "SCALP_V2"}
+    engine._live_service = _Venue(
+        {
+            "id": "56",
+            "clientOrderId": cid,
+            "status": "expired",
+            "filled": 0.25,
+            "average": 100,
+            "amount": 1,
+            "side": "buy",
+            "info": {"status": "EXPIRED_IN_MATCH", "executedQty": "0.25", "cummulativeQuoteQty": "25"},
+            "trades": [{"qty": 0.25, "price": 100, "commission": 0.01, "commission_asset": "USDT", "trade_id": "fill-1"}],
+        }
+    )
+
+    await engine._classify_resting_buys("BTC/USDT")
+
+    assert float(committed_buy_quote(db, memory_reservations=engine._entry_reservations)) == pytest.approx(25.01)
+    assert "SCALP_V2::BTC/USDT" not in engine._entry_reservations
+    with sqlite3.connect(db) as conn:
+        qty, price = conn.execute("SELECT quantity, price FROM paper_trades WHERE side='BUY'").fetchone()
+        status = conn.execute("SELECT status, filled_qty FROM strategy_order_intents WHERE client_order_id=?", (cid,)).fetchone()
+    assert qty == pytest.approx(0.25)
+    assert price == pytest.approx(100)
+    assert status[1] == pytest.approx(0.25)
+    assert status[0] != "PENDING"
+
+
+def test_raw_stp_status_is_terminal_and_sell_classifies_afterward():
+    assert order_is_working({"status": "EXPIRED_IN_MATCH", "filled": 0}) is False
+    assert order_is_working({"status": "expired", "info": {"status": "EXPIRED_IN_MATCH"}}) is False
+    source = inspect.getsource(PortfolioEngine.execute_sell_fifo)
+    assert source.index("_execute_sell_fifo_locked") < source.index("_classify_resting_buys")

@@ -4396,6 +4396,8 @@ class PortfolioEngine:
                     self.cash_balance,
                     cash_sync_held=has_unbooked_buy_commitment(self.db_path) or has_unbooked_executed_sell(self.db_path),
                 )
+                payload["buy_cash"]["buy_stp_expired_count"] = int(getattr(self, "_buy_stp_expired_count", 0) or 0)
+                payload["buy_cash"]["last_buy_stp_expiration"] = getattr(self, "_last_buy_stp_expiration", None)
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)
             logger.info("LIVE_RECONCILE_STATE_WRITTEN path=%s time=%s actions=%s", path, now_utc, actions)
@@ -9677,6 +9679,62 @@ class PortfolioEngine:
             return {"absent": True}
         return {"unconfirmed": True}
 
+    def _note_buy_stp(self, order: dict[str, Any]) -> None:
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        raw = str(info.get("status") or order.get("status") or "").strip().upper()
+        if raw != "EXPIRED_IN_MATCH":
+            return
+        cid = str(order.get("clientOrderId") or order.get("client_order_id") or "")
+        seen = getattr(self, "_buy_stp_seen", None)
+        if seen is None:
+            self._buy_stp_seen = set()
+            seen = self._buy_stp_seen
+        if cid and cid in seen:
+            return
+        if cid:
+            seen.add(cid)
+        self._buy_stp_expired_count = int(getattr(self, "_buy_stp_expired_count", 0) or 0) + 1
+        self._last_buy_stp_expiration = time.time()
+
+    def _release_terminal_buy_quote(self, order: dict[str, Any], client_order_id: str = "") -> None:
+        """A terminal BUY no longer holds its unused quote. The spent quote stays on the intent until it is booked."""
+        from backend.services.strategy_order_intent import intent_by_client, order_is_working
+
+        if not isinstance(order, dict) or order_is_working(order) or not getattr(self, "db_path", None):
+            return
+        cid = str(client_order_id or order.get("clientOrderId") or order.get("client_order_id") or "")
+        intent = intent_by_client(self.db_path, cid) if cid else None
+        if not intent or str(intent.get("side") or "").upper() != "BUY":
+            return
+        self._note_buy_stp(order)
+        symbol = str(intent.get("symbol") or "")
+        decision = str(intent.get("decision_id") or "")
+        engine = str(intent.get("engine_id") or "")
+        self._release_entry_reservation(symbol, decision_id=decision, sleeve=engine)
+        self._release_entry_reservation(symbol, sleeve=engine)
+
+    async def _classify_resting_buys(self, symbol: str) -> None:
+        """After a protective sell, read a same-symbol BUY once. The sell is not delayed for this."""
+        from backend.services.day_entry_reservations import release_reservation
+        from backend.services.strategy_order_intent import mark_intent_absent, working_buy_intents
+
+        if getattr(self, "_live_service", None) is None or not getattr(self, "db_path", None):
+            return
+        intents = working_buy_intents(self.db_path, symbol)
+        for intent in intents:
+            cid = str(intent.get("client_order_id") or "")
+            found = await self._probe_intent(intent)
+            if found.get("unconfirmed"):
+                continue
+            if found.get("absent"):
+                mark_intent_absent(self.db_path, cid)
+                release_reservation(self.db_path, decision_id=str(intent.get("decision_id") or ""))
+                release_reservation(self.db_path, symbol=str(intent.get("symbol") or symbol), sleeve=str(intent.get("engine_id") or ""))
+                self._release_entry_reservation(str(intent.get("symbol") or symbol), decision_id=str(intent.get("decision_id") or ""), sleeve=str(intent.get("engine_id") or ""))
+                self._release_entry_reservation(str(intent.get("symbol") or symbol), sleeve=str(intent.get("engine_id") or ""))
+                continue
+            await self._apply_probed_order(found["order"], str(intent.get("symbol") or symbol), cid, wait=False)
+
     async def _apply_probed_order(self, order: dict[str, Any], symbol: str, client_order_id: str = "", *, wait: bool = True) -> dict[str, Any]:
         from backend.services.live_fill_economics import merge_venue_trades_into_order
         from backend.services.strategy_order_intent import apply_venue_order
@@ -9684,6 +9742,7 @@ class PortfolioEngine:
         if client_order_id and not order.get("clientOrderId") and not order.get("client_order_id"):
             order["clientOrderId"] = client_order_id
         applied = apply_venue_order(self.db_path, order)
+        self._release_terminal_buy_quote(order, client_order_id)
         if applied.get("reason") == "NEEDS_TRADES":
             priority = "exit" if str(order.get("side") or "").lower() == "sell" else "background"
             trades = await self._live_service.fetch_order_trades(
@@ -9694,7 +9753,9 @@ class PortfolioEngine:
                 wait=wait,
             )
             if str(trades.get("status") or "") == "success":
-                applied = apply_venue_order(self.db_path, merge_venue_trades_into_order(order, trades.get("trades")))
+                merged = merge_venue_trades_into_order(order, trades.get("trades"))
+                applied = apply_venue_order(self.db_path, merged)
+                self._release_terminal_buy_quote(merged, client_order_id)
         return applied
 
     async def _execution_book_is_fresh(self, symbol: str) -> dict[str, Any] | None:
@@ -14458,6 +14519,8 @@ class PortfolioEngine:
             finally:
                 self._sells_inflight = max(0, int(getattr(self, "_sells_inflight", 1) or 1) - 1)
                 self._sell_seq = int(getattr(self, "_sell_seq", 0) or 0) + 1
+                with contextlib.suppress(Exception):
+                    await self._classify_resting_buys(symbol)
                 _norm_sym = normalize_symbol(symbol)
                 for _key, _lot in list((getattr(self, "open_positions", None) or {}).items()):
                     if split_position_key(_key)[1] == _norm_sym and getattr(_lot, "_close_provenance", None) is not None:

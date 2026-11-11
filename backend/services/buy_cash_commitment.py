@@ -18,6 +18,7 @@ from backend.services.day_entry_spendable import money
 from backend.utils.position_keys import POSITION_KEY_SEP
 
 WORKING_BUY_STATUSES = ("PENDING", "ACKED", "OPEN", "PARTIAL", "WORKING")
+UNBOOKED_BUY_STATUSES = ("FILLED", "FEE_PENDING")
 
 # A protected-limit attempt returned a result that cannot still spend quote.
 RELEASE_OUTCOMES = {
@@ -73,6 +74,8 @@ class _IntentQuote:
     symbol: str
     decision_id: str
     client_order_id: str
+    status: str
+    filled_qty: Decimal
     remaining_quote: Decimal
     executed_quote: Decimal
     created_at: float
@@ -91,7 +94,8 @@ def intent_quote_parts(row: dict[str, Any]) -> tuple[Decimal, Decimal]:
     A base-asset or other-asset fee is not turned into extra USDT.
     """
     status = str(row.get("status") or "")
-    if status not in WORKING_BUY_STATUSES:
+    unbooked = status in UNBOOKED_BUY_STATUSES
+    if status not in WORKING_BUY_STATUSES and not unbooked:
         return Decimal("0"), Decimal("0")
     if str(row.get("side") or "BUY").upper() != "BUY":
         return Decimal("0"), Decimal("0")
@@ -103,7 +107,7 @@ def intent_quote_parts(row: dict[str, Any]) -> tuple[Decimal, Decimal]:
     if filled < 0:
         filled = Decimal("0")
     filled = min(filled, qty)
-    remaining = qty - filled
+    remaining = Decimal("0") if unbooked else qty - filled
     executed = money(row.get("filled_cost"))
     cash = money(row.get("filled_cash"))
     if executed <= 0 and filled > 0:
@@ -196,7 +200,10 @@ def _load_intents(db_path: str) -> list[_IntentQuote]:
             SELECT client_order_id, engine_id, decision_id, symbol, side, status,
                    quantity, limit_price, filled_qty, {cost} AS filled_cost, {cash} AS filled_cash, created_at
             FROM strategy_order_intents
-            WHERE side='BUY' AND status IN ({", ".join("?" for _ in WORKING_BUY_STATUSES)})
+            WHERE side='BUY' AND (
+                status IN ({", ".join("?" for _ in WORKING_BUY_STATUSES)})
+                OR (status IN ('FILLED', 'FEE_PENDING') AND filled_qty > 0)
+            )
             """,
             WORKING_BUY_STATUSES,
         ).fetchall()
@@ -219,6 +226,8 @@ def _load_intents(db_path: str) -> list[_IntentQuote]:
                 symbol=_symbol(str(row["symbol"] or "")),
                 decision_id=str(row["decision_id"] or ""),
                 client_order_id=str(row["client_order_id"] or ""),
+                status=str(row["status"] or ""),
+                filled_qty=money(row["filled_qty"]),
                 remaining_quote=remaining,
                 executed_quote=executed,
                 created_at=created,
@@ -284,6 +293,8 @@ class BuyCashView:
     committed_quote: Decimal
     reservation_count: int
     oldest_created_at: float
+    working_buy_count: int = 0
+    working_buys: list[dict[str, Any]] | None = None
 
     @property
     def oldest_age_sec(self) -> float | None:
@@ -310,6 +321,8 @@ class BuyCashView:
             "buy_cash_reservation_count": self.reservation_count,
             "oldest_buy_reservation_age_sec": None if self.oldest_age_sec is None else round(self.oldest_age_sec, 3),
             "cash_sync_held": bool(cash_sync_held),
+            "working_buy_count": self.working_buy_count,
+            "working_buys": list(self.working_buys or []),
         }
 
 
@@ -333,7 +346,7 @@ def buy_cash_view(
     """
     stamp = float(now if now is not None else time.time())
     intents = _load_intents(db_path)
-    working_decisions = {item.decision_id for item in intents if item.decision_id}
+    working_decisions = {item.decision_id for item in intents if item.decision_id and item.remaining_quote > 0}
     reservations = _load_reservations(
         db_path,
         exclude_reservation_id=exclude_reservation_id,
@@ -413,6 +426,18 @@ def buy_cash_view(
         note_age(created)
 
     committed = pending + working + executed
+    working_rows = [
+        {
+            "engine": item.engine,
+            "symbol": item.symbol,
+            "client_order_id": item.client_order_id,
+            "status": item.status,
+            "reserved_quote": float(item.open_quote),
+            "filled_qty": float(item.filled_qty),
+        }
+        for item in intents
+        if item.remaining_quote > 0
+    ]
     return BuyCashView(
         pending_buy_quote=pending,
         working_buy_quote=working,
@@ -420,6 +445,8 @@ def buy_cash_view(
         committed_quote=committed,
         reservation_count=count,
         oldest_created_at=oldest,
+        working_buy_count=len(working_rows),
+        working_buys=working_rows,
     )
 
 

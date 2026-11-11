@@ -534,7 +534,9 @@ def intents_to_probe(db_path: str, *, max_age_sec: float = 172800, limit: int = 
 
 
 _WORKING_SELL_STATUSES = ("PENDING", "ACKED", "OPEN", "PARTIAL", "WORKING")
-_TERMINAL_VENUE_STATUSES = {"canceled", "cancelled", "expired", "rejected", "closed", "filled"}
+# EXPIRED_IN_MATCH is Binance self-trade prevention. CCXT maps it to expired;
+# a raw payload keeps the original status and is just as terminal.
+_TERMINAL_VENUE_STATUSES = {"canceled", "cancelled", "expired", "expired_in_match", "rejected", "closed", "filled"}
 
 
 def venue_order_status(order: dict[str, Any] | None) -> str:
@@ -553,7 +555,7 @@ def terminal_unfilled_label(order: dict[str, Any] | None, filled: float) -> str 
     if float(filled or 0.0) > 0.0 or order_is_working(order):
         return None
     status = venue_order_status(order)
-    if status == "expired":
+    if status in {"expired", "expired_in_match"}:
         return "EXPIRED"
     if status == "rejected":
         return "REJECTED"
@@ -653,6 +655,29 @@ def _finish_venue_lifecycle(db_path: str, order: dict[str, Any], result: dict[st
     if order_is_working(order) and cid:
         mark_working_sell(db_path, cid, "PARTIAL" if filled > 0.0 else "OPEN", oid)
     return result
+
+
+def working_buy_intents(db_path: str, symbol: str | None = None) -> list[dict[str, Any]]:
+    """BUY intents that can still fill. No age cutoff."""
+    from backend.utils.symbols import normalize_symbol
+
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM strategy_order_intents
+            WHERE side='BUY' AND status IN ({", ".join("?" for _ in _WORKING_SELL_STATUSES)})
+            ORDER BY created_at
+            """,
+            _WORKING_SELL_STATUSES,
+        ).fetchall()
+    finally:
+        conn.close()
+    out = [dict(row) for row in rows]
+    if not symbol:
+        return out
+    want = normalize_symbol(symbol)
+    return [row for row in out if normalize_symbol(str(row.get("symbol") or "")) == want]
 
 
 def working_sell_intents(db_path: str, symbol: str | None = None) -> list[dict[str, Any]]:
