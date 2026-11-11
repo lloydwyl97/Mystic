@@ -3166,6 +3166,9 @@ class PortfolioEngineIntegration:
         deadline = time.monotonic() + max(0.0, float(wait_sec))
         wake = getattr(self, "_exit_cycle_wake", None)
         while self.is_running:
+            consume = getattr(getattr(self, "engine", None), "consume_exit_reeval_request", None)
+            if callable(consume) and consume():
+                return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return

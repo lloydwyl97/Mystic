@@ -4370,6 +4370,7 @@ class PortfolioEngine:
                 from backend.utils.binance_weight_limiter import request_weight_status
 
                 snap["request_weight"] = request_weight_status()
+                snap["blocked_exit"] = getattr(self, "_symbol_sell_block", None)
                 payload["sell_protection"] = snap
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)
@@ -9693,6 +9694,30 @@ class PortfolioEngine:
         freshness["best_ask"] = ask
         return freshness
 
+    def note_sell_symbol_released(self) -> None:
+        """A working sell left the symbol. The next exit pass should not wait out the full cadence."""
+        self._exit_reeval_requested = True
+        self._symbol_sell_block = None
+
+    def consume_exit_reeval_request(self) -> bool:
+        if not getattr(self, "_exit_reeval_requested", False):
+            return False
+        self._exit_reeval_requested = False
+        return True
+
+    def note_symbol_sell_blocked(self, symbol: str, engine_id: str, reason: str) -> None:
+        """The exit was refused because another working sell still owns the symbol."""
+        current = getattr(self, "_symbol_sell_block", None) or {}
+        sym = normalize_symbol(symbol)
+        if current.get("symbol") == sym and current.get("blocked_exit_engine") == str(engine_id or "") and current.get("blocked_exit_reason") == str(reason or ""):
+            return
+        self._symbol_sell_block = {
+            "symbol": sym,
+            "blocked_exit_engine": str(engine_id or ""),
+            "blocked_exit_reason": str(reason or ""),
+            "blocked_exit_since": time.time(),
+        }
+
     def _settle_sell_attempt(self, client_order_id: str, order: dict[str, Any] | None) -> str:
         """Record the attempt without treating a missing commission as a close."""
         from backend.services.protected_limit_execution import last_live_order_outcome
@@ -9700,12 +9725,15 @@ class PortfolioEngine:
 
         if not client_order_id or not getattr(self, "db_path", None):
             return ""
-        return record_sell_attempt_result(
+        disposition = record_sell_attempt_result(
             self.db_path,
             client_order_id=client_order_id,
             order=order if isinstance(order, dict) else None,
             outcome=last_live_order_outcome(),
         )
+        if disposition in {"release", "fee_pending", "filled"}:
+            self.note_sell_symbol_released()
+        return disposition
 
     async def _canonical_pending_sell(self, position: Any) -> dict[str, Any] | None:
         """One already-filled sell whose commission can now be read. No waiting."""
@@ -9756,10 +9784,12 @@ class PortfolioEngine:
                 continue
             if probed.get("absent"):
                 mark_intent_absent(self.db_path, str(intent.get("client_order_id") or ""))
+                self.note_sell_symbol_released()
                 continue
             order = probed["order"]
             await self._apply_probed_order(order, str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""), wait=False)
             if not order_is_working(order):
+                self.note_sell_symbol_released()
                 continue
             age = time.time() - float(intent.get("created_at") or time.time())
             if not allow_cancel or age < timeout:
@@ -9792,6 +9822,8 @@ class PortfolioEngine:
             if str(again.get("status") or "") != "success" or not isinstance(again.get("order"), dict):
                 continue
             await self._apply_probed_order(again["order"], str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""), wait=False)
+            if not order_is_working(again.get("order")):
+                self.note_sell_symbol_released()
 
     async def _recover_strategy_order_intents(self) -> int:
         """Find venue orders for intents that died before a fill was stored, then book them once."""
@@ -14289,9 +14321,11 @@ class PortfolioEngine:
             return None
         db_path = getattr(self, "db_path", None)
         if db_path and _unresolved_sell_intent(str(db_path), symbol):
+            self.note_symbol_sell_blocked(symbol, engine_id, exit_trigger)
             logger.warning(
-                "SELL_HELD_UNRESOLVED_INTENT symbol=%s trigger=%s — prior SELL is not filled, open, or proven absent",
+                "SELL_HELD_UNRESOLVED_INTENT symbol=%s engine=%s trigger=%s — prior SELL is not filled, open, or proven absent",
                 symbol,
+                engine_id,
                 exit_trigger,
             )
             return None

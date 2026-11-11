@@ -698,6 +698,7 @@ def sell_protection_snapshot(db_path: str) -> dict[str, Any]:
             "executed_unbooked_sell_qty": 0.0,
             "working_sell_qty": 0.0,
             "fee_pending_count": 0,
+            "working_sells": [],
         }
     now = time.time()
     ages = [max(0.0, now - float(row.get("created_at") or now)) for row in rows]
@@ -733,6 +734,21 @@ def sell_protection_snapshot(db_path: str) -> dict[str, Any]:
         "remaining_sell_qty": remaining,
         "venue_order_status": [str(row.get("status") or "") for row in rows],
         "limit_prices": [float(row.get("limit_price") or 0.0) for row in rows],
+        "working_sells": [
+            {
+                "engine_id": str(row.get("engine_id") or ""),
+                "trade_id": str(row.get("trade_id") or ""),
+                "symbol": str(row.get("symbol") or ""),
+                "status": str(row.get("status") or ""),
+                "age_sec": max(0.0, now - float(row.get("created_at") or now)),
+                "quantity": float(row.get("quantity") or 0.0),
+                "filled_qty": float(row.get("filled_qty") or 0.0),
+                "remaining_qty": max(0.0, float(row.get("quantity") or 0.0) - float(row.get("filled_qty") or 0.0)),
+                "limit_price": float(row.get("limit_price") or 0.0),
+                "exit_reason": None,
+            }
+            for row in rows
+        ],
         "fee_pending_qty": fee_pending_qty,
         "fee_pending_count": fee_pending_count,
         "oldest_fee_pending_age_sec": oldest_fee,

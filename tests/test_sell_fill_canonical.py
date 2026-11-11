@@ -20,6 +20,7 @@ from backend.services.live_fill_economics import (
 )
 from backend.services.protected_limit_execution import _LIVE_ORDER_OUTCOME, LIVE_OUTCOME_UNCONFIRMED
 from backend.services.strategy_order_intent import (
+    _WORKING_SELL_STATUSES,
     _finish_venue_lifecycle,
     allocate_intent,
     close_sell_order_ids,
@@ -28,6 +29,7 @@ from backend.services.strategy_order_intent import (
     record_sell_attempt_result,
     reserved_unbooked_sell_qty,
     sell_intent_blocks,
+    sell_protection_snapshot,
     sell_quantity_state,
     unbooked_protective_sells,
 )
@@ -346,10 +348,19 @@ def test_working_day_sell_blocks_the_symbol_and_fee_pending_does_not(tmp_path):
     cid = allocate_intent(db, engine_id="DAY_V2", trade_id="day-btc", symbol="BTC/USDT", side="SELL", quantity=0.40, limit_price=100.0)
     mark_exchange_order(db, cid, "LIVE", status="OPEN")
     assert sell_intent_blocks(db, "BTC/USDT") is True
+    working = sell_protection_snapshot(db)["working_sells"]
+    assert working[0]["engine_id"] == "DAY_V2"
+    assert working[0]["trade_id"] == "day-btc"
+    assert working[0]["status"] == "OPEN"
+    assert working[0]["exit_reason"] is None
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE strategy_order_intents SET status='FEE_PENDING', filled_qty=0.30 WHERE client_order_id=?", (cid,))
         conn.commit()
     assert sell_intent_blocks(db, "BTC/USDT") is False
+    assert "FEE_PENDING" not in _WORKING_SELL_STATUSES
+    assert "FILLED" not in _WORKING_SELL_STATUSES
+    snap = sell_protection_snapshot(db)
+    assert snap["working_sells"] == []
     state = sell_quantity_state(db, "day-btc", 0.60)
     assert state["available_to_sell_qty"] == pytest.approx(0.30)
     assert sell_quantity_state(db, "scalp-btc", 0.40)["available_to_sell_qty"] == pytest.approx(0.40)
@@ -391,3 +402,25 @@ async def test_dual_engine_fee_pending_does_not_move_either_lot_or_pause(tmp_pat
 
 async def _async_false(*_a, **_k):
     return False
+
+
+def test_terminal_sell_requests_another_exit_pass(tmp_path):
+    from backend.services.portfolio_engine import PortfolioEngine
+    from backend.services.protected_limit_execution import _LIVE_ORDER_OUTCOME, LIVE_OUTCOME_EXPIRED_UNFILLED
+
+    db = str(tmp_path / "wake.db")
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = db
+    engine._exit_reeval_requested = False
+    engine._symbol_sell_block = {"symbol": "BTC/USDT", "blocked_exit_engine": "SCALP_V2", "blocked_exit_reason": "SCALP_V2_CATASTROPHIC_STOP", "blocked_exit_since": 1.0}
+    cid = allocate_intent(db, engine_id="DAY_V2", trade_id="day-btc", symbol="BTC/USDT", side="SELL", quantity=0.2, limit_price=100.0)
+    _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_EXPIRED_UNFILLED)
+    assert engine._settle_sell_attempt(cid, {"id": "1", "filled": 0, "status": "expired", "info": {"executedQty": "0"}}) == "release"
+    assert engine.consume_exit_reeval_request() is True
+    assert engine.consume_exit_reeval_request() is False
+    assert engine._symbol_sell_block is None
+    engine.note_symbol_sell_blocked("BTC/USDT", "SCALP_V2", "SCALP_V2_CATASTROPHIC_STOP")
+    first = engine._symbol_sell_block["blocked_exit_since"]
+    engine.note_symbol_sell_blocked("BTC/USDT", "SCALP_V2", "SCALP_V2_CATASTROPHIC_STOP")
+    assert engine._symbol_sell_block["blocked_exit_since"] == first
+    assert sell_intent_blocks(db, "BTC/USDT") is False
