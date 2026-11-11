@@ -424,3 +424,21 @@ def test_terminal_sell_requests_another_exit_pass(tmp_path):
     engine.note_symbol_sell_blocked("BTC/USDT", "SCALP_V2", "SCALP_V2_CATASTROPHIC_STOP")
     assert engine._symbol_sell_block["blocked_exit_since"] == first
     assert sell_intent_blocks(db, "BTC/USDT") is False
+
+
+@pytest.mark.asyncio
+async def test_working_sell_blocks_other_engine_buy_fee_pending_does_not(tmp_path):
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    db = str(tmp_path / "buy.db")
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = db
+    cid = allocate_intent(db, engine_id="DAY_V2", trade_id="day-btc", symbol="BTC/USDT", side="SELL", quantity=0.3, limit_price=90.0)
+    mark_exchange_order(db, cid, "REST", status="OPEN")
+    allowed, reason = await engine._can_open_position("BTC/USDT", 25.0, engine_id="SCALP_V2")
+    assert allowed is False
+    assert reason == "WORKING_SELL_SAME_SYMBOL"
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE strategy_order_intents SET status='FEE_PENDING', filled_qty=0.3 WHERE client_order_id=?", (cid,))
+        conn.commit()
+    assert sell_intent_blocks(db, "BTC/USDT") is False

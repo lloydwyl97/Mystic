@@ -17240,6 +17240,22 @@ class PortfolioEngine:
             logger.warning("BUY_BLOCKED_DISK_CRITICAL: %s %s", symbol, disk_reason)
             return False, disk_reason
 
+        # Binance.US default self-trade mode is EXPIRE_MAKER. A new buy that
+        # crosses a resting sell on this account cancels that sell. A working
+        # or still-unknown sell can also still consume this symbol's fungible
+        # base. FEE_PENDING is terminal and does not block.
+        db_path = getattr(self, "db_path", None)
+        if db_path:
+            from backend.services.strategy_order_intent import sell_intent_blocks
+
+            try:
+                sell_blocking = sell_intent_blocks(str(db_path), symbol)
+            except Exception:
+                sell_blocking = False
+            if sell_blocking:
+                logger.warning("BUY_BLOCKED_WORKING_SELL symbol=%s engine=%s", symbol, engine_id)
+                return False, "WORKING_SELL_SAME_SYMBOL"
+
         # CRITICAL: Check account status first
         if self._account_status == AccountStatus.OVERALLOCATED:
             if PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK:
