@@ -49,6 +49,9 @@ def _connect(db_path: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE strategy_order_intents ADD COLUMN filled_gross REAL NOT NULL DEFAULT 0")
     if "filled_cash" not in cols:
         conn.execute("ALTER TABLE strategy_order_intents ADD COLUMN filled_cash REAL NOT NULL DEFAULT 0")
+    for name in ("pending_high", "pending_low", "booked_cash", "booked_high", "booked_low", "booked_fee"):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE strategy_order_intents ADD COLUMN {name} REAL NOT NULL DEFAULT 0")
     return conn
 
 
@@ -245,11 +248,15 @@ def adopt_venue_fill(
             filled_cash = float(row["filled_cash"] or 0.0) + add_cash
         seen.add(fid or f"{exchange_order_id}:{filled_qty}")
         vwap = filled_cost / filled_gross if filled_gross else 0.0
+        prior_high = float(row["pending_high"] or 0.0)
+        prior_low = float(row["pending_low"] or 0.0)
+        pending_high = px if prior_high <= 0 else max(prior_high, px)
+        pending_low = px if prior_low <= 0 else min(prior_low, px)
         conn.execute(
             """
             UPDATE strategy_order_intents
             SET exchange_order_id=?, status='FILLED', filled_qty=?, filled_gross=?, filled_cost=?,
-                filled_fee=?, filled_cash=?, fill_ids_json=?, updated_at=?
+                filled_fee=?, filled_cash=?, fill_ids_json=?, pending_high=?, pending_low=?, updated_at=?
             WHERE client_order_id=?
             """,
             (
@@ -260,6 +267,8 @@ def adopt_venue_fill(
                 filled_fee,
                 filled_cash,
                 json.dumps(sorted(seen)),
+                pending_high,
+                pending_low,
                 time.time(),
                 cid,
             ),
@@ -286,11 +295,36 @@ def adopt_venue_fill(
         fix = sqlite3.connect(db_path, timeout=15)
         try:
             cols = {str(r[1]) for r in fix.execute("PRAGMA table_info(paper_trades)")}
-            sets = ["quantity=?", "price=?"]
-            params: list[Any] = [filled_qty, vwap]
-            if "remaining_position" in cols:
-                sets.append("remaining_position=CASE WHEN ABS(COALESCE(remaining_position, quantity) - quantity) < 1e-8 THEN ? ELSE remaining_position END")
-                params.append(filled_qty)
+            held = None
+            try:
+                held = fix.execute(
+                    "SELECT 1 FROM portfolio_engine_positions WHERE trade_id=? AND IFNULL(quantity, 0) > 0",
+                    (intent["trade_id"],),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                held = None
+            closed = False
+            if "remaining_position" in cols and "quantity" in cols:
+                paper = fix.execute(
+                    "SELECT quantity, remaining_position FROM paper_trades WHERE trade_id=? AND UPPER(side)='BUY'",
+                    (intent["trade_id"],),
+                ).fetchone()
+                if paper is not None and abs(float(paper[1] or 0.0)) <= 1e-12 and float(paper[0] or 0.0) > 0:
+                    closed = True
+            # A live lot, or a lot already sold down to zero, owns the booked
+            # quantity. Updating that baseline first hides the next fill's delta.
+            if held is None and not closed:
+                sets = ["quantity=?", "price=?"]
+                params: list[Any] = [filled_qty, vwap]
+                if "remaining_position" in cols:
+                    sets.append("remaining_position=CASE WHEN ABS(COALESCE(remaining_position, quantity) - quantity) < 1e-8 THEN ? ELSE remaining_position END")
+                    params.append(filled_qty)
+            elif not closed:
+                sets = ["price=?"]
+                params = [vwap]
+            else:
+                sets = []
+                params = []
             if "fees_paid" in cols:
                 sets.append("fees_paid=?")
                 params.append(filled_fee)
@@ -316,8 +350,9 @@ def adopt_venue_fill(
                         separators=(",", ":"),
                     )
                 )
-            params.append(intent["trade_id"])
-            fix.execute(f"UPDATE paper_trades SET {', '.join(sets)} WHERE trade_id=? AND UPPER(side)='BUY'", params)
+            if sets:
+                params.append(intent["trade_id"])
+                fix.execute(f"UPDATE paper_trades SET {', '.join(sets)} WHERE trade_id=? AND UPPER(side)='BUY'", params)
             fix.commit()
         finally:
             fix.close()
@@ -634,20 +669,33 @@ def _finish_venue_lifecycle(db_path: str, order: dict[str, Any], result: dict[st
     if cid and filled > 0.0 and not order_is_working(order):
         # The resting remainder is dead. The executed base stays reserved
         # until its own close, and it no longer blocks the unsold base.
+        # An executedQty that myTrades does not yet cover is not copied in.
         from backend.services.live_fill_economics import proven_sell_quote, sell_commission_known
 
-        status = "FILLED" if sell_commission_known(order) else FEE_PENDING_STATUS
+        known = sell_commission_known(order)
+        status = "FILLED" if known else FEE_PENDING_STATUS
         conn = _connect(db_path)
         try:
-            conn.execute(
-                """
-                UPDATE strategy_order_intents
-                SET exchange_order_id=CASE WHEN ? != '' THEN ? ELSE exchange_order_id END,
-                    status=?, filled_qty=?, filled_cost=CASE WHEN ? > 0 THEN ? ELSE filled_cost END, updated_at=?
-                WHERE client_order_id=? AND status NOT IN ('CLOSED', 'COMMITTED', 'CANCELED', 'EXPIRED', 'REJECTED', 'NO_VENUE_ORDER')
-                """,
-                (oid, oid, status, filled, proven_sell_quote(order), proven_sell_quote(order), time.time(), normalize_client_order_id(cid)),
-            )
+            if known:
+                conn.execute(
+                    """
+                    UPDATE strategy_order_intents
+                    SET exchange_order_id=CASE WHEN ? != '' THEN ? ELSE exchange_order_id END,
+                        status=?, filled_qty=?, filled_cost=CASE WHEN ? > 0 THEN ? ELSE filled_cost END, updated_at=?
+                    WHERE client_order_id=? AND status NOT IN ('CLOSED', 'COMMITTED', 'CANCELED', 'EXPIRED', 'REJECTED', 'NO_VENUE_ORDER')
+                    """,
+                    (oid, oid, status, filled, proven_sell_quote(order), proven_sell_quote(order), time.time(), normalize_client_order_id(cid)),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE strategy_order_intents
+                    SET exchange_order_id=CASE WHEN ? != '' THEN ? ELSE exchange_order_id END,
+                        status=?, updated_at=?
+                    WHERE client_order_id=? AND status NOT IN ('CLOSED', 'COMMITTED', 'CANCELED', 'EXPIRED', 'REJECTED', 'NO_VENUE_ORDER')
+                    """,
+                    (oid, oid, status, time.time(), normalize_client_order_id(cid)),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -677,6 +725,97 @@ def unresolved_buy_on_symbol(db_path: str, symbol: str) -> bool:
     finally:
         conn.close()
     return any(normalize_symbol(str(item["symbol"] or "")) == want for item in row)
+
+
+def note_open_buy_basis(
+    db_path: str,
+    trade_id: str,
+    *,
+    cash: float = 0.0,
+    high: float = 0.0,
+    low: float = 0.0,
+    fee: float = 0.0,
+) -> None:
+    """Remember the basis already booked, so a later fill can debit only its own delta."""
+    if not trade_id:
+        return
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE strategy_order_intents
+            SET booked_cash=CASE WHEN ? > booked_cash THEN ? ELSE booked_cash END,
+                booked_high=CASE WHEN ? > booked_high THEN ? ELSE booked_high END,
+                booked_low=CASE WHEN booked_low <= 0 THEN ? WHEN ? > 0 THEN MIN(booked_low, ?) ELSE booked_low END,
+                booked_fee=CASE WHEN ? > booked_fee THEN ? ELSE booked_fee END
+            WHERE trade_id=? AND side='BUY'
+            """,
+            (
+                float(cash or 0.0),
+                float(cash or 0.0),
+                float(high or 0.0),
+                float(high or 0.0),
+                float(low or 0.0),
+                float(low or 0.0),
+                float(low or 0.0),
+                float(fee or 0.0),
+                float(fee or 0.0),
+                str(trade_id),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _paper_buy_quantity(db_path: str, trade_id: str) -> float:
+    conn = sqlite3.connect(db_path, timeout=15)
+    try:
+        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "paper_trades" not in tables:
+            return 0.0
+        row = conn.execute(
+            "SELECT quantity FROM paper_trades WHERE trade_id=? AND UPPER(side)='BUY' LIMIT 1",
+            (str(trade_id),),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0.0
+    finally:
+        conn.close()
+    return float(row[0] or 0.0) if row is not None else 0.0
+
+
+def buy_intents_to_reread(db_path: str, symbol: str | None = None) -> list[dict[str, Any]]:
+    """Working buys, plus a terminal buy whose commission is not proven yet.
+
+    A zero-fill OPEN order stays on the ordinary working list. FEE_PENDING is
+    not a live order; it is reread so a missing trade leg can still be booked.
+    """
+    rows = working_buy_intents(db_path, symbol)
+    seen = {str(row.get("client_order_id") or "") for row in rows}
+    from backend.utils.symbols import normalize_symbol
+
+    conn = _connect(db_path)
+    try:
+        extra = conn.execute(
+            """
+            SELECT * FROM strategy_order_intents
+            WHERE side='BUY' AND status='FEE_PENDING' AND filled_qty > 0
+            ORDER BY created_at
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    want = normalize_symbol(symbol) if symbol else ""
+    for row in extra:
+        item = dict(row)
+        cid = str(item.get("client_order_id") or "")
+        if cid in seen:
+            continue
+        if want and normalize_symbol(str(item.get("symbol") or "")) != want:
+            continue
+        rows.append(item)
+    return rows
 
 
 def working_buy_intents(db_path: str, symbol: str | None = None) -> list[dict[str, Any]]:
@@ -986,7 +1125,9 @@ def materialize_buy_custody(db_path: str) -> int:
             complete_intent(db_path, trade_id=str(intent["trade_id"]), side="BUY", status="COMMITTED")
             continue
         if closed:
-            complete_intent(db_path, trade_id=str(intent["trade_id"]), side="BUY", status="CLOSED")
+            booked = _paper_buy_quantity(db_path, str(intent["trade_id"]))
+            if float(intent["filled_qty"] or 0.0) <= booked + 1e-8:
+                complete_intent(db_path, trade_id=str(intent["trade_id"]), side="BUY", status="CLOSED")
             continue
         qty = float(intent["filled_qty"] or 0.0)
         gross = float(intent.get("filled_gross") or 0.0)

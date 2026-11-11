@@ -9574,10 +9574,16 @@ class PortfolioEngine:
     def _grow_recovered_buy_lots(self) -> int:
         """A later fill on the same buy raises that engine's lot. It does not open a second one."""
         try:
+            from backend.services.strategy_order_intent import _connect as _intent_connect
+
+            _intent_connect(self.db_path).close()
             with connect_rw(self.db_path) as conn:
                 rows = conn.execute(
                     """
-                    SELECT engine_id, trade_id, symbol, filled_qty, filled_gross, filled_cost, filled_fee, filled_cash
+                    SELECT engine_id, trade_id, symbol, filled_qty, filled_gross, filled_cost, filled_fee, filled_cash,
+                           COALESCE(pending_high, 0), COALESCE(pending_low, 0),
+                           COALESCE(booked_cash, 0), COALESCE(booked_high, 0), COALESCE(booked_low, 0),
+                           COALESCE(booked_fee, 0), created_at
                     FROM strategy_order_intents
                     WHERE side='BUY' AND filled_qty > 0
                       AND status NOT IN ('FEE_PENDING', 'CLOSED', 'NO_VENUE_ORDER')
@@ -9589,30 +9595,79 @@ class PortfolioEngine:
         for row in rows:
             engine_id = str(row[0])
             trade_id = str(row[1])
+            symbol = str(row[2] or "")
             target = float(row[3] or 0.0)
             gross = float(row[4] or 0.0) or target
             price = (float(row[5] or 0.0) / gross) if gross else 0.0
             cash = float(row[7] or 0.0) or float(row[5] or 0.0)
             fee = float(row[6] or 0.0)
+            leg_high = float(row[8] or 0.0)
+            leg_low = float(row[9] or 0.0)
+            booked_cash = float(row[10] or 0.0)
+            booked_high = float(row[11] or 0.0)
+            booked_low = float(row[12] or 0.0)
+            booked_fee = float(row[13] or 0.0)
+            created_at = float(row[14] or 0.0)
             if target <= 0 or price <= 0:
                 continue
+            mark_high = leg_high if leg_high > 0 else price
+            mark_low = leg_low if leg_low > 0 else price
             with connect_rw(self.db_path) as db:
-                current = db.execute(
-                    """
+                try:
+                    current = db.execute(
+                        """
                     SELECT quantity, original_position_cost, highest_price, lowest_price, entry_price
                     FROM portfolio_engine_positions
                     WHERE engine_id=? AND trade_id=? AND IFNULL(quantity, 0) > 0
                     """,
-                    (engine_id, trade_id),
-                ).fetchone()
-                if current is None or float(current[0] or 0.0) + 1e-8 >= target:
+                        (engine_id, trade_id),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    continue
+                if current is None:
+                    try:
+                        reopened = self._reopen_closed_buy_delta(
+                            db,
+                            engine_id=engine_id,
+                            trade_id=trade_id,
+                            symbol=symbol,
+                            target=target,
+                            price=price,
+                            cash=cash,
+                            fee=fee,
+                            mark_high=mark_high,
+                            mark_low=mark_low,
+                            booked_cash=booked_cash,
+                            booked_high=booked_high,
+                            booked_low=booked_low,
+                            booked_fee=booked_fee,
+                            created_at=created_at,
+                        )
+                    except Exception:
+                        logger.warning("RECOVERED_BUY_REOPEN_FAILED trade=%s", trade_id, exc_info=True)
+                        reopened = False
+                    if reopened:
+                        grown += 1
                     continue
                 previous_cost = float(current[1] or 0.0)
                 old_qty = float(current[0] or 0.0)
-                old_entry = float(current[4] or 0.0) or price
-                high = max(float(current[2] or 0.0), price)
+                booked = old_qty
+                try:
+                    paper = db.execute(
+                        "SELECT quantity FROM paper_trades WHERE trade_id=? AND UPPER(side)='BUY'",
+                        (trade_id,),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    paper = None
+                if paper is not None:
+                    booked = float(paper[0] or 0.0)
+                added = target - booked
+                if added <= 1e-8:
+                    continue
+                new_qty = old_qty + added
+                high = max(float(current[2] or 0.0), mark_high)
                 low_now = float(current[3] or 0.0)
-                low = price if low_now <= 0 else min(low_now, price)
+                low = mark_low if low_now <= 0 else min(low_now, mark_low)
                 db.execute(
                     """
                     UPDATE portfolio_engine_positions
@@ -9620,11 +9675,26 @@ class PortfolioEngine:
                         highest_price=?, lowest_price=?
                     WHERE engine_id=? AND trade_id=?
                     """,
-                    (target, price, fee, cash, high, low, engine_id, trade_id),
+                    (new_qty, price, fee, cash, high, low, engine_id, trade_id),
                 )
+                if paper is not None:
+                    db.execute(
+                        """
+                        UPDATE paper_trades
+                        SET quantity=?,
+                            remaining_position=COALESCE(remaining_position, quantity) + ?
+                        WHERE trade_id=? AND UPPER(side)='BUY'
+                        """,
+                        (target, added, trade_id),
+                    )
                 delta = cash - previous_cost
-                if delta > 0 and db.execute("SELECT 1 FROM portfolio_engine_ledger WHERE id=1").fetchone() is not None:
-                    notion = target * price - old_qty * old_entry
+                ledger = None
+                try:
+                    ledger = db.execute("SELECT 1 FROM portfolio_engine_ledger WHERE id=1").fetchone()
+                except sqlite3.OperationalError:
+                    ledger = None
+                if delta > 0 and ledger is not None:
+                    notion = added * price
                     db.execute(
                         """
                         UPDATE portfolio_engine_ledger
@@ -9636,9 +9706,183 @@ class PortfolioEngine:
                         (delta, max(0.0, notion), max(0.0, notion) - delta),
                     )
                 db.commit()
+            for pos in (getattr(self, "open_positions", None) or {}).values():
+                if str(getattr(pos, "trade_id", "") or "") == trade_id and str(getattr(pos, "engine_id", "") or "") == engine_id:
+                    pos.quantity = float(getattr(pos, "quantity", 0) or 0) + added
+                    pos.entry_price = price
+                    pos.entry_fee = fee
+                    pos.original_position_cost = cash
+                    pos.highest_price = max(float(getattr(pos, "highest_price", 0) or 0), mark_high)
+                    current_low = float(getattr(pos, "lowest_price", 0) or 0)
+                    pos.lowest_price = mark_low if current_low <= 0 else min(current_low, mark_low)
+            self._clear_buy_fill_marks(trade_id, cash=cash, high=high, low=low, fee=fee)
             grown += 1
-            logger.warning("RECOVERED_BUY_GROWTH engine=%s trade=%s qty=%.8f", engine_id, trade_id, target)
+            logger.warning("RECOVERED_BUY_GROWTH engine=%s trade=%s qty=%.8f added=%.8f", engine_id, trade_id, target, added)
         return grown
+
+    def _clear_buy_fill_marks(self, trade_id: str, *, cash: float, high: float, low: float, fee: float) -> None:
+        """The leg prices are now on the lot. A repeat probe must not apply them again."""
+        try:
+            with connect_rw(self.db_path) as db:
+                db.execute(
+                    """
+                    UPDATE strategy_order_intents
+                    SET pending_high=0, pending_low=0,
+                        booked_cash=CASE WHEN ? > booked_cash THEN ? ELSE booked_cash END,
+                        booked_high=CASE WHEN ? > booked_high THEN ? ELSE booked_high END,
+                        booked_low=CASE WHEN booked_low <= 0 THEN ? WHEN ? > 0 THEN MIN(booked_low, ?) ELSE booked_low END,
+                        booked_fee=CASE WHEN ? > booked_fee THEN ? ELSE booked_fee END
+                    WHERE trade_id=? AND side='BUY'
+                    """,
+                    (cash, cash, high, high, low, low, low, fee, fee, str(trade_id)),
+                )
+                db.commit()
+        except Exception:
+            return
+
+    def _reopen_closed_buy_delta(
+        self,
+        db,
+        *,
+        engine_id: str,
+        trade_id: str,
+        symbol: str,
+        target: float,
+        price: float,
+        cash: float,
+        fee: float,
+        mark_high: float,
+        mark_low: float,
+        booked_cash: float,
+        booked_high: float,
+        booked_low: float,
+        booked_fee: float,
+        created_at: float,
+    ) -> bool:
+        """A sold lot gained base after the close. Book only that new base on the same trade."""
+        try:
+            paper = db.execute(
+                "SELECT quantity, remaining_position, price FROM paper_trades WHERE trade_id=? AND UPPER(side)='BUY'",
+                (trade_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        if paper is None:
+            return False
+        booked = float(paper[0] or 0.0)
+        remaining = float(paper[1] or 0.0)
+        if booked <= 0 or remaining > 1e-8:
+            return False
+        added = target - booked
+        if added <= 1e-8:
+            return False
+        prior_cash = booked_cash if booked_cash > 0 else float(paper[2] or 0.0) * booked
+        delta_cash = cash - prior_cash
+        if delta_cash < 0:
+            delta_cash = 0.0
+        entry = (delta_cash / added) if added > 0 and delta_cash > 0 else price
+        high = max(booked_high, mark_high)
+        low_candidates = [item for item in (booked_low, mark_low) if item > 0]
+        low = min(low_candidates) if low_candidates else entry
+        prior_fee = booked_fee if booked_fee > 0 else 0.0
+        delta_fee = max(0.0, fee - prior_fee)
+        cols = {str(item[1]) for item in db.execute("PRAGMA table_info(portfolio_engine_positions)")}
+        if "engine_id" in cols and "symbol" in cols:
+            sibling = db.execute(
+                "SELECT trade_id, quantity FROM portfolio_engine_positions WHERE engine_id=? AND symbol=?",
+                (engine_id, symbol),
+            ).fetchone()
+            if sibling is not None and str(sibling[0] or "") != trade_id and float(sibling[1] or 0.0) > 0:
+                return False
+        values = {
+            "symbol": symbol,
+            "quantity": added,
+            "entry_price": entry,
+            "entry_time": created_at if created_at > 0 else time.time(),
+            "trade_id": trade_id,
+            "stop_price": 0.0,
+            "take_profit_1_price": 0.0,
+            "take_profit_2_price": 0.0,
+            "highest_price": high,
+            "lowest_price": low,
+            "atr_at_entry": 0.0,
+            "entry_bar_timestamp": 0,
+            "confidence_at_entry": 0.5,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "engine_id": engine_id,
+            "entry_fee": delta_fee,
+            "original_position_cost": delta_cash,
+            "status": "ACTIVE",
+        }
+        names = [name for name in values if name in cols]
+        if not names or "quantity" not in names:
+            return False
+        same = None
+        if "trade_id" in cols:
+            same = db.execute(
+                "SELECT 1 FROM portfolio_engine_positions WHERE trade_id=? AND engine_id=?" if "engine_id" in cols else "SELECT 1 FROM portfolio_engine_positions WHERE trade_id=?",
+                (trade_id, engine_id) if "engine_id" in cols else (trade_id,),
+            ).fetchone()
+        if same is not None:
+            assignments = ", ".join(f"{name}=?" for name in names if name not in {"trade_id", "engine_id", "symbol"})
+            params = [values[name] for name in names if name not in {"trade_id", "engine_id", "symbol"}]
+            params.extend([trade_id, engine_id] if "engine_id" in cols else [trade_id])
+            where = "trade_id=? AND engine_id=?" if "engine_id" in cols else "trade_id=?"
+            db.execute(f"UPDATE portfolio_engine_positions SET {assignments} WHERE {where}", params)
+        else:
+            db.execute(
+                f"INSERT INTO portfolio_engine_positions ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
+                [values[name] for name in names],
+            )
+        if "quantity" in {str(item[1]) for item in db.execute("PRAGMA table_info(paper_trades)")}:
+            db.execute(
+                """
+                UPDATE paper_trades
+                SET quantity=?, remaining_position=?, price=?
+                WHERE trade_id=? AND UPPER(side)='BUY'
+                """,
+                (target, added, entry, trade_id),
+            )
+        if delta_cash > 0:
+            try:
+                ledger = db.execute("SELECT 1 FROM portfolio_engine_ledger WHERE id=1").fetchone()
+            except sqlite3.OperationalError:
+                ledger = None
+            if ledger is not None:
+                notion = added * entry
+                db.execute(
+                    """
+                    UPDATE portfolio_engine_ledger
+                    SET cash_balance = cash_balance - ?,
+                        positions_value = positions_value + ?,
+                        total_equity = total_equity + ?
+                    WHERE id=1
+                    """,
+                    (delta_cash, max(0.0, notion), max(0.0, notion) - delta_cash),
+                )
+        db.commit()
+        book = getattr(self, "open_positions", None)
+        if isinstance(book, dict):
+            lot = OpenPosition(
+                symbol=symbol,
+                quantity=added,
+                entry_price=entry,
+                entry_time=float(values["entry_time"]),
+                trade_id=trade_id,
+                stop_price=0.0,
+                take_profit_1_price=0.0,
+                take_profit_2_price=0.0,
+                highest_price=high,
+                lowest_price=low,
+                entry_fee=delta_fee,
+                original_position_cost=delta_cash,
+                engine_id=engine_id,
+                status="ACTIVE",
+            )
+            book[make_position_key(engine_id, symbol)] = lot
+        self._clear_buy_fill_marks(trade_id, cash=cash, high=high, low=low, fee=fee)
+        logger.warning("RECOVERED_BUY_GROWTH engine=%s trade=%s qty=%.8f added=%.8f", engine_id, trade_id, target, added)
+        return True
 
     async def restore_filled_asset_custody(self) -> int:
         """Book each venue fill whose open transaction never committed. Once."""
@@ -9722,6 +9966,13 @@ class PortfolioEngine:
                             )
                             conn.commit()
                 mark(self.db_path, engine_id=engine_id, trade_id=trade_id, status=RECOVERED_ACTIVE_LOT, cash_applied=1)
+                self._clear_buy_fill_marks(
+                    trade_id,
+                    cash=float(row["cash_debit"] or 0.0),
+                    high=float(row["fill_price"]),
+                    low=float(row["fill_price"]),
+                    fee=float(row["fee"] or 0.0),
+                )
                 booked += 1
                 logger.critical(
                     "RECOVERED_ACTIVE_LOT engine=%s symbol=%s trade=%s qty=%.8f order=%s",
@@ -9745,7 +9996,7 @@ class PortfolioEngine:
                 )
         return booked
 
-    async def _probe_intent(self, intent: dict[str, Any]) -> dict[str, Any]:
+    async def _probe_intent(self, intent: dict[str, Any], *, wait: bool = True) -> dict[str, Any]:
         """Fetch both attempt ids. A network failure is not absence. -2013 on both is absence."""
         cid = str(intent.get("client_order_id") or "")
         symbol = str(intent.get("symbol") or "")
@@ -9757,6 +10008,7 @@ class PortfolioEngine:
                     f"{cid}{suffix}",
                     symbol,
                     priority="exit" if str(intent.get("side") or "").lower() == "sell" else "entry",
+                    wait=wait,
                 )
             except Exception:
                 logger.warning("STRATEGY_INTENT_PROBE_FAILED trade=%s", intent.get("trade_id"), exc_info=True)
@@ -9925,6 +10177,12 @@ class PortfolioEngine:
         lots = self._symbol_lots(symbol) if callable(getattr(self, "_symbol_lots", None)) else []
         for pos in lots:
             if str(getattr(pos, "trade_id", "") or "") == str(trade_id):
+                high = max(high, float(getattr(pos, "highest_price", 0) or 0))
+                current_low = float(getattr(pos, "lowest_price", 0) or 0)
+                if current_low > 0:
+                    low = min(low, current_low)
+        for pos in lots:
+            if str(getattr(pos, "trade_id", "") or "") == str(trade_id):
                 pos.highest_price = high
                 pos.lowest_price = low
         with contextlib.suppress(Exception), connect_rw(self.db_path) as conn:
@@ -9938,16 +10196,58 @@ class PortfolioEngine:
             )
             conn.commit()
 
+    async def _refresh_partial_buy_before_sell(self, position: Any) -> None:
+        """Read this lot's working partial buy once. A miss leaves the booked quantity."""
+        from backend.services.strategy_order_intent import buy_intents_to_reread, note_open_buy_basis
+
+        if getattr(self, "_live_service", None) is None or not getattr(self, "db_path", None):
+            return
+        trade_id = str(getattr(position, "trade_id", "") or "")
+        engine_id = str(getattr(position, "engine_id", "") or "")
+        symbol = str(getattr(position, "symbol", "") or "")
+        if not trade_id:
+            return
+        try:
+            intents = buy_intents_to_reread(self.db_path, symbol)
+        except Exception:
+            return
+        match = next(
+            (
+                item
+                for item in intents
+                if str(item.get("trade_id") or "") == trade_id
+                and str(item.get("engine_id") or "") == engine_id
+                and str(item.get("status") or "") in {"PARTIAL", "FEE_PENDING", "WORKING"}
+                and float(item.get("filled_qty") or 0.0) > 0
+            ),
+            None,
+        )
+        if match is None:
+            return
+        note_open_buy_basis(
+            self.db_path,
+            trade_id,
+            cash=float(getattr(position, "original_position_cost", 0.0) or 0.0),
+            high=float(getattr(position, "highest_price", 0.0) or 0.0),
+            low=float(getattr(position, "lowest_price", 0.0) or 0.0),
+            fee=float(getattr(position, "entry_fee", 0.0) or 0.0),
+        )
+        found = await self._probe_intent(match, wait=False)
+        if not found.get("found"):
+            return
+        await self._apply_probed_order(found["order"], symbol, str(match.get("client_order_id") or ""), wait=False)
+        self._grow_recovered_buy_lots()
+
     async def _classify_resting_buys(self, symbol: str) -> None:
         """After a protective sell, read a same-symbol BUY once. The sell is not delayed for this."""
         from backend.services.day_entry_reservations import release_reservation
-        from backend.services.strategy_order_intent import mark_intent_absent, working_buy_intents
+        from backend.services.strategy_order_intent import buy_intents_to_reread, mark_intent_absent
 
         if getattr(self, "_live_service", None) is None or not getattr(self, "db_path", None):
             return
         self._last_buy_probe_epoch = time.time()
         self._last_buy_probe_status = "started"
-        intents = working_buy_intents(self.db_path, symbol)
+        intents = buy_intents_to_reread(self.db_path, symbol)
         for intent in intents:
             cid = str(intent.get("client_order_id") or "")
             found = await self._probe_intent(intent)
@@ -9961,6 +10261,9 @@ class PortfolioEngine:
                 self._release_entry_reservation(str(intent.get("symbol") or symbol), sleeve=str(intent.get("engine_id") or ""))
                 continue
             await self._apply_probed_order(found["order"], str(intent.get("symbol") or symbol), cid, wait=False)
+        grown = await self.restore_filled_asset_custody()
+        if grown:
+            self.note_sell_symbol_released()
 
     async def _apply_probed_order(self, order: dict[str, Any], symbol: str, client_order_id: str = "", *, wait: bool = True) -> dict[str, Any]:
         from backend.services.live_fill_economics import merge_venue_trades_into_order
@@ -10140,7 +10443,7 @@ class PortfolioEngine:
 
     async def _recover_strategy_order_intents(self) -> int:
         """Find venue orders for intents that died before a fill was stored, then book them once."""
-        from backend.services.strategy_order_intent import intents_to_probe, mark_intent_absent, working_buy_intents, working_sell_intents
+        from backend.services.strategy_order_intent import buy_intents_to_reread, intents_to_probe, mark_intent_absent, working_sell_intents
 
         if self._live_service is None:
             return 0
@@ -10150,7 +10453,7 @@ class PortfolioEngine:
         probed = 0
         seen: set[str] = set()
         batch: list[dict[str, Any]] = []
-        for intent in list(intents_to_probe(self.db_path)) + working_sell_intents(self.db_path) + working_buy_intents(self.db_path):
+        for intent in list(intents_to_probe(self.db_path)) + working_sell_intents(self.db_path) + buy_intents_to_reread(self.db_path):
             cid = str(intent.get("client_order_id") or "")
             if not cid or cid in seen:
                 continue
@@ -15040,6 +15343,10 @@ class PortfolioEngine:
         _venue_sell_budget: list[float] = []
 
         async def _protected_live_sell(qty: float) -> dict[str, Any] | None:
+            # One non-blocking read of this lot's still-working partial buy.
+            # A timeout or a missing fee sells the quantity already booked.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._refresh_partial_buy_before_sell(position), timeout=5.0)
             # A fill whose fee is now known is booked before any new order.
             staged = getattr(position, "_ready_pending_sell", None)
             if isinstance(staged, dict):

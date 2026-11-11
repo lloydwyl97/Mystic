@@ -79,6 +79,8 @@ class _IntentQuote:
     remaining_quote: Decimal
     executed_quote: Decimal
     created_at: float
+    trade_id: str = ""
+    order_qty: Decimal = Decimal("0")
 
     @property
     def open_quote(self) -> Decimal:
@@ -198,7 +200,8 @@ def _load_intents(db_path: str) -> list[_IntentQuote]:
         rows = conn.execute(
             f"""
             SELECT client_order_id, engine_id, decision_id, symbol, side, status,
-                   quantity, limit_price, filled_qty, {cost} AS filled_cost, {cash} AS filled_cash, created_at
+                   quantity, limit_price, filled_qty, {cost} AS filled_cost, {cash} AS filled_cash, created_at,
+                   trade_id
             FROM strategy_order_intents
             WHERE side='BUY' AND (
                 status IN ({", ".join("?" for _ in WORKING_BUY_STATUSES)})
@@ -231,6 +234,8 @@ def _load_intents(db_path: str) -> list[_IntentQuote]:
                 remaining_quote=remaining,
                 executed_quote=executed,
                 created_at=created,
+                trade_id=str(row["trade_id"] or ""),
+                order_qty=money(row["quantity"]),
             )
         )
     return out
@@ -340,6 +345,33 @@ class BuyCashView:
         }
 
 
+def _local_buy_books(db_path: str) -> dict[str, tuple[float | None, float | None]]:
+    """trade_id -> (paper BUY quantity, open position quantity).
+
+    Paper quantity is the last cumulative fill booked onto that buy. The
+    position quantity is what exit protection can see right now.
+    """
+    conn = _connect(db_path)
+    if conn is None:
+        return {}
+    out: dict[str, tuple[float | None, float | None]] = {}
+    try:
+        tables = _tables(conn)
+        if "paper_trades" in tables:
+            for row in conn.execute("SELECT trade_id, quantity FROM paper_trades WHERE UPPER(side)='BUY' AND trade_id != ''"):
+                out[str(row["trade_id"])] = (float(row["quantity"] or 0.0), None)
+        if "portfolio_engine_positions" in tables:
+            for row in conn.execute("SELECT trade_id, quantity FROM portfolio_engine_positions WHERE IFNULL(quantity, 0) > 0 AND trade_id != ''"):
+                trade_id = str(row["trade_id"])
+                paper_qty = out.get(trade_id, (None, None))[0]
+                out[trade_id] = (paper_qty, float(row["quantity"] or 0.0))
+    except sqlite3.Error:
+        return out
+    finally:
+        conn.close()
+    return out
+
+
 def buy_cash_view(
     db_path: str,
     *,
@@ -444,18 +476,32 @@ def buy_cash_view(
     ambiguous = [item for item in intents if item.status in {"PENDING", "ACKED"} and item.filled_qty <= 0]
     oldest_unresolved = min((item.created_at for item in unresolved if item.created_at > 0), default=0.0)
     oldest_ambiguous = min((item.created_at for item in ambiguous if item.created_at > 0), default=0.0)
-    working_rows = [
-        {
-            "engine": item.engine,
-            "symbol": item.symbol,
-            "client_order_id": item.client_order_id,
-            "status": item.status,
-            "reserved_quote": float(item.open_quote),
-            "filled_qty": float(item.filled_qty),
-        }
-        for item in intents
-        if item.remaining_quote > 0
-    ]
+    books = _local_buy_books(db_path)
+    working_rows = []
+    for item in intents:
+        if item.remaining_quote <= 0:
+            continue
+        paper_qty, position_qty = books.get(item.trade_id, (None, None))
+        booked = paper_qty if paper_qty is not None else position_qty
+        venue_qty = float(item.filled_qty)
+        unbooked = max(0.0, venue_qty - float(booked)) if booked is not None else 0.0
+        working_rows.append(
+            {
+                "engine": item.engine,
+                "symbol": item.symbol,
+                "client_order_id": item.client_order_id,
+                "status": item.status,
+                "reserved_quote": float(item.open_quote),
+                "filled_qty": venue_qty,
+                "order_qty": float(item.order_qty),
+                "venue_cumulative_filled": venue_qty,
+                "locally_booked_filled": None if booked is None else float(booked),
+                "unbooked_fill_qty": unbooked,
+                "working_remainder": max(0.0, float(item.order_qty) - venue_qty),
+                "position_qty": None if position_qty is None else float(position_qty),
+                "age_sec": None if item.created_at <= 0 else round(max(0.0, stamp - item.created_at), 3),
+            }
+        )
     return BuyCashView(
         pending_buy_quote=pending,
         working_buy_quote=working,
