@@ -49,6 +49,20 @@ MIN_HOLDOUT_CONFIDENCE_SAMPLES = max(20, _confidence_env)
 TARGET_HOLDOUT_SAMPLES = max(20, _target_env)
 
 
+def _terminal_outcome_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Drop ambiguous duplicate opens before a promotion comparison.
+
+    Several sells that share an entry time and have no single trade id are not
+    one evaluation label. The comparison keeps a row only when the training
+    reader would keep it.
+    """
+    from backend.services.ai_canonical_storage import strategy_terminal_outcome_rows
+
+    kept = strategy_terminal_outcome_rows([dict(row) for row in rows])
+    keep_ids = {int(row["id"]) for row in kept if row.get("id") is not None}
+    return [row for row in rows if int(row["id"]) in keep_ids]
+
+
 def _canonical_bus_symbol(raw: str) -> str:
     s = (raw or "").strip().upper()
     if s.endswith("USDT"):
@@ -144,6 +158,7 @@ def _holdout_split(
             """,
             (sid, ccxt, bus),
         ).fetchall()
+    rows = _terminal_outcome_rows(rows)
     eligible = [row for row in rows if _row_passes_filters(row, symbol_bus=bus, min_fv=feature_version, min_dim=feature_dim)]
     if seen_cutoff:
         eligible = [row for row in eligible if _row_unseen_by_incumbent(row, seen_cutoff)]
@@ -294,6 +309,7 @@ def load_forward_rows(
             """,
             (sid, ccxt, bus, opened_after_utc),
         ).fetchall()
+    rows = _terminal_outcome_rows(rows)
     rows = [r for r in rows if _row_passes_filters(r, symbol_bus=bus, min_fv=feature_version, min_dim=feature_dim)]
     xs, ys, nets, gbs, ids = [], [], [], [], []
     from backend.services.day_feature_health import zero_learning_blocked_feature_dims

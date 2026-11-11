@@ -1942,6 +1942,10 @@ class AITrainingDataPipeline:
                             artifact["artifact_id"] = ver_path.name
                             artifact["train_outcome_max_id"] = train_outcome_max_id
                             artifact.update(training_info.get(sym) or {})
+                            artifact["outcome_semantics_version"] = "TERMINAL_ENTRY_V2"
+                            artifact["dataset_builder_version"] = "strategy_terminal_outcome_rows"
+                            artifact["ambiguous_rows_excluded"] = True
+                            artifact["training_identity_count"] = int(((training_info.get(sym) or {}).get("training_window") or {}).get("outcome_rows") or 0)
                             if not artifact.get("training_data_end"):
                                 artifact["training_data_end"] = datetime.now(timezone.utc).isoformat()
                             artifact["holdout_window"] = validation_metrics.get("holdout_window") or {}

@@ -39,6 +39,46 @@ def _artifact_meta(path: Path) -> dict[str, Any]:
     return out
 
 
+def apply_data_contract_rule(
+    decision: dict[str, Any],
+    *,
+    incumbent_status: str,
+    candidate_status: str,
+    holdout_n: int,
+    min_common_n: int,
+) -> dict[str, Any]:
+    """Keep a contract change on one shared holdout. Stored training accuracy has no vote.
+
+    Same-contract comparisons keep the paired lower-bound rule, including a small
+    sample whose bound is too wide to promote. A change of label semantics needs
+    that same-row comparison to be large enough to mean something.
+    """
+    out = dict(decision)
+    out["incumbent_data_contract"] = incumbent_status
+    out["candidate_data_contract"] = candidate_status
+    out["stored_accuracy_ignored"] = True
+    if incumbent_status == candidate_status:
+        out["comparison"] = "SAME_CONTRACT"
+        return out
+    if int(holdout_n) < int(min_common_n):
+        out["verdict"] = "INSUFFICIENT_COMMON_HOLDOUT"
+        out["promote"] = False
+        out["comparison"] = "INSUFFICIENT_COMMON_HOLDOUT"
+        return out
+    out["comparison"] = "COMMON_CLEAN_HOLDOUT"
+    return out
+
+
+def _contract_status(path: Path) -> str:
+    from backend.services.ai_model_registry import training_data_status
+
+    try:
+        art = pickle.loads(Path(path).read_bytes())
+    except Exception:
+        return training_data_status(None)
+    return training_data_status(art if isinstance(art, dict) else None)
+
+
 def _holdout_accuracy(metrics: dict[str, Any] | None, *, role: str) -> float | None:
     if not metrics:
         return None
@@ -158,6 +198,15 @@ def register_candidate_and_maybe_promote(
             decision.update(verdict="CAUSALITY_UNVERIFIED", promote=False)
         elif candidate_always_buy:
             decision.update(verdict="REJECT_ALWAYS_BUY", promote=False)
+        from backend.services.ai_model_promotion_holdout import MIN_HOLDOUT_CONFIDENCE_SAMPLES
+
+        decision = apply_data_contract_rule(
+            decision,
+            incumbent_status=_contract_status(active_path),
+            candidate_status=_contract_status(candidate_path),
+            holdout_n=int(decision.get("n") or metrics.get("holdout_sample_count") or 0),
+            min_common_n=MIN_HOLDOUT_CONFIDENCE_SAMPLES,
+        )
         metrics["promotion_path"] = "paired_forward_lcb"
     metrics["promotion_decision"] = {k: v for k, v in decision.items() if k not in ("candidate", "incumbent")}
 

@@ -168,13 +168,24 @@ def register_artifact(strategy_id: str, symbol: str, src: Path, meta: dict[str, 
     return {"version": sha[:16], "sha256": sha, "path": str(dst), "meta_path": str(meta_path)}
 
 
+OUTCOME_SEMANTICS_TERMINAL = "TERMINAL_ENTRY_V2"
+OUTCOME_SEMANTICS_LEGACY = "LEGACY_CONTAMINATED"
+
+
+def training_data_status(art: dict[str, Any] | None) -> str:
+    """Provenance of the labels an artifact was fit on. Not a trading gate."""
+    if isinstance(art, dict) and str(art.get("outcome_semantics_version") or "") == OUTCOME_SEMANTICS_TERMINAL:
+        return OUTCOME_SEMANTICS_TERMINAL
+    return OUTCOME_SEMANTICS_LEGACY
+
+
 def artifact_meta(art_path: Path) -> dict[str, Any]:
     try:
         art = pickle.loads(Path(art_path).read_bytes())
     except Exception:
-        return {}
+        return {"training_data_status": OUTCOME_SEMANTICS_LEGACY}
     if not isinstance(art, dict):
-        return {}
+        return {"training_data_status": OUTCOME_SEMANTICS_LEGACY}
     keep = (
         "trained_at",
         "feature_version",
@@ -182,13 +193,20 @@ def artifact_meta(art_path: Path) -> dict[str, Any]:
         "train_outcome_max_id",
         "holdout_window",
         "train_samples",
+        "training_identity_count",
         "accuracy",
         "artifact_id",
         "live_strategy_id",
         "training_window",
         "training_fingerprint",
+        "training_data_end",
+        "outcome_semantics_version",
+        "dataset_builder_version",
+        "ambiguous_rows_excluded",
     )
-    return {k: art.get(k) for k in keep if k in art}
+    meta = {k: art.get(k) for k in keep if k in art}
+    meta["training_data_status"] = training_data_status(art)
+    return meta
 
 
 def _pointer(root: Path, strategy_id: str, symbol: str, which: str) -> Path:
@@ -226,6 +244,27 @@ def read_events(strategy_id: str, symbol: str, root: Path | None = None, limit: 
 
 def _pointer_payload(reg: dict[str, Any], *, reason: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"version": reg["version"], "sha256": reg["sha256"], "path": reg["path"], "set_at": _now(), "reason": reason, "meta": meta or {}}
+
+
+def annotate_active_provenance(strategy_id: str, symbol: str, root: Path | None = None) -> dict[str, Any]:
+    """Record label provenance on the ACTIVE pointer. The model bytes stay put."""
+    root = root or registry_root()
+    path = _pointer(root, strategy_id, symbol, "ACTIVE")
+    pointer = read_json(path)
+    if not pointer:
+        return {}
+    art_path = Path(str(pointer.get("path") or ""))
+    meta = dict(pointer.get("meta") or {})
+    if art_path.exists():
+        meta.update(artifact_meta(art_path))
+    else:
+        meta["training_data_status"] = training_data_status(meta)
+    if (pointer.get("meta") or {}).get("training_data_status") == meta.get("training_data_status") and "training_data_status" in (pointer.get("meta") or {}):
+        return pointer
+    updated = dict(pointer)
+    updated["meta"] = meta
+    atomic_write_json(path, updated)
+    return updated
 
 
 def ensure_incumbent_registered(strategy_id: str, symbol: str, active_path: Path, root: Path | None = None, *, reason: str = "incumbent_registered") -> dict[str, Any] | None:
@@ -377,6 +416,7 @@ def symbol_status(strategy_id: str, symbol: str, active_path: Path, root: Path |
     hw = meta.get("holdout_window") or {}
     return {
         "active_model_version": act.get("version"),
+        "training_data_status": str(meta.get("training_data_status") or training_data_status(meta)),
         "active_matches_live_file": bool(live_sha and live_sha == act.get("sha256")),
         "previous_model_version": prev.get("version"),
         "trained_at": meta.get("trained_at"),
@@ -393,6 +433,9 @@ def symbol_status(strategy_id: str, symbol: str, active_path: Path, root: Path |
 
 __all__ = [
     "CANDIDATE_RETENTION",
+    "OUTCOME_SEMANTICS_LEGACY",
+    "OUTCOME_SEMANTICS_TERMINAL",
+    "annotate_active_provenance",
     "append_event",
     "artifact_meta",
     "artifact_path",

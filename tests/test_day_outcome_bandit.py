@@ -19,6 +19,17 @@ from backend.services.day_trade_thesis import (
 )
 
 
+def test_observation_count_keeps_every_update(tmp_path: Path):
+    from backend.services.day_outcome_bandit import SLIDING_WINDOW
+
+    db = str(tmp_path / "decay.db")
+    for _ in range(SLIDING_WINDOW + 1):
+        record_bandit_outcome(symbol="BTC/USDT", setup=SETUP_RANGE_BOUNCE, regime="range", pnl_usd=1.0, exit_reason="NET_PROFIT_EXIT", db_path=db)
+    st = get_arm_stats("BTC/USDT", SETUP_RANGE_BOUNCE, "range", db_path=db)
+    assert st["n_obs"] == SLIDING_WINDOW + 1
+    assert st["wins"] == SLIDING_WINDOW + 1
+
+
 def test_win_promotes_arm_mean(tmp_path: Path):
     db = str(tmp_path / "b.db")
     for _ in range(5):

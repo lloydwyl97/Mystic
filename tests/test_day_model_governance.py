@@ -145,6 +145,71 @@ def test_tie_never_promotes(models):
     assert _register(models, identical, _metrics(identical, models["active"], X, y, nets, gbs))[0] is False
 
 
+def test_contract_change_with_a_small_holdout_is_not_a_promotion(models):
+    registry.set_promotion_enabled("day", True, "test", models["root"])
+    before = models["active"].read_bytes()
+    cand = _write(models["tmp"] / "versions" / "clean.pkl", _artifact(0.0, outcome_semantics_version="TERMINAL_ENTRY_V2", accuracy=0.99))
+    X, y, nets, gbs = _holdout(8, 0)
+    metrics = _metrics(cand, models["active"], X, y, nets, gbs)
+    metrics["paired_decision"]["verdict"] = "PROMOTE"
+    metrics["paired_decision"]["promote"] = True
+    metrics["paired_decision"]["n"] = 8
+    metrics["active_accuracy"] = 0.99
+    metrics["candidate_accuracy"] = 0.10
+    ok, reason = _register(models, cand, metrics)
+    assert ok is False
+    assert reason == "keep_incumbent:INSUFFICIENT_COMMON_HOLDOUT"
+    assert models["active"].read_bytes() == before
+
+
+def test_same_contract_still_uses_the_paired_holdout(models):
+    registry.set_promotion_enabled("day", True, "test", models["root"])
+    _write(models["active"], _artifact(1e6, outcome_semantics_version="TERMINAL_ENTRY_V2", accuracy=0.9))
+    cand = _write(models["tmp"] / "versions" / "clean.pkl", _artifact(0.5, outcome_semantics_version="TERMINAL_ENTRY_V2", accuracy=0.1))
+    X, y, nets, gbs = _holdout(4, 4)
+    metrics = _metrics(cand, models["active"], X, y, nets, gbs)
+    assert metrics["paired_decision"]["verdict"] == "PROMOTE"
+    ok, reason = _register(models, cand, metrics)
+    assert ok is True
+    assert "promoted" in reason
+
+
+def test_legacy_and_clean_artifact_metadata(models):
+    legacy = registry.artifact_meta(models["active"])
+    assert legacy["training_data_status"] == "LEGACY_CONTAMINATED"
+    cand = _write(
+        models["tmp"] / "versions" / "clean.pkl",
+        _artifact(0.0, outcome_semantics_version="TERMINAL_ENTRY_V2", dataset_builder_version="strategy_terminal_outcome_rows", ambiguous_rows_excluded=True),
+    )
+    clean = registry.artifact_meta(cand)
+    assert clean["training_data_status"] == "TERMINAL_ENTRY_V2"
+    assert clean["ambiguous_rows_excluded"] is True
+    registry.ensure_incumbent_registered("day", SYM, models["active"], models["root"])
+    stamped = registry.annotate_active_provenance("day", SYM, models["root"])
+    assert stamped["meta"]["training_data_status"] == "LEGACY_CONTAMINATED"
+    assert registry.sha256_file(models["active"]) == stamped["sha256"]
+
+
+def test_ambiguous_duplicate_open_is_not_an_evaluation_row(models):
+    _seed_outcomes(models["db"], 4)
+    with sqlite3.connect(models["db"]) as conn:
+        feats = json.dumps([0.0] * DIM)
+        ctx = json.dumps({"_feature_version": FEATURE_VERSION_DAY_HTF})
+        for close, label in (("2026-03-02T01:30:00+00:00", 1), ("2026-03-02T02:30:00+00:00", 0)):
+            conn.execute(
+                "INSERT INTO ai_outcome_training_rows (symbol, opened_at_utc, closed_at_utc, strategy_id, net_pnl_pct, features_json, context_json, outcome_label, ingested_at_utc) "
+                "VALUES (?, ?, ?, 'day', ?, ?, ?, ?, datetime('now'))",
+                (SYM, "2026-03-02T01:00:00+00:00", close, 0.01, feats, ctx, label),
+            )
+        conn.commit()
+    window = holdout_window(strategy_id="day", symbol_bus=SYM, db_path=models["db"], active_path=models["active"])
+    assert window["n"] > 0
+    with sqlite3.connect(models["db"]) as conn:
+        marks = ",".join("?" for _ in window["ids"])
+        opened = {row[0] for row in conn.execute(f"SELECT opened_at_utc FROM ai_outcome_training_rows WHERE id IN ({marks})", window["ids"])}
+    assert "2026-03-02T01:00:00+00:00" not in opened
+
+
 def test_ambiguous_comparison_keeps_incumbent(models):
     registry.set_promotion_enabled("day", True, "test", models["root"])
     before = models["active"].read_bytes()
