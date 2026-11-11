@@ -679,6 +679,47 @@ def _symbol_variants_for_lookup(symbol: str) -> list[str]:
     return sorted(variants)
 
 
+def _context_trade_id(row: dict[str, Any]) -> str:
+    raw = row.get("context_json")
+    try:
+        ctx = json.loads(raw) if isinstance(raw, str) and raw else {}
+    except json.JSONDecodeError:
+        ctx = {}
+    if not isinstance(ctx, dict):
+        return ""
+    return str(ctx.get("trade_id") or ctx.get("original_trade_id") or "")
+
+
+def strategy_terminal_outcome_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One strategy sample per entry. Ambiguous duplicate opens are left out.
+
+    A single row is kept. Several rows that share an open time are kept only
+    when they name one trade id, the same feature vector, and the same label.
+    Rows with no trade id, or the same trade id and disagreeing labels, are
+    not merged and are not used as strategy samples.
+    """
+    import hashlib
+    from collections import defaultdict
+
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        key = (str(row.get("symbol") or ""), str(row.get("strategy_id") or ""), str(row.get("opened_at_utc") or ""))
+        groups[key].append(row)
+    kept: list[dict[str, Any]] = []
+    for items in groups.values():
+        if len(items) == 1:
+            kept.append(items[0])
+            continue
+        trade_ids = {_context_trade_id(item) for item in items}
+        if len(trade_ids) != 1 or "" in trade_ids:
+            continue
+        hashes = {hashlib.sha256(str(item.get("features_json") or "").encode()).hexdigest() for item in items}
+        labels = {str(item.get("outcome_label") or "") for item in items}
+        if len(hashes) == 1 and len(labels) == 1:
+            kept.append(items[0])
+    return kept
+
+
 def read_recent_outcome_training_rows(
     symbol: str | None = None,
     strategy_id: str | None = None,
@@ -706,10 +747,10 @@ def read_recent_outcome_training_rows(
         with sqlite3.connect(path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+            return strategy_terminal_outcome_rows([dict(r) for r in rows])
     except sqlite3.Error as e:
         logger.warning("read_recent_outcome_training_rows failed: %s", e)
         return []
 
 
-__all__ = ["ensure_ai_canonical_tables", "persist_ai_feature_sample_row", "read_recent_outcome_training_rows"]
+__all__ = ["ensure_ai_canonical_tables", "persist_ai_feature_sample_row", "read_recent_outcome_training_rows", "strategy_terminal_outcome_rows"]

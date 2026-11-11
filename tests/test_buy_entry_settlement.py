@@ -6,6 +6,7 @@ import sqlite3
 
 import pytest
 
+from backend.services.ai_canonical_storage import strategy_terminal_outcome_rows
 from backend.services.buy_entry_settlement import (
     completed_trade_row,
     entry_is_settled,
@@ -160,6 +161,20 @@ def test_setup_score_ignores_the_unsettled_loser_and_counts_the_final_winner(tmp
     assert after["n"] == 1
     assert after["wins"] == 1
     assert after["expectancy_usd"] == pytest.approx(7.0)
+
+
+def test_ambiguous_duplicate_training_rows_are_not_strategy_samples():
+    lone = {"symbol": "BTC/USDT", "strategy_id": "day", "opened_at_utc": "a", "outcome_label": "1", "features_json": "[1]", "context_json": "{}"}
+    ambiguous = [
+        {"symbol": "ETH/USDT", "strategy_id": "day", "opened_at_utc": "b", "outcome_label": "1", "features_json": "[1]", "context_json": "{}"},
+        {"symbol": "ETH/USDT", "strategy_id": "day", "opened_at_utc": "b", "outcome_label": "0", "features_json": "[1]", "context_json": "{}"},
+    ]
+    same = [
+        {"symbol": "SOL/USDT", "strategy_id": "scalp", "opened_at_utc": "c", "outcome_label": "1", "features_json": "[9]", "context_json": '{"trade_id":"t-1"}'},
+        {"symbol": "SOL/USDT", "strategy_id": "scalp", "opened_at_utc": "c", "outcome_label": "1", "features_json": "[9]", "context_json": '{"trade_id":"t-1"}'},
+    ]
+    kept = strategy_terminal_outcome_rows([lone, *ambiguous, *same])
+    assert [row["symbol"] for row in kept] == ["BTC/USDT", "SOL/USDT"]
 
 
 def test_three_execution_rows_are_one_completed_trade(tmp_path):
