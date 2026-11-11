@@ -112,6 +112,69 @@ async def test_partial_stp_expiry_books_the_fill_and_releases_the_rest(tmp_path)
     assert status[0] != "PENDING"
 
 
+@pytest.mark.asyncio
+async def test_open_buy_is_recovered_without_a_sell_or_restart(tmp_path):
+    db = str(tmp_path / "open.db")
+    cid = _arm(db, qty=1.0, limit_px=400)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE strategy_order_intents SET status='OPEN' WHERE client_order_id=?", (cid,))
+    engine = _engine(db)
+    engine._entry_reservations["SCALP_V2::BTC/USDT"] = {"notional": 400.0, "decision_id": "buy-1", "sleeve": "SCALP_V2"}
+    engine._live_service = _Venue(
+        {
+            "id": "77",
+            "clientOrderId": cid,
+            "status": "expired",
+            "filled": 0,
+            "amount": 1,
+            "side": "buy",
+            "info": {"status": "EXPIRED", "executedQty": "0"},
+        }
+    )
+
+    await engine._recover_strategy_order_intents()
+
+    assert engine._live_service.calls == 1
+    assert committed_buy_quote(db, memory_reservations=engine._entry_reservations) == 0
+    with sqlite3.connect(db) as conn:
+        status = conn.execute("SELECT status FROM strategy_order_intents WHERE client_order_id=?", (cid,)).fetchone()[0]
+    assert status == "EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_keeps_the_quote(tmp_path):
+    db = str(tmp_path / "timeout.db")
+    cid = _arm(db, qty=1.0, limit_px=400)
+
+    class _Down:
+        async def fetch_order(self, *_args, **_kwargs):
+            raise TimeoutError("venue")
+
+    engine = _engine(db)
+    engine._entry_reservations["SCALP_V2::BTC/USDT"] = {"notional": 400.0, "decision_id": "buy-1", "sleeve": "SCALP_V2"}
+    engine._live_service = _Down()
+
+    await engine._recover_strategy_order_intents()
+
+    assert float(committed_buy_quote(db, memory_reservations=engine._entry_reservations)) == 400
+    with sqlite3.connect(db) as conn:
+        status = conn.execute("SELECT status FROM strategy_order_intents WHERE client_order_id=?", (cid,)).fetchone()[0]
+    assert status == "PENDING"
+
+
+def test_unknown_fee_does_not_open_a_position(tmp_path):
+    from backend.services.strategy_order_intent import materialize_buy_custody
+
+    db = str(tmp_path / "fee.db")
+    cid = _arm(db, qty=1.0, limit_px=100)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE strategy_order_intents SET status='FEE_PENDING', filled_qty=0.25, filled_cost=25 WHERE client_order_id=?",
+            (cid,),
+        )
+    assert materialize_buy_custody(db) == 0
+
+
 def test_raw_stp_status_is_terminal_and_sell_classifies_afterward():
     assert order_is_working({"status": "EXPIRED_IN_MATCH", "filled": 0}) is False
     assert order_is_working({"status": "expired", "info": {"status": "EXPIRED_IN_MATCH"}}) is False

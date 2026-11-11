@@ -657,6 +657,28 @@ def _finish_venue_lifecycle(db_path: str, order: dict[str, Any], result: dict[st
     return result
 
 
+def unresolved_buy_on_symbol(db_path: str, symbol: str) -> bool:
+    """A BUY on this symbol can still explain venue base. It is not another engine's lot."""
+    if working_buy_intents(db_path, symbol):
+        return True
+    from backend.utils.symbols import normalize_symbol
+
+    want = normalize_symbol(symbol)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT symbol FROM strategy_order_intents
+            WHERE side='BUY' AND status='FEE_PENDING' AND filled_qty > 0
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+    return any(normalize_symbol(str(item["symbol"] or "")) == want for item in row)
+
+
 def working_buy_intents(db_path: str, symbol: str | None = None) -> list[dict[str, Any]]:
     """BUY intents that can still fill. No age cutoff."""
     from backend.utils.symbols import normalize_symbol
@@ -934,7 +956,8 @@ def materialize_buy_custody(db_path: str) -> int:
         rows = conn.execute(
             """
             SELECT * FROM strategy_order_intents
-            WHERE side='BUY' AND filled_qty > 0 AND status NOT IN ('COMMITTED', 'CLOSED', 'NO_VENUE_ORDER')
+            WHERE side='BUY' AND filled_qty > 0
+              AND status NOT IN ('COMMITTED', 'CLOSED', 'NO_VENUE_ORDER', 'FEE_PENDING')
             """
         ).fetchall()
         staged = [dict(row) for row in rows]
@@ -958,6 +981,8 @@ def materialize_buy_custody(db_path: str) -> int:
         finally:
             check.close()
         if owned:
+            if str(intent.get("status") or "") in {"PENDING", "ACKED", "OPEN", "PARTIAL", "WORKING"}:
+                continue
             complete_intent(db_path, trade_id=str(intent["trade_id"]), side="BUY", status="COMMITTED")
             continue
         if closed:

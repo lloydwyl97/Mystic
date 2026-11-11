@@ -3533,6 +3533,11 @@ class PortfolioEngine:
                 # balance; importing it would represent it twice.
                 logger.info("LIVE_RECONCILE_IMPORT_DEFERRED symbol=%s reason=committed_lot_not_in_book", symbol)
                 continue
+            from backend.services.strategy_order_intent import unresolved_buy_on_symbol
+
+            if unresolved_buy_on_symbol(self.db_path, symbol):
+                logger.info("RECONCILE_HELD_UNRESOLVED_BUY symbol=%s — venue base is not imported", symbol)
+                continue
             free_qty = max(0.0, float(free.get(asset, 0) or 0) - held_by_symbol.get(symbol, 0.0))
             if free_qty <= qty_epsilon:
                 continue
@@ -3953,8 +3958,12 @@ class PortfolioEngine:
             # and strands the lot's exit (plan_sell_quantity sells 0).
             try:
                 from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+                from backend.services.strategy_order_intent import unresolved_buy_on_symbol
 
-                stamp_protected_preexisting_dust(self.db_path, symbol, max(0.0, float(exchange_qty) - engine_sum))
+                if unresolved_buy_on_symbol(self.db_path, symbol):
+                    logger.info("RECONCILE_HELD_UNRESOLVED_BUY symbol=%s — surplus is not dust", symbol)
+                else:
+                    stamp_protected_preexisting_dust(self.db_path, symbol, max(0.0, float(exchange_qty) - engine_sum))
             except Exception:
                 logger.debug("PROTECTED_DUST_RESTAMP_SKIPPED %s", symbol, exc_info=True)
             logger.info(
@@ -4224,9 +4233,13 @@ class PortfolioEngine:
                 try:
                     from backend.services.day_entry_spendable import money as _money_surplus
                     from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+                    from backend.services.strategy_order_intent import unresolved_buy_on_symbol
 
-                    surplus = _money_surplus(exchange_qty) - _money_surplus(db_qty)
-                    stamp_protected_preexisting_dust(self.db_path, symbol, max(surplus, 0))
+                    if unresolved_buy_on_symbol(self.db_path, symbol):
+                        logger.info("RECONCILE_HELD_UNRESOLVED_BUY symbol=%s — surplus is not dust", symbol)
+                    else:
+                        surplus = _money_surplus(exchange_qty) - _money_surplus(db_qty)
+                        stamp_protected_preexisting_dust(self.db_path, symbol, max(surplus, 0))
                 except Exception:
                     logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
             else:
@@ -4398,6 +4411,8 @@ class PortfolioEngine:
                 )
                 payload["buy_cash"]["buy_stp_expired_count"] = int(getattr(self, "_buy_stp_expired_count", 0) or 0)
                 payload["buy_cash"]["last_buy_stp_expiration"] = getattr(self, "_last_buy_stp_expiration", None)
+                payload["buy_cash"]["last_buy_probe_at"] = getattr(self, "_last_buy_probe_epoch", None)
+                payload["buy_cash"]["last_buy_probe_status"] = getattr(self, "_last_buy_probe_status", None)
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)
             logger.info("LIVE_RECONCILE_STATE_WRITTEN path=%s time=%s actions=%s", path, now_utc, actions)
@@ -9554,6 +9569,75 @@ class PortfolioEngine:
             self._buys_inflight = max(0, int(getattr(self, "_buys_inflight", 1) or 1) - 1)
             self._buy_seq = int(getattr(self, "_buy_seq", 0) or 0) + 1
 
+    def _grow_recovered_buy_lots(self) -> int:
+        """A later fill on the same buy raises that engine's lot. It does not open a second one."""
+        try:
+            with connect_rw(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT engine_id, trade_id, symbol, filled_qty, filled_gross, filled_cost, filled_fee, filled_cash
+                    FROM strategy_order_intents
+                    WHERE side='BUY' AND filled_qty > 0
+                      AND status NOT IN ('FEE_PENDING', 'CLOSED', 'NO_VENUE_ORDER')
+                    """
+                ).fetchall()
+        except Exception:
+            return 0
+        grown = 0
+        for row in rows:
+            engine_id = str(row[0])
+            trade_id = str(row[1])
+            target = float(row[3] or 0.0)
+            gross = float(row[4] or 0.0) or target
+            price = (float(row[5] or 0.0) / gross) if gross else 0.0
+            cash = float(row[7] or 0.0) or float(row[5] or 0.0)
+            fee = float(row[6] or 0.0)
+            if target <= 0 or price <= 0:
+                continue
+            with connect_rw(self.db_path) as db:
+                current = db.execute(
+                    """
+                    SELECT quantity, original_position_cost, highest_price, lowest_price, entry_price
+                    FROM portfolio_engine_positions
+                    WHERE engine_id=? AND trade_id=? AND IFNULL(quantity, 0) > 0
+                    """,
+                    (engine_id, trade_id),
+                ).fetchone()
+                if current is None or float(current[0] or 0.0) + 1e-8 >= target:
+                    continue
+                previous_cost = float(current[1] or 0.0)
+                old_qty = float(current[0] or 0.0)
+                old_entry = float(current[4] or 0.0) or price
+                high = max(float(current[2] or 0.0), price)
+                low_now = float(current[3] or 0.0)
+                low = price if low_now <= 0 else min(low_now, price)
+                db.execute(
+                    """
+                    UPDATE portfolio_engine_positions
+                    SET quantity=?, entry_price=?, entry_fee=?, original_position_cost=?,
+                        highest_price=?, lowest_price=?
+                    WHERE engine_id=? AND trade_id=?
+                    """,
+                    (target, price, fee, cash, high, low, engine_id, trade_id),
+                )
+                delta = cash - previous_cost
+                if delta > 0 and db.execute("SELECT 1 FROM portfolio_engine_ledger WHERE id=1").fetchone() is not None:
+                    notion = target * price - old_qty * old_entry
+                    db.execute(
+                        """
+                        UPDATE portfolio_engine_ledger
+                        SET cash_balance = cash_balance - ?,
+                            positions_value = positions_value + ?,
+                            total_equity = total_equity + ?
+                        WHERE id=1
+                        """,
+                        (delta, max(0.0, notion), max(0.0, notion) - delta),
+                    )
+                db.commit()
+            grown += 1
+            logger.warning("RECOVERED_BUY_GROWTH engine=%s trade=%s qty=%.8f", engine_id, trade_id, target)
+        return grown
+
     async def restore_filled_asset_custody(self) -> int:
         """Book each venue fill whose open transaction never committed. Once."""
         from backend.services.filled_asset_custody import (
@@ -9567,8 +9651,9 @@ class PortfolioEngine:
 
         with contextlib.suppress(Exception):
             materialize_buy_custody(self.db_path)
+        grown = self._grow_recovered_buy_lots()
 
-        booked = 0
+        booked = grown
         for row in open_rows(self.db_path):
             engine_id = str(row["engine_id"])
             trade_id = str(row["trade_id"])
@@ -9720,6 +9805,8 @@ class PortfolioEngine:
 
         if getattr(self, "_live_service", None) is None or not getattr(self, "db_path", None):
             return
+        self._last_buy_probe_epoch = time.time()
+        self._last_buy_probe_status = "started"
         intents = working_buy_intents(self.db_path, symbol)
         for intent in intents:
             cid = str(intent.get("client_order_id") or "")
@@ -9912,15 +9999,17 @@ class PortfolioEngine:
 
     async def _recover_strategy_order_intents(self) -> int:
         """Find venue orders for intents that died before a fill was stored, then book them once."""
-        from backend.services.strategy_order_intent import intents_to_probe, mark_intent_absent, working_sell_intents
+        from backend.services.strategy_order_intent import intents_to_probe, mark_intent_absent, working_buy_intents, working_sell_intents
 
         if self._live_service is None:
             return 0
         self._last_sell_probe_epoch = time.time()
+        self._last_buy_probe_epoch = time.time()
+        self._last_buy_probe_status = "started"
         probed = 0
         seen: set[str] = set()
         batch: list[dict[str, Any]] = []
-        for intent in list(intents_to_probe(self.db_path)) + working_sell_intents(self.db_path):
+        for intent in list(intents_to_probe(self.db_path)) + working_sell_intents(self.db_path) + working_buy_intents(self.db_path):
             cid = str(intent.get("client_order_id") or "")
             if not cid or cid in seen:
                 continue
@@ -9931,6 +10020,7 @@ class PortfolioEngine:
             symbol = str(intent.get("symbol") or "")
             found = await self._probe_intent(intent)
             if found.get("unconfirmed"):
+                self._last_buy_probe_status = "unconfirmed" if str(intent.get("side") or "").upper() == "BUY" else self._last_buy_probe_status
                 continue
             if found.get("absent"):
                 mark_intent_absent(self.db_path, cid)
@@ -9943,13 +10033,20 @@ class PortfolioEngine:
                         symbol=symbol,
                         sleeve=str(intent.get("engine_id") or ""),
                     )
+                if str(intent.get("side") or "").upper() == "BUY":
+                    self._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), sleeve=str(intent.get("engine_id") or ""))
+                    self._release_entry_reservation(symbol, sleeve=str(intent.get("engine_id") or ""))
+                    self._last_buy_probe_status = "absent"
                 continue
             await self._apply_probed_order(found["order"], symbol, cid)
             probed += 1
+            if str(intent.get("side") or "").upper() == "BUY":
+                self._last_buy_probe_status = "applied"
         booked = await self.restore_filled_asset_custody()
         if booked:
             await self._load_positions_from_sqlite()
             await self._load_ledger_from_sqlite()
+            self.note_sell_symbol_released()
         return probed + booked
 
     async def _load_positions_from_sqlite(self, *, allow_mutations: bool = True, during_sell: bool = False) -> int:

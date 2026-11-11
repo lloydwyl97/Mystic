@@ -295,6 +295,9 @@ class BuyCashView:
     oldest_created_at: float
     working_buy_count: int = 0
     working_buys: list[dict[str, Any]] | None = None
+    unresolved_buy_count: int = 0
+    oldest_unresolved_buy_age_sec: float | None = None
+    partial_buy_count: int = 0
 
     @property
     def oldest_age_sec(self) -> float | None:
@@ -323,6 +326,9 @@ class BuyCashView:
             "cash_sync_held": bool(cash_sync_held),
             "working_buy_count": self.working_buy_count,
             "working_buys": list(self.working_buys or []),
+            "unresolved_buy_count": self.unresolved_buy_count,
+            "oldest_unresolved_buy_age_sec": self.oldest_unresolved_buy_age_sec,
+            "partial_buy_count": self.partial_buy_count,
         }
 
 
@@ -426,6 +432,8 @@ def buy_cash_view(
         note_age(created)
 
     committed = pending + working + executed
+    unresolved = [item for item in intents if item.remaining_quote > 0 or item.status == "FEE_PENDING"]
+    oldest_unresolved = min((item.created_at for item in unresolved if item.created_at > 0), default=0.0)
     working_rows = [
         {
             "engine": item.engine,
@@ -447,6 +455,9 @@ def buy_cash_view(
         oldest_created_at=oldest,
         working_buy_count=len(working_rows),
         working_buys=working_rows,
+        unresolved_buy_count=len(unresolved),
+        oldest_unresolved_buy_age_sec=None if oldest_unresolved <= 0 else round(max(0.0, stamp - oldest_unresolved), 3),
+        partial_buy_count=sum(1 for item in intents if item.status == "PARTIAL"),
     )
 
 
