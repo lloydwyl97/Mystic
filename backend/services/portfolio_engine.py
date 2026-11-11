@@ -3998,11 +3998,20 @@ class PortfolioEngine:
         mark = float((getattr(self, "_position_mark_prices", None) or {}).get(symbol) or 0.0) or next(
             (float(getattr(p, "entry_price", 0) or 0) for p in lots if float(getattr(p, "entry_price", 0) or 0) > 0), 0.0
         )
-        if (owned - float(exchange_qty)) * mark > SHORTFALL_PAUSE_USD:
+        # The known reservation is not an unexplained loss. Only the gap below
+        # the reservation-aware expected venue quantity can pause entries.
+        unexplained = max(0.0, expected + float(held_dust or 0.0) - float(exchange_qty))
+        if unexplained * mark > SHORTFALL_PAUSE_USD:
             if not self._trading_paused:
                 self._trading_paused = True
                 self._pause_reason = f"{SHORTFALL_PAUSE_PREFIX}{symbol}"
-            logger.critical("ENGINE_QTY_SHORTFALL_PAUSE symbol=%s missing=%.12g usd=%.2f", symbol, owned - float(exchange_qty), (owned - float(exchange_qty)) * mark)
+            logger.critical(
+                "ENGINE_QTY_SHORTFALL_PAUSE symbol=%s unexplained=%.12g reserved=%.12g usd=%.2f",
+                symbol,
+                unexplained,
+                reserved,
+                unexplained * mark,
+            )
 
     def _check_single_lot_shortfall(self, symbol: str, position: Any, exchange_qty: float, reserved_qty: float = 0.0) -> None:
         """Lot plus held engine dust above the balance is never cut by guessing; it pauses entries."""

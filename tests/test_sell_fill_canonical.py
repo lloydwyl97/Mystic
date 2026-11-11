@@ -27,6 +27,7 @@ from backend.services.strategy_order_intent import (
     mark_exchange_order,
     record_sell_attempt_result,
     reserved_unbooked_sell_qty,
+    sell_intent_blocks,
     sell_quantity_state,
     unbooked_protective_sells,
 )
@@ -306,3 +307,87 @@ def test_partial_mytrades_does_not_become_a_close_and_empty_read_is_not_a_zero_f
     )
     assert sell_commission_known(complete) is True
     assert extract_live_commission(complete, symbol="SOL/USDT", fill_price=100.0).usd == pytest.approx(0.04)
+
+
+def _pending(db: str, engine: str, trade: str, qty: float, order_id: str) -> None:
+    cid = allocate_intent(db, engine_id=engine, trade_id=trade, symbol="BTC/USDT", side="SELL", quantity=qty, limit_price=100.0)
+    record_sell_attempt_result(
+        db,
+        client_order_id=cid,
+        order={"id": order_id, "filled": qty, "info": {"executedQty": str(qty), "cummulativeQuoteQty": str(qty * 100)}},
+        outcome="",
+    )
+
+
+def test_day_and_scalp_reservations_stay_on_their_own_lots(tmp_path):
+    db = str(tmp_path / "both.db")
+    _pending(db, "DAY_V2", "day-btc", 0.30, "D1")
+    day = sell_quantity_state(db, "day-btc", 0.60)
+    scalp = sell_quantity_state(db, "scalp-btc", 0.40)
+    assert day["ledger_qty"] == pytest.approx(0.60)
+    assert day["executed_unbooked_qty"] == pytest.approx(0.30)
+    assert day["available_to_sell_qty"] == pytest.approx(0.30)
+    assert day["economic_open_qty"] == pytest.approx(0.30)
+    assert scalp["reserved_qty"] == pytest.approx(0.0)
+    assert scalp["available_to_sell_qty"] == pytest.approx(0.40)
+    assert scalp["economic_open_qty"] == pytest.approx(0.40)
+    assert day["economic_open_qty"] + scalp["economic_open_qty"] == pytest.approx(0.70)
+    _pending(db, "SCALP_V2", "scalp-btc", 0.15, "S1")
+    day2 = sell_quantity_state(db, "day-btc", 0.60)
+    scalp2 = sell_quantity_state(db, "scalp-btc", 0.40)
+    assert day2["executed_unbooked_qty"] == pytest.approx(0.30)
+    assert scalp2["executed_unbooked_qty"] == pytest.approx(0.15)
+    assert day2["available_to_sell_qty"] == pytest.approx(0.30)
+    assert scalp2["available_to_sell_qty"] == pytest.approx(0.25)
+
+
+def test_working_day_sell_blocks_the_symbol_and_fee_pending_does_not(tmp_path):
+    db = str(tmp_path / "block.db")
+    cid = allocate_intent(db, engine_id="DAY_V2", trade_id="day-btc", symbol="BTC/USDT", side="SELL", quantity=0.40, limit_price=100.0)
+    mark_exchange_order(db, cid, "LIVE", status="OPEN")
+    assert sell_intent_blocks(db, "BTC/USDT") is True
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE strategy_order_intents SET status='FEE_PENDING', filled_qty=0.30 WHERE client_order_id=?", (cid,))
+        conn.commit()
+    assert sell_intent_blocks(db, "BTC/USDT") is False
+    state = sell_quantity_state(db, "day-btc", 0.60)
+    assert state["available_to_sell_qty"] == pytest.approx(0.30)
+    assert sell_quantity_state(db, "scalp-btc", 0.40)["available_to_sell_qty"] == pytest.approx(0.40)
+
+
+@pytest.mark.asyncio
+async def test_dual_engine_fee_pending_does_not_move_either_lot_or_pause(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from backend.services import live_exchange_equity
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    db = str(tmp_path / "dual.db")
+    _pending(db, "DAY_V2", "day-btc", 0.30, "D1")
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = db
+    engine._trading_paused = False
+    engine._pause_reason = ""
+    engine._metrics_reconciliation_adjustments = 0
+    engine._position_mark_prices = {"BTC/USDT": 100000.0}
+    engine._enforce_lot_ownership = lambda *_a, **_k: _async_false()
+    engine._shrink_unproven_dust_bucket = lambda *_a, **_k: _async_false()
+    engine._sync_protected_remainder = lambda *_a, **_k: _async_false()
+    engine._held_engine_dust_qty = lambda _s: 0.0
+    engine._floor_to_step = lambda q, _step: q
+    monkeypatch.setattr(live_exchange_equity, "stamp_protected_preexisting_dust", lambda *_a, **_k: None)
+    day = SimpleNamespace(quantity=0.60, entry_price=100000.0, engine_id="DAY_V2", trade_id="day-btc", status="ACTIVE")
+    scalp = SimpleNamespace(quantity=0.40, entry_price=100000.0, engine_id="SCALP_V2", trade_id="scalp-btc", status="ACTIVE")
+    await engine._reconcile_dual_engine_lots(symbol="BTC/USDT", lots=[day, scalp], exchange_qty=0.70, qty_step=0.00001, source="test")
+    assert day.quantity == pytest.approx(0.60)
+    assert scalp.quantity == pytest.approx(0.40)
+    assert engine._trading_paused is False
+    # One cent of unexplained base is not the known 0.30 reservation.
+    await engine._reconcile_dual_engine_lots(symbol="BTC/USDT", lots=[day, scalp], exchange_qty=0.70 - 0.000001, qty_step=0.00000001, source="test")
+    assert day.quantity == pytest.approx(0.60)
+    assert scalp.quantity == pytest.approx(0.40)
+    assert engine._trading_paused is False
+
+
+async def _async_false(*_a, **_k):
+    return False
