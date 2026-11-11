@@ -3218,9 +3218,12 @@ class PortfolioEngine:
             # CRITICAL: Use FREE USDT so free_usdt in governor matches Binance US "free" balance.
             # An unbooked sell's proceeds are already in that free balance. Adopting it
             # and later crediting the close would count the same USDT twice.
+            from backend.services.buy_cash_commitment import has_unbooked_buy_commitment
             from backend.services.strategy_order_intent import has_unbooked_executed_sell
 
-            if has_unbooked_executed_sell(self.db_path):
+            if has_unbooked_buy_commitment(self.db_path):
+                logger.warning("CASH_SYNC_HELD_UNBOOKED_BUY source=principal_sync local=%.8f venue_free=%.8f", float(self.cash_balance or 0.0), usdt_balance)
+            elif has_unbooked_executed_sell(self.db_path):
                 logger.warning("CASH_SYNC_HELD_UNBOOKED_SELL source=principal_sync local=%.8f venue_free=%.8f", float(self.cash_balance or 0.0), usdt_balance)
             else:
                 self.cash_balance = usdt_balance
@@ -3421,9 +3424,12 @@ class PortfolioEngine:
             await self._recompute_positions_values()
             # Set cash/available from FREE USDT so governor free_usdt matches Binance at startup
             usdt_free = float(free_balances.get("USDT", 0) or 0)
+            from backend.services.buy_cash_commitment import has_unbooked_buy_commitment
             from backend.services.strategy_order_intent import has_unbooked_executed_sell
 
-            if has_unbooked_executed_sell(self.db_path):
+            if has_unbooked_buy_commitment(self.db_path):
+                logger.warning("CASH_SYNC_HELD_UNBOOKED_BUY source=bootstrap local=%.8f venue_free=%.8f", float(self.cash_balance or 0.0), usdt_free)
+            elif has_unbooked_executed_sell(self.db_path):
                 logger.warning("CASH_SYNC_HELD_UNBOOKED_SELL source=bootstrap local=%.8f venue_free=%.8f", float(self.cash_balance or 0.0), usdt_free)
             else:
                 self.cash_balance = usdt_free
@@ -4277,8 +4283,12 @@ class PortfolioEngine:
         threshold = float(os.getenv("CASH_DRIFT_THRESHOLD_USD", "1.00"))
         require_no_orders = os.getenv("CASH_SYNC_REQUIRE_NO_OPEN_ORDERS", "true").lower() == "true"
 
+        from backend.services.buy_cash_commitment import has_unbooked_buy_commitment
         from backend.services.strategy_order_intent import has_unbooked_executed_sell
 
+        if has_unbooked_buy_commitment(self.db_path):
+            self._cash_sync_skip_log("UNBOOKED_BUY", venue=f"{float(exchange_usdt):.2f}", local=f"{float(self.cash_balance or 0.0):.2f}")
+            return False
         if has_unbooked_executed_sell(self.db_path):
             self._cash_sync_skip_log("UNBOOKED_SELL", venue=f"{float(exchange_usdt):.2f}", local=f"{float(self.cash_balance or 0.0):.2f}")
             return False
@@ -4372,6 +4382,20 @@ class PortfolioEngine:
                 snap["request_weight"] = request_weight_status()
                 snap["blocked_exit"] = getattr(self, "_symbol_sell_block", None)
                 payload["sell_protection"] = snap
+            with contextlib.suppress(Exception):
+                from backend.services.buy_cash_commitment import buy_cash_view, has_unbooked_buy_commitment
+                from backend.services.strategy_order_intent import has_unbooked_executed_sell
+
+                view = buy_cash_view(
+                    self.db_path,
+                    memory_reservations=getattr(self, "_entry_reservations", None) or {},
+                    pending_orders=getattr(self, "_pending_orders", None) or {},
+                    trailing_arms=getattr(self, "_trailing_buy_arms", None) or {},
+                )
+                payload["buy_cash"] = view.as_dict(
+                    self.cash_balance,
+                    cash_sync_held=has_unbooked_buy_commitment(self.db_path) or has_unbooked_executed_sell(self.db_path),
+                )
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)
             logger.info("LIVE_RECONCILE_STATE_WRITTEN path=%s time=%s actions=%s", path, now_utc, actions)
@@ -9849,6 +9873,15 @@ class PortfolioEngine:
                 continue
             if found.get("absent"):
                 mark_intent_absent(self.db_path, cid)
+                with contextlib.suppress(Exception):
+                    from backend.services.day_entry_reservations import release_reservation
+
+                    release_reservation(self.db_path, decision_id=str(intent.get("decision_id") or ""))
+                    release_reservation(
+                        self.db_path,
+                        symbol=symbol,
+                        sleeve=str(intent.get("engine_id") or ""),
+                    )
                 continue
             await self._apply_probed_order(found["order"], symbol, cid)
             probed += 1
@@ -11384,15 +11417,21 @@ class PortfolioEngine:
             self.last_buy_reject_reason = budget_reason
             return None
 
-        # 8. Cash gate and live order inside the global cash lock
+        # 8. Cash gate and live order inside the global cash lock.
+        # The lock covers the check and the claim. DAY may already have reserved
+        # quote and released this lock, so the raw ledger balance is not spendable.
         async with self._global_cash_lock:
-            free_cash = float(self._available_balance or 0)
+            from backend.services.day_entry_spendable import money as _scalp_money
+
+            committed_quote = self._pending_buy_notional()
+            free_cash = float(_scalp_money(self._available_balance) - _scalp_money(committed_quote))
             if notional > free_cash:
                 logger.info(
-                    "SCALP_V2_BUY_BLOCKED symbol=%s INSUFFICIENT_CASH notional=%.4f free=%.4f",
+                    "SCALP_V2_BUY_BLOCKED symbol=%s INSUFFICIENT_CASH notional=%.4f free=%.4f committed=%.4f",
                     norm,
                     notional,
                     free_cash,
+                    float(committed_quote),
                 )
                 self.last_buy_reject_reason = "INSUFFICIENT_EXECUTABLE_CASH"
                 return None
@@ -11445,6 +11484,13 @@ class PortfolioEngine:
                 client_order_id=scalp_client_id,
             )
             if not live_order:
+                from backend.services.buy_cash_commitment import buy_failure_intent_status, buy_failure_keeps_quote
+
+                _scalp_outcome = last_live_order_outcome()
+                self.last_buy_reject_reason = _scalp_outcome or "EXCHANGE_REJECTED"
+                if buy_failure_keeps_quote(_scalp_outcome):
+                    logger.error("BUY_CASH_HELD_UNCONFIRMED symbol=%s engine=SCALP_V2 outcome=%s client=%s", norm, _scalp_outcome, scalp_client_id)
+                    return None
                 release_claim(
                     self.db_path,
                     reservation_id=reservation_id,
@@ -11452,7 +11498,12 @@ class PortfolioEngine:
                     symbol=norm,
                     engine_id=SCALP_V2_ENGINE_ID,
                 )
-                self.last_buy_reject_reason = last_live_order_outcome() or "EXCHANGE_REJECTED"
+                _dead = buy_failure_intent_status(_scalp_outcome)
+                if _dead and scalp_client_id:
+                    with contextlib.suppress(Exception):
+                        from backend.services.strategy_order_intent import release_unfilled_intent
+
+                        release_unfilled_intent(self.db_path, str(scalp_client_id), _dead)
                 logger.error("SCALP_V2_BUY_FAILED symbol=%s NOT_FILLED outcome=%s", norm, self.last_buy_reject_reason)
                 return None
 
@@ -12671,6 +12722,32 @@ class PortfolioEngine:
             await self._record_reject(symbol, "BUY", "ENGINE_IDENTITY_MISSING", "ENGINE_IDENTITY_MISSING", decision_id=decision_id, explainability=explainability)
             return None
         _entry_ref_decision_ts = time.time()
+        from backend.services.day_entry_spendable import money as _pre_money
+
+        _pre_free = _pre_money(self._available_balance) - _pre_money(
+            self._pending_buy_notional(
+                exclude_decision_id=str(decision_id or ""),
+                exclude_symbol=normalized_symbol,
+                exclude_engine=str(fill_engine_id or ""),
+            )
+        )
+        if _pre_free <= 0:
+            self.last_buy_reject_reason = "INSUFFICIENT_CASH_WITH_PENDING"
+            logger.warning(
+                "BUY_BLOCKED_COMMITTED_CASH symbol=%s engine=%s free=%s — book not requested",
+                normalized_symbol,
+                fill_engine_id,
+                _pre_free,
+            )
+            await self._record_reject(
+                symbol,
+                "BUY",
+                "INSUFFICIENT_CASH_WITH_PENDING",
+                "EXECUTABLE_CASH",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            return None
         preflight = await run_protected_preflight(
             symbol=normalized_symbol,
             side="BUY",
@@ -12767,8 +12844,9 @@ class PortfolioEngine:
         own_res, own_ns = self._own_entry_reservation(normalized_symbol, str(decision_id or ""))
         own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
         pending_other = self._pending_buy_notional(
-            exclude_symbol=own_ns if own_reserved else "",
-            exclude_decision_id=str(decision_id or "") if own_reserved else "",
+            exclude_symbol=own_ns if own_reserved else normalized_symbol,
+            exclude_decision_id=str(decision_id or ""),
+            exclude_engine=str(fill_engine_id or ""),
         )
         constraints = self._symbol_constraints.get(symbol) or self._symbol_constraints.get(normalized_symbol) or {}
         cash_plan = plan_executable_buy(
@@ -12977,6 +13055,7 @@ class PortfolioEngine:
         # LiveAdapter gate: refuse unless EXECUTION_MODE=live AND LIVE_TRADES_ALLOWED=true
         # =================================================================
         live_order_buy = None
+        _buy_client_allocated = False
         if self._live_execution_enabled and self._live_service and can_place_live_orders_sync()[0]:
             try:
                 exchange_symbol = _to_api_symbol(symbol)
@@ -13002,6 +13081,7 @@ class PortfolioEngine:
                     regime=str(getattr(explainability, "regime", "") or ""),
                     feature_version=str(getattr(explainability, "feature_version", "") or ""),
                 )
+                _buy_client_allocated = True
                 live_order_buy = await execute_protected_limit_live(
                     self._live_service,
                     symbol=exchange_symbol,
@@ -13012,9 +13092,25 @@ class PortfolioEngine:
                 )
 
                 if not live_order_buy:
-                    error_msg = "PROTECTED_LIMIT_BUY_NOT_FILLED"
+                    from backend.services.buy_cash_commitment import buy_failure_intent_status, buy_failure_keeps_quote
+                    from backend.services.protected_limit_execution import last_live_order_outcome
+
+                    _buy_outcome = last_live_order_outcome()
+                    error_msg = _buy_outcome or "PROTECTED_LIMIT_BUY_NOT_FILLED"
                     self.last_buy_failure_reason = error_msg
-                    logger.error("LIVE_BUY_FAILED: %s - %s", exchange_symbol, error_msg)
+                    if buy_failure_keeps_quote(_buy_outcome):
+                        logger.error("BUY_CASH_HELD_UNCONFIRMED symbol=%s outcome=%s client=%s", exchange_symbol, _buy_outcome, client_order_id)
+                    else:
+                        logger.error("LIVE_BUY_FAILED: %s - %s", exchange_symbol, error_msg)
+                        if _entry_reserved:
+                            self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                            _entry_reserved = False
+                        _dead = buy_failure_intent_status(_buy_outcome)
+                        if _dead and client_order_id:
+                            with contextlib.suppress(Exception):
+                                from backend.services.strategy_order_intent import release_unfilled_intent
+
+                                release_unfilled_intent(self.db_path, str(client_order_id), _dead)
                     await self._record_reject(
                         symbol,
                         "BUY",
@@ -13028,9 +13124,6 @@ class PortfolioEngine:
                             decision_id,
                             {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"LIVE_BUY_FAILED:{error_msg}"},
                         )
-                    if _entry_reserved:
-                        self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
-                        _entry_reserved = False
                     return None
 
                 live_order_buy = live_order_buy if isinstance(live_order_buy, dict) else {}
@@ -13058,6 +13151,11 @@ class PortfolioEngine:
                     if _entry_reserved:
                         self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
                         _entry_reserved = False
+                    if client_order_id:
+                        with contextlib.suppress(Exception):
+                            from backend.services.strategy_order_intent import release_unfilled_intent
+
+                            release_unfilled_intent(self.db_path, str(client_order_id), "CANCELED")
                     return None
                 quantity = float(filled_qty)
                 if avg_price and float(avg_price) > 0:
@@ -13174,6 +13272,9 @@ class PortfolioEngine:
                         decision_id,
                         {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"LIVE_BUY_ERROR:{e!s}"},
                     )
+                if _buy_client_allocated and _entry_reserved:
+                    logger.error("BUY_CASH_HELD_UNCONFIRMED symbol=%s outcome=exception client=%s", symbol, client_order_id)
+                    return None
                 if _entry_reserved:
                     self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
                     _entry_reserved = False
@@ -13196,7 +13297,11 @@ class PortfolioEngine:
         # Keep this entry's reservation active so concurrent buys cannot consume its cash
         # between this check and the debit below.
         async with self._global_cash_lock:
-            pending_other = self._pending_buy_notional(exclude_symbol=symbol)
+            pending_other = self._pending_buy_notional(
+                exclude_symbol=symbol,
+                exclude_decision_id=str(decision_id or ""),
+                exclude_engine=str(fill_engine_id or ""),
+            )
             from backend.services.day_entry_spendable import money as _money_cash
 
             free_cash = float(_money_cash(self._available_balance) - _money_cash(pending_other))
@@ -16984,31 +17089,24 @@ class PortfolioEngine:
         out |= self._pending_buy_order_symbols()
         return out
 
-    def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = ""):
-        from backend.services.day_entry_spendable import money
+    def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = "", exclude_engine: str = ""):
+        """Account-wide quote a new buy cannot spend.
 
-        ex = normalize_symbol(exclude_symbol) if exclude_symbol else ""
-        skip_did = str(exclude_decision_id or "").strip()
-        n = money(0)
-        for sym, r in (getattr(self, "_entry_reservations", None) or {}).items():
-            if skip_did and str((r or {}).get("decision_id") or "") == skip_did:
-                continue
-            if ex and normalize_symbol(sym) == ex:
-                continue
-            n += money((r or {}).get("notional") or 0)
-        for p in (getattr(self, "_pending_orders", None) or {}).values():
-            if str(getattr(p, "side", "") or "").upper() != "BUY":
-                continue
-            if ex and normalize_symbol(getattr(p, "symbol", "") or "") == ex:
-                continue
-            n += money(getattr(p, "remaining_qty", 0) or 0) * money(getattr(p, "price", 0) or 0)
-        for sym, arm in (getattr(self, "_trailing_buy_arms", None) or {}).items():
-            if ex and normalize_symbol(sym) == ex:
-                continue
-            qty = money(getattr(arm, "quantity", 0) or 0)
-            px = money(getattr(arm, "last_ask", 0) or getattr(arm, "initial_ask", 0) or 0)
-            n += qty * px
-        return n
+        Persistent reservations, working BUY intents, and in-memory holds are
+        one figure. The caller's own pre-claim is omitted when its engine and
+        symbol are passed; every other symbol and the other engine stay in.
+        """
+        from backend.services.buy_cash_commitment import committed_buy_quote
+
+        return committed_buy_quote(
+            str(getattr(self, "db_path", "") or ""),
+            memory_reservations=getattr(self, "_entry_reservations", None) or {},
+            pending_orders=getattr(self, "_pending_orders", None) or {},
+            trailing_arms=getattr(self, "_trailing_buy_arms", None) or {},
+            exclude_symbol=exclude_symbol,
+            exclude_decision_id=exclude_decision_id,
+            exclude_engine=exclude_engine,
+        )
 
     def _own_entry_reservation(self, symbol: str, decision_id: str = "", sleeve: str = "") -> tuple[dict[str, Any], str]:
         ns = normalize_symbol(symbol)
@@ -17064,6 +17162,10 @@ class PortfolioEngine:
             return False, "ENTRY_ALREADY_RESERVED"
         if ns in self._pending_buy_order_symbols():
             return False, "ENTRY_PENDING_ORDER"
+        from backend.services.buy_cash_commitment import foreign_working_buy
+
+        if eff_engine in ("DAY_V2", "SCALP_V2") and foreign_working_buy(str(self.db_path), eff_engine, ns, did):
+            return False, "ENTRY_PENDING_ORDER"
         if eff_engine in ("DAY_V2", "SCALP_V2"):
             engine_cap = SCALP_MAX_OPEN_POSITIONS if eff_engine == "SCALP_V2" else DAY_MAX_OPEN_POSITIONS
             engine_held = self._engine_held_count(eff_engine)
@@ -17083,7 +17185,11 @@ class PortfolioEngine:
                 return False, "MAX_POSITIONS_WITH_PENDING"
         from backend.services.day_entry_spendable import plan_reservation, spendable_quote
 
-        pending_n = self._pending_buy_notional(exclude_decision_id=did)
+        pending_n = self._pending_buy_notional(
+            exclude_decision_id=did,
+            exclude_symbol=ns,
+            exclude_engine=eff_engine,
+        )
         spendable = spendable_quote(
             account_cash=self._available_balance,
             other_reservations=pending_n,
@@ -17480,6 +17586,7 @@ class PortfolioEngine:
         pending_notional = self._pending_buy_notional(
             exclude_symbol=own_ns if own_reserved else "",
             exclude_decision_id=str(decision_id or "") if own_reserved else "",
+            exclude_engine=str(engine_id or "") if own_reserved else "",
         )
         free_cash = money(self._available_balance) - money(pending_notional)
         if free_cash <= 0:
@@ -24356,7 +24463,7 @@ class PortfolioEngine:
 
         Returns ledger with:
         - principal: Initial capital
-        - cash_balance: Available cash
+        - cash_balance: Ledger cash. Spendable cash is available_to_buy.
         - positions_value: Current value of all positions (cost basis)
         - realized_pnl: Closed trade profits/losses
         - unrealized_pnl: Open position mark-to-market
@@ -24388,6 +24495,16 @@ class PortfolioEngine:
             )
 
         mode_pnl = self._mode_aware_pnl_fields()
+        buy_cash: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            from backend.services.buy_cash_commitment import buy_cash_view
+
+            buy_cash = buy_cash_view(
+                self.db_path,
+                memory_reservations=self._entry_reservations,
+                pending_orders=getattr(self, "_pending_orders", None) or {},
+                trailing_arms=getattr(self, "_trailing_buy_arms", None) or {},
+            ).as_dict(self.cash_balance, cash_sync_held=False)
         return {
             # LEDGER STATE (canonical)
             "principal": self.principal,
@@ -24413,6 +24530,12 @@ class PortfolioEngine:
             "open_positions_count": sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING"),
             "dust_pending_count": sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "available_to_buy": buy_cash.get("available_to_buy", self.cash_balance),
+            "pending_buy_quote": buy_cash.get("pending_buy_quote", 0.0),
+            "working_buy_quote": buy_cash.get("working_buy_quote", 0.0),
+            "executed_unbooked_buy_quote": buy_cash.get("executed_unbooked_buy_quote", 0.0),
+            "buy_cash_reservation_count": buy_cash.get("buy_cash_reservation_count", 0),
+            "oldest_buy_reservation_age_sec": buy_cash.get("oldest_buy_reservation_age_sec"),
         }
 
     def _coin_status_keys(self, symbol: str) -> list[str]:

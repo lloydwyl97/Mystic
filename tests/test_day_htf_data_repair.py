@@ -522,7 +522,7 @@ def test_protected_limit_no_fill_label_is_specific():
 
 def test_no_fill_label_does_not_touch_execution_reason():
     src = (REPO / "backend/services/portfolio_engine.py").read_text()
-    sites = [m.start() for m in re.finditer(r'error_msg = "PROTECTED_LIMIT_BUY_NOT_FILLED"', src)]
+    sites = [m.start() for m in re.finditer(r'error_msg = .*"PROTECTED_LIMIT_BUY_NOT_FILLED"', src)]
     assert len(sites) == 2
     for s in sites:
         window = src[s : s + 400]

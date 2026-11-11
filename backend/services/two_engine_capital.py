@@ -292,7 +292,15 @@ def check_engine_budget(
     cost = max(0.0, float(order_cost or 0))
     if cost > budget.remaining_budget:
         return False, ENGINE_BUDGET_EXCEEDED, snap
-    physical = snap.free_cash - snap.reservations_total - max(0.0, float(fee_reserve or 0))
+    from backend.services.buy_cash_commitment import committed_buy_quote
+
+    held_quote = float(
+        committed_buy_quote(
+            db_path,
+            exclude_reservation_id=exclude_reservation_id,
+        )
+    )
+    physical = snap.free_cash - held_quote - max(0.0, float(fee_reserve or 0))
     if cost > max(0.0, physical):
         return False, PHYSICAL_CASH_UNAVAILABLE, snap
     return True, "", snap

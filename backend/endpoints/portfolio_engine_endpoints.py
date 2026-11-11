@@ -272,7 +272,7 @@ def _read_operator_status_from_sqlite_sync() -> dict[str, Any] | None:
         pos_row = cursor.fetchone()
         open_positions_count = pos_row[0] if pos_row else 0
 
-        return {
+        payload = {
             "cash_balance": float(cash_balance or 0),
             "total_equity": float(total_equity or 0),
             "positions_value": float(positions_value or 0),
@@ -282,6 +282,14 @@ def _read_operator_status_from_sqlite_sync() -> dict[str, Any] | None:
             "pause_reason": pause_reason or "",
             "open_positions_count": int(open_positions_count),
         }
+        try:
+            from backend.services.buy_cash_commitment import buy_cash_view
+
+            payload.update(buy_cash_view(DATABASE_PATH).as_dict(cash_balance, cash_sync_held=False))
+            payload["cash_balance"] = float(cash_balance or 0)
+        except Exception:
+            logger.debug("BUY_CASH_STATUS_UNAVAILABLE", exc_info=True)
+        return payload
     except Exception as e:
         logger.debug("Operator status SQLite read failed: %s", e)
         return None

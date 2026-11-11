@@ -2147,16 +2147,30 @@ class PortfolioEngineIntegration:
             _note_exact(db_path, cand, funded=False, reason=str(gate_reason))
             return
 
+        from backend.services.day_entry_spendable import money as _claim_money
         from backend.services.two_engine_claim import claim_symbol, release_claim
 
-        claimed, claim_reason, reservation_id = claim_symbol(
-            db_path,
-            norm,
-            "DAY_V2",
-            str(signal.opportunity_id),
-            float(notional),
-            positions=self.engine.open_positions,
-        )
+        def _claim_day_quote():
+            pending_fn = getattr(self.engine, "_pending_buy_notional", None)
+            if callable(pending_fn):
+                free = _claim_money(getattr(self.engine, "_available_balance", 0)) - _claim_money(pending_fn())
+                if _claim_money(notional) > free:
+                    return False, "INSUFFICIENT_CASH_WITH_PENDING", ""
+            return claim_symbol(
+                db_path,
+                norm,
+                "DAY_V2",
+                str(signal.opportunity_id),
+                float(notional),
+                positions=getattr(self.engine, "open_positions", None),
+            )
+
+        cash_lock = getattr(self.engine, "_global_cash_lock", None)
+        if cash_lock is None:
+            claimed, claim_reason, reservation_id = _claim_day_quote()
+        else:
+            async with cash_lock:
+                claimed, claim_reason, reservation_id = _claim_day_quote()
         if not claimed:
             record_day_decision(db_path, symbol, claim_reason, cycle_ts=as_of, closest=signal.setup)
             logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, claim_reason)

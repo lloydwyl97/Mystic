@@ -1303,6 +1303,9 @@ async def execute_protected_limit_live(
             last["_mystic_partial_fill"] = True
             last["_mystic_ioc_incomplete"] = True
             return _stamp_latency(last, submit_ts, response_ts)
+        if isinstance(last, dict) and last.get("_mystic_cancel_unconfirmed"):
+            _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_UNCONFIRMED)
+            return None
         _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_TIMEOUT_CANCELED_UNFILLED)
         return None
 
