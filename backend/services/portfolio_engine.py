@@ -7860,6 +7860,10 @@ class PortfolioEngine:
                 },
                 extra=extra_payload,
             )
+            from backend.services.buy_entry_settlement import entry_is_settled
+
+            _trade_for_settle = str(getattr(position, "trade_id", "") or "")
+            extra_payload["entry_settled"] = entry_is_settled(self.db_path, _trade_for_settle)
             record_trade_outcome(record, db_path=self.db_path, mode_override=(TradingMode.LIVE if self._live_execution_enabled else None))
             try:
                 from backend.services.adaptive_learning import learn_from_close
@@ -7891,27 +7895,51 @@ class PortfolioEngine:
                         structural_emphasis=float(_adapt_dec.get("structural_emphasis") or 1.0),
                     )
                     _continuation = continuation_ratio(entry_price=float(entry_px or 0.0), highest_price=float(hi or 0.0), objective=_objective)
-                learn_from_close(
-                    self.db_path,
-                    engine=str(_prov.get("engine_id") or ""),
-                    symbol=symbol,
-                    setup=_learn_setup,
-                    regime=_learn_regime,
-                    strategy_version=str(_prov.get("strategy_version") or ""),
-                    net_pct=record.net_profit_pct,
-                    mfe_pct=_iwh.get("mfe_pct"),
-                    mae_pct=_iwh.get("mae_pct"),
-                    hold_min=(float(record.hold_seconds) / 60.0) if record.hold_seconds else None,
-                    continuation=_continuation,
-                    version_current=bool(_prov.get("version_current")),
-                    is_dust=bool(_prov.get("is_dust")),
-                    entered_at=record.entry_timestamp,
-                    unrealized_marks=_hold_unrealized_marks(self.db_path, str(getattr(position, "trade_id", "") or "")),
-                    opportunity_id=str(getattr(position, "scalp_opportunity_id", "") or ""),
-                    exit_reason=str(close_reason or ""),
-                    candidate_id=(_adapt_dec.get("lineage") or {}).get("candidate_id") if isinstance(_adapt_dec.get("lineage"), dict) else None,
-                    close_key=str(getattr(position, "trade_id", "") or ""),
+                _learn_kwargs = {
+                    "engine": str(_prov.get("engine_id") or ""),
+                    "symbol": symbol,
+                    "setup": _learn_setup,
+                    "regime": _learn_regime,
+                    "strategy_version": str(_prov.get("strategy_version") or ""),
+                    "net_pct": record.net_profit_pct,
+                    "mfe_pct": _iwh.get("mfe_pct"),
+                    "mae_pct": _iwh.get("mae_pct"),
+                    "hold_min": (float(record.hold_seconds) / 60.0) if record.hold_seconds else None,
+                    "continuation": _continuation,
+                    "version_current": bool(_prov.get("version_current")),
+                    "is_dust": bool(_prov.get("is_dust")),
+                    "entered_at": record.entry_timestamp,
+                    "unrealized_marks": _hold_unrealized_marks(self.db_path, _trade_for_settle),
+                    "opportunity_id": str(getattr(position, "scalp_opportunity_id", "") or ""),
+                    "exit_reason": str(close_reason or ""),
+                    "close_key": _trade_for_settle,
+                }
+                _learn_kwargs.update(candidate_id=(_adapt_dec.get("lineage") or {}).get("candidate_id") if isinstance(_adapt_dec.get("lineage"), dict) else None)
+                _facts = {
+                    "net_profit_usd": record.net_profit_usd,
+                    "entry_price": record.entry_price,
+                    "quantity": record.quantity,
+                    "highest_price": hi,
+                    "lowest_price": lo,
+                    "entry_timestamp": record.entry_timestamp,
+                    "exit_timestamp": record.exit_timestamp,
+                }
+                from backend.services.buy_entry_settlement import (
+                    clear_unsettled_learns,
+                    merge_terminal_learn,
+                    peek_unsettled_learns,
+                    remember_unsettled_learn,
                 )
+
+                if not entry_is_settled(self.db_path, _trade_for_settle):
+                    remember_unsettled_learn(self.db_path, _trade_for_settle, _learn_kwargs, _facts)
+                else:
+                    _pending = peek_unsettled_learns(self.db_path, _trade_for_settle)
+                    if _pending:
+                        _learn_kwargs = merge_terminal_learn([*_pending, {"learn": _learn_kwargs, "facts": _facts}])
+                    learn_from_close(self.db_path, **_learn_kwargs)
+                    if _pending:
+                        clear_unsettled_learns(self.db_path, _trade_for_settle)
             except Exception:
                 logger.warning("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)
             opened_iso = None
@@ -10264,6 +10292,118 @@ class PortfolioEngine:
         grown = await self.restore_filled_asset_custody()
         if grown:
             self.note_sell_symbol_released()
+        self._schedule_flat_buy_recovery(symbol)
+        self._emit_deferred_terminal_learning()
+
+    def _schedule_flat_buy_recovery(self, symbol: str | None = None) -> None:
+        """After the booked lot is gone, keep reading a buy that can still reveal base."""
+        from backend.services.buy_entry_settlement import canonical_booked_qty, flat_buy_needs_recovery, open_position_qty
+        from backend.services.strategy_order_intent import buy_intents_to_reread
+
+        if not getattr(self, "db_path", None) or getattr(self, "_live_service", None) is None:
+            return
+        tasks = getattr(self, "_flat_buy_tasks", None)
+        if tasks is None:
+            self._flat_buy_tasks = {}
+            tasks = self._flat_buy_tasks
+        try:
+            intents = buy_intents_to_reread(self.db_path, symbol)
+        except Exception:
+            return
+        for intent in intents:
+            cid = str(intent.get("client_order_id") or "")
+            trade_id = str(intent.get("trade_id") or "")
+            if not cid or not trade_id:
+                continue
+            current = tasks.get(cid)
+            if current is not None and not current.done():
+                continue
+            booked = canonical_booked_qty(self.db_path, trade_id)
+            candidate = dict(intent)
+            candidate["booked_qty"] = booked
+            if not flat_buy_needs_recovery(candidate, open_position_qty(self.db_path, trade_id)):
+                continue
+            tasks[cid] = asyncio.create_task(self._fast_recover_flat_buy(cid))
+
+    async def _fast_recover_flat_buy(self, client_order_id: str) -> None:
+        """Three looks, on the protected-order clock, then the two-minute loop remains.
+
+        A weight refusal waits for the venue minute once. The read stays entry
+        priority and does not spend the sell reserve. Net base is still taken
+        only from fee-proven fills.
+        """
+        from backend.config.protected_execution import PROTECTED_LIMIT_ORDER_TIMEOUT_SEC
+        from backend.services.buy_entry_settlement import canonical_booked_qty, flat_buy_needs_recovery, open_position_qty
+        from backend.services.strategy_order_intent import intent_by_client
+
+        cid = str(client_order_id or "")
+        window_wait_used = False
+        rate_limited = False
+        for _attempt in range(3):
+            if rate_limited and not window_wait_used:
+                now = time.time()
+                delay = max(0.0, (math.floor(now / 60) + 1) * 60 - now)
+                window_wait_used = True
+            else:
+                delay = float(PROTECTED_LIMIT_ORDER_TIMEOUT_SEC)
+            await asyncio.sleep(delay)
+            intent = intent_by_client(self.db_path, cid) if getattr(self, "db_path", None) else None
+            if intent is None or str(intent.get("side") or "").upper() != "BUY":
+                return
+            if getattr(self, "_live_service", None) is None:
+                return
+            trade_id = str(intent.get("trade_id") or "")
+            intent = dict(intent)
+            intent["booked_qty"] = canonical_booked_qty(self.db_path, trade_id)
+            if not flat_buy_needs_recovery(intent, open_position_qty(self.db_path, trade_id)):
+                self._emit_deferred_terminal_learning()
+                return
+            found = await self._probe_intent(intent)
+            rate_limited = bool(found.get("rate_limited"))
+            if found.get("unconfirmed"):
+                continue
+            if found.get("found"):
+                await self._apply_probed_order(found["order"], str(intent.get("symbol") or ""), cid)
+                grown = await self.restore_filled_asset_custody()
+                if grown:
+                    self.note_sell_symbol_released()
+            self._emit_deferred_terminal_learning()
+            latest = intent_by_client(self.db_path, cid)
+            if latest is None:
+                return
+            latest = dict(latest)
+            latest["booked_qty"] = canonical_booked_qty(self.db_path, trade_id)
+            if not flat_buy_needs_recovery(latest, open_position_qty(self.db_path, trade_id)):
+                return
+        self._emit_deferred_terminal_learning()
+
+    def _emit_deferred_terminal_learning(self) -> None:
+        """Write the one trade-id label once the buy is settled and the lot is flat."""
+        from backend.services.adaptive_learning import learn_from_close
+        from backend.services.buy_entry_settlement import (
+            clear_unsettled_learns,
+            deferred_trade_ids,
+            entry_is_settled,
+            merge_terminal_learn,
+            open_position_qty,
+            peek_unsettled_learns,
+        )
+
+        if not getattr(self, "db_path", None):
+            return
+        for trade_id in deferred_trade_ids(self.db_path):
+            if not entry_is_settled(self.db_path, trade_id) or open_position_qty(self.db_path, trade_id) > 1e-8:
+                continue
+            chunks = peek_unsettled_learns(self.db_path, trade_id)
+            learn = merge_terminal_learn(chunks)
+            if not learn:
+                continue
+            try:
+                learn_from_close(self.db_path, **learn)
+            except Exception:
+                logger.warning("DEFERRED_TERMINAL_LEARN_FAILED trade=%s", trade_id, exc_info=True)
+                continue
+            clear_unsettled_learns(self.db_path, trade_id)
 
     async def _apply_probed_order(self, order: dict[str, Any], symbol: str, client_order_id: str = "", *, wait: bool = True) -> dict[str, Any]:
         from backend.services.live_fill_economics import merge_venue_trades_into_order
@@ -10491,6 +10631,7 @@ class PortfolioEngine:
             await self._load_positions_from_sqlite()
             await self._load_ledger_from_sqlite()
             self.note_sell_symbol_released()
+        self._emit_deferred_terminal_learning()
         return probed + booked
 
     async def _load_positions_from_sqlite(self, *, allow_mutations: bool = True, during_sell: bool = False) -> int:
@@ -17963,6 +18104,7 @@ class PortfolioEngine:
         # base. FEE_PENDING is terminal and does not block.
         db_path = getattr(self, "db_path", None)
         if db_path:
+            from backend.services.buy_entry_settlement import unsettled_buy_blocks_engine
             from backend.services.strategy_order_intent import sell_intent_blocks
 
             try:
@@ -17972,6 +18114,13 @@ class PortfolioEngine:
             if sell_blocking:
                 logger.warning("BUY_BLOCKED_WORKING_SELL symbol=%s engine=%s", symbol, engine_id)
                 return False, "WORKING_SELL_SAME_SYMBOL"
+            try:
+                entry_unsettled = unsettled_buy_blocks_engine(str(db_path), symbol, str(engine_id or ""))
+            except Exception:
+                entry_unsettled = False
+            if entry_unsettled:
+                logger.warning("BUY_BLOCKED_ENTRY_UNSETTLED symbol=%s engine=%s", symbol, engine_id)
+                return False, "ENTRY_UNSETTLED_SAME_ENGINE"
 
         # CRITICAL: Check account status first
         if self._account_status == AccountStatus.OVERALLOCATED:

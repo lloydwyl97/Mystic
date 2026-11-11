@@ -307,6 +307,9 @@ class BuyCashView:
     oldest_ambiguous_buy_age_sec: float | None = None
     custody_pending_count: int = 0
     potential_unprotected_symbols: list[str] | None = None
+    unsettled_entries: list[dict[str, Any]] | None = None
+    oldest_custody_pending_age_sec: float | None = None
+    terminal_learning_pending_count: int = 0
 
     @property
     def oldest_age_sec(self) -> float | None:
@@ -342,6 +345,9 @@ class BuyCashView:
             "oldest_ambiguous_buy_age_sec": self.oldest_ambiguous_buy_age_sec,
             "custody_pending_count": self.custody_pending_count,
             "potential_unprotected_symbols": list(self.potential_unprotected_symbols or []),
+            "unsettled_entries": list(self.unsettled_entries or []),
+            "oldest_custody_pending_age_sec": self.oldest_custody_pending_age_sec,
+            "terminal_learning_pending_count": self.terminal_learning_pending_count,
         }
 
 
@@ -476,6 +482,10 @@ def buy_cash_view(
     ambiguous = [item for item in intents if item.status in {"PENDING", "ACKED"} and item.filled_qty <= 0]
     oldest_unresolved = min((item.created_at for item in unresolved if item.created_at > 0), default=0.0)
     oldest_ambiguous = min((item.created_at for item in ambiguous if item.created_at > 0), default=0.0)
+    from backend.services.buy_entry_settlement import settlement_rows
+
+    unsettled = settlement_rows(db_path, now=stamp)
+    custody_ages = [item["age_sec"] for item in unsettled if (item.get("unbooked_executed_qty") or item.get("buy_terminal")) and item.get("age_sec") is not None]
     books = _local_buy_books(db_path)
     working_rows = []
     for item in intents:
@@ -518,6 +528,9 @@ def buy_cash_view(
         oldest_ambiguous_buy_age_sec=None if oldest_ambiguous <= 0 else round(max(0.0, stamp - oldest_ambiguous), 3),
         custody_pending_count=sum(1 for item in intents if item.status == "FEE_PENDING"),
         potential_unprotected_symbols=sorted({item.symbol for item in intents if item.status in {"PENDING", "ACKED", "FEE_PENDING"} and item.symbol}),
+        unsettled_entries=unsettled,
+        oldest_custody_pending_age_sec=max(custody_ages) if custody_ages else None,
+        terminal_learning_pending_count=sum(1 for item in unsettled if item.get("terminal_learning_pending")),
     )
 
 

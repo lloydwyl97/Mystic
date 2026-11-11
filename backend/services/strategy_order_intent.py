@@ -49,9 +49,11 @@ def _connect(db_path: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE strategy_order_intents ADD COLUMN filled_gross REAL NOT NULL DEFAULT 0")
     if "filled_cash" not in cols:
         conn.execute("ALTER TABLE strategy_order_intents ADD COLUMN filled_cash REAL NOT NULL DEFAULT 0")
-    for name in ("pending_high", "pending_low", "booked_cash", "booked_high", "booked_low", "booked_fee"):
+    for name in ("pending_high", "pending_low", "booked_cash", "booked_high", "booked_low", "booked_fee", "venue_executed_qty"):
         if name not in cols:
             conn.execute(f"ALTER TABLE strategy_order_intents ADD COLUMN {name} REAL NOT NULL DEFAULT 0")
+    if "deferred_close_json" not in cols:
+        conn.execute("ALTER TABLE strategy_order_intents ADD COLUMN deferred_close_json TEXT NOT NULL DEFAULT '[]'")
     return conn
 
 
@@ -646,6 +648,31 @@ def mark_working_sell(db_path: str, client_order_id: str, status: str, exchange_
         conn.close()
 
 
+def _note_venue_executed_qty(db_path: str, client_order_id: str, order: dict[str, Any]) -> None:
+    """Remember the venue's gross executedQty without treating it as canonical net base."""
+    if not client_order_id:
+        return
+    try:
+        venue_qty = float(order.get("filled") or 0.0)
+    except (TypeError, ValueError):
+        venue_qty = 0.0
+    if venue_qty <= 0:
+        return
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE strategy_order_intents
+            SET venue_executed_qty=CASE WHEN ? > venue_executed_qty THEN ? ELSE venue_executed_qty END
+            WHERE client_order_id=? AND side='BUY'
+            """,
+            (venue_qty, venue_qty, normalize_client_order_id(client_order_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _finish_venue_lifecycle(db_path: str, order: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     """Record whether the venue order is still able to fill. A dead zero-fill releases the intent."""
     cid = str(order.get("clientOrderId") or order.get("client_order_id") or "")
@@ -666,6 +693,7 @@ def _finish_venue_lifecycle(db_path: str, order: dict[str, Any], result: dict[st
         out["released"] = True
         out["reason"] = label
         return out
+    _note_venue_executed_qty(db_path, cid, order)
     if cid and filled > 0.0 and not order_is_working(order):
         # The resting remainder is dead. The executed base stays reserved
         # until its own close, and it no longer blocks the unsold base.
