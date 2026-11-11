@@ -175,6 +175,83 @@ def test_unknown_fee_does_not_open_a_position(tmp_path):
     assert materialize_buy_custody(db) == 0
 
 
+@pytest.mark.asyncio
+async def test_ambiguous_buy_is_reread_before_the_two_minute_loop(tmp_path, monkeypatch):
+    sleeps: list[float] = []
+
+    async def _sleep(delay):
+        sleeps.append(float(delay))
+
+    monkeypatch.setattr("backend.services.portfolio_engine.asyncio.sleep", _sleep)
+    db = str(tmp_path / "fast.db")
+    cid = _arm(db, qty=1.0, limit_px=400)
+    engine = _engine(db)
+    engine._entry_reservations["SCALP_V2::BTC/USDT"] = {"notional": 400.0, "decision_id": "buy-1", "sleeve": "SCALP_V2"}
+    calls = {"n": 0}
+
+    class _Later(_Venue):
+        async def fetch_order(self, *_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return {"status": "error", "message": "timeout"}
+            return {"status": "success", "order": self.order}
+
+    engine._live_service = _Later(
+        {
+            "id": "90",
+            "clientOrderId": cid,
+            "status": "expired",
+            "filled": 0,
+            "amount": 1,
+            "side": "buy",
+            "info": {"status": "EXPIRED", "executedQty": "0"},
+        }
+    )
+
+    await engine._fast_recover_ambiguous_buy(cid)
+
+    assert sleeps[:2] == [8.0, 8.0]
+    assert max(sleeps) < 120
+    assert committed_buy_quote(db, memory_reservations=engine._entry_reservations) == 0
+
+
+def test_post_fill_range_ignores_a_gap_and_prices_before_the_fill(tmp_path, monkeypatch):
+    from backend.services.day_order_flow_tape import TapePrint
+
+    db = str(tmp_path / "range.db")
+    engine = _engine(db)
+    engine.open_positions = {}
+    engine._symbol_lots = lambda _symbol: []
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE portfolio_engine_positions (trade_id TEXT, highest_price REAL, lowest_price REAL)")
+        conn.execute("INSERT INTO portfolio_engine_positions VALUES ('scalp-btc', 100, 100)")
+    seen: dict[str, float] = {}
+
+    def _tape(_symbol, *, since_ts, until_ts=None):
+        seen["since"] = since_ts
+        return [
+            TapePrint(trade_ts=since_ts + 1, price=97, qty=1, is_buyer_maker=True),
+            TapePrint(trade_ts=since_ts + 3, price=103, qty=1, is_buyer_maker=False),
+        ]
+
+    monkeypatch.setattr("backend.services.day_order_flow_tape.read_tape", _tape)
+    engine._apply_observed_post_fill_range("BTC/USDT", "scalp-btc", 1_000.0, 100.0)
+    with sqlite3.connect(db) as conn:
+        high, low = conn.execute("SELECT highest_price, lowest_price FROM portfolio_engine_positions").fetchone()
+    assert seen["since"] == 1_000.0
+    assert high == 103
+    assert low == 97
+
+    def _gap(_symbol, *, since_ts, until_ts=None):
+        return [TapePrint(trade_ts=since_ts + 30, price=80, qty=1, is_buyer_maker=True)]
+
+    monkeypatch.setattr("backend.services.day_order_flow_tape.read_tape", _gap)
+    engine._apply_observed_post_fill_range("BTC/USDT", "scalp-btc", 1_000.0, 100.0)
+    with sqlite3.connect(db) as conn:
+        high, low = conn.execute("SELECT highest_price, lowest_price FROM portfolio_engine_positions").fetchone()
+    assert (high, low) == (103, 97)
+
+
 def test_raw_stp_status_is_terminal_and_sell_classifies_afterward():
     assert order_is_working({"status": "EXPIRED_IN_MATCH", "filled": 0}) is False
     assert order_is_working({"status": "expired", "info": {"status": "EXPIRED_IN_MATCH"}}) is False

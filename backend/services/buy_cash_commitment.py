@@ -298,6 +298,10 @@ class BuyCashView:
     unresolved_buy_count: int = 0
     oldest_unresolved_buy_age_sec: float | None = None
     partial_buy_count: int = 0
+    ambiguous_buy_count: int = 0
+    oldest_ambiguous_buy_age_sec: float | None = None
+    custody_pending_count: int = 0
+    potential_unprotected_symbols: list[str] | None = None
 
     @property
     def oldest_age_sec(self) -> float | None:
@@ -329,6 +333,10 @@ class BuyCashView:
             "unresolved_buy_count": self.unresolved_buy_count,
             "oldest_unresolved_buy_age_sec": self.oldest_unresolved_buy_age_sec,
             "partial_buy_count": self.partial_buy_count,
+            "ambiguous_buy_count": self.ambiguous_buy_count,
+            "oldest_ambiguous_buy_age_sec": self.oldest_ambiguous_buy_age_sec,
+            "custody_pending_count": self.custody_pending_count,
+            "potential_unprotected_symbols": list(self.potential_unprotected_symbols or []),
         }
 
 
@@ -433,7 +441,9 @@ def buy_cash_view(
 
     committed = pending + working + executed
     unresolved = [item for item in intents if item.remaining_quote > 0 or item.status == "FEE_PENDING"]
+    ambiguous = [item for item in intents if item.status in {"PENDING", "ACKED"} and item.filled_qty <= 0]
     oldest_unresolved = min((item.created_at for item in unresolved if item.created_at > 0), default=0.0)
+    oldest_ambiguous = min((item.created_at for item in ambiguous if item.created_at > 0), default=0.0)
     working_rows = [
         {
             "engine": item.engine,
@@ -458,6 +468,10 @@ def buy_cash_view(
         unresolved_buy_count=len(unresolved),
         oldest_unresolved_buy_age_sec=None if oldest_unresolved <= 0 else round(max(0.0, stamp - oldest_unresolved), 3),
         partial_buy_count=sum(1 for item in intents if item.status == "PARTIAL"),
+        ambiguous_buy_count=len(ambiguous),
+        oldest_ambiguous_buy_age_sec=None if oldest_ambiguous <= 0 else round(max(0.0, stamp - oldest_ambiguous), 3),
+        custody_pending_count=sum(1 for item in intents if item.status == "FEE_PENDING"),
+        potential_unprotected_symbols=sorted({item.symbol for item in intents if item.status in {"PENDING", "ACKED", "FEE_PENDING"} and item.symbol}),
     )
 
 

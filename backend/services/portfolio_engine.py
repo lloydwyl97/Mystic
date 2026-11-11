@@ -4413,6 +4413,8 @@ class PortfolioEngine:
                 payload["buy_cash"]["last_buy_stp_expiration"] = getattr(self, "_last_buy_stp_expiration", None)
                 payload["buy_cash"]["last_buy_probe_at"] = getattr(self, "_last_buy_probe_epoch", None)
                 payload["buy_cash"]["last_buy_probe_status"] = getattr(self, "_last_buy_probe_status", None)
+                payload["buy_cash"]["last_buy_recovery_probe"] = getattr(self, "_last_buy_probe_epoch", None)
+                payload["buy_cash"]["buy_recovery_next_probe_at"] = getattr(self, "_buy_recovery_next_probe_at", None)
             with open(path, "w") as f:
                 json.dump(payload, f, indent=0)
             logger.info("LIVE_RECONCILE_STATE_WRITTEN path=%s time=%s actions=%s", path, now_utc, actions)
@@ -9696,6 +9698,9 @@ class PortfolioEngine:
                     status="ACTIVE",
                 )
                 await self._persist_position_to_sqlite(position)
+                clock = (getattr(self, "_buy_fill_clocks", {}) or {}).pop(trade_id, None)
+                if clock:
+                    self._apply_observed_post_fill_range(str(row["symbol"]), trade_id, float(clock[0]), float(clock[1]))
                 from backend.services.filled_asset_custody import ensure_canonical_buy_row
 
                 ensure_canonical_buy_row(self.db_path, row)
@@ -9756,6 +9761,8 @@ class PortfolioEngine:
             except Exception:
                 logger.warning("STRATEGY_INTENT_PROBE_FAILED trade=%s", intent.get("trade_id"), exc_info=True)
                 return {"unconfirmed": True}
+            if res.get("rate_limited"):
+                return {"unconfirmed": True, "rate_limited": True}
             if str(res.get("status") or "") == "success" and isinstance(res.get("order"), dict):
                 return {"found": True, "order": res["order"]}
             if str(res.get("code") or "") == "-2013":
@@ -9798,6 +9805,139 @@ class PortfolioEngine:
         self._release_entry_reservation(symbol, decision_id=decision, sleeve=engine)
         self._release_entry_reservation(symbol, sleeve=engine)
 
+    def _schedule_ambiguous_buy_recovery(self, client_order_id: str) -> None:
+        """A lost acknowledgement is not left until the 120-second reconcile."""
+        cid = str(client_order_id or "")
+        if not cid:
+            return
+        tasks = getattr(self, "_ambiguous_buy_tasks", None)
+        if tasks is None:
+            self._ambiguous_buy_tasks = {}
+            tasks = self._ambiguous_buy_tasks
+        current = tasks.get(cid)
+        if current is not None and not current.done():
+            return
+        tasks[cid] = asyncio.create_task(self._fast_recover_ambiguous_buy(cid))
+
+    async def _fast_recover_ambiguous_buy(self, client_order_id: str) -> None:
+        """Three looks, on clocks the execution path already uses, then the 120-second loop remains.
+
+        The gap is the protected-order timeout. A weight refusal waits for the
+        venue minute the limiter already uses, once, and does not spend the sell reserve.
+        """
+        from backend.config.protected_execution import PROTECTED_LIMIT_ORDER_TIMEOUT_SEC
+        from backend.services.strategy_order_intent import intent_by_client, mark_intent_absent
+
+        cid = str(client_order_id or "")
+        window_wait_used = False
+        rate_limited = False
+        for _attempt in range(3):
+            if rate_limited and not window_wait_used:
+                now = time.time()
+                delay = max(0.0, (math.floor(now / 60) + 1) * 60 - now)
+                window_wait_used = True
+            else:
+                delay = float(PROTECTED_LIMIT_ORDER_TIMEOUT_SEC)
+            self._buy_recovery_next_probe_at = time.time() + delay
+            await asyncio.sleep(delay)
+            intent = intent_by_client(self.db_path, cid) if getattr(self, "db_path", None) else None
+            if intent is None or str(intent.get("side") or "").upper() != "BUY":
+                return
+            if str(intent.get("status") or "") not in {"PENDING", "ACKED"} or float(intent.get("filled_qty") or 0.0) > 0:
+                return
+            if getattr(self, "_live_service", None) is None:
+                return
+            self._last_buy_probe_epoch = time.time()
+            found = await self._probe_intent(intent)
+            rate_limited = bool(found.get("rate_limited"))
+            if found.get("unconfirmed"):
+                self._last_buy_probe_status = "rate_limited" if rate_limited else "unconfirmed"
+                continue
+            if found.get("absent"):
+                mark_intent_absent(self.db_path, cid)
+                self._release_entry_reservation(str(intent.get("symbol") or ""), decision_id=str(intent.get("decision_id") or ""), sleeve=str(intent.get("engine_id") or ""))
+                self._release_entry_reservation(str(intent.get("symbol") or ""), sleeve=str(intent.get("engine_id") or ""))
+                self._last_buy_probe_status = "absent"
+                return
+            await self._apply_probed_order(found["order"], str(intent.get("symbol") or ""), cid, wait=False)
+            latest = intent_by_client(self.db_path, cid)
+            if latest is not None and str(latest.get("status") or "") == "FEE_PENDING":
+                self._last_buy_probe_status = "fee_pending"
+                continue
+            booked = await self.restore_filled_asset_custody()
+            if booked:
+                await self._load_positions_from_sqlite()
+                await self._load_ledger_from_sqlite()
+                self.note_sell_symbol_released()
+            self._last_buy_probe_status = "applied"
+            return
+        self._buy_recovery_next_probe_at = None
+        self._last_buy_probe_status = "deferred_to_reconcile"
+
+    def _stash_buy_fill_clock(self, order: dict[str, Any], client_order_id: str) -> None:
+        from backend.services.strategy_order_intent import intent_by_client, order_is_working
+
+        if not isinstance(order, dict) or order_is_working(order) or not getattr(self, "db_path", None):
+            return
+        try:
+            filled = float(order.get("filled") or 0.0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if filled <= 0:
+            return
+        raw_ts = order.get("timestamp")
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        if raw_ts in (None, ""):
+            raw_ts = info.get("transactTime") or info.get("updateTime") or 0
+        try:
+            fill_ts = float(raw_ts or 0.0)
+        except (TypeError, ValueError):
+            fill_ts = 0.0
+        if fill_ts > 1e12:
+            fill_ts /= 1000.0
+        try:
+            price = float(order.get("average") or order.get("price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        intent = intent_by_client(self.db_path, str(client_order_id or order.get("clientOrderId") or ""))
+        if intent is None or fill_ts <= 0 or price <= 0:
+            return
+        clocks = getattr(self, "_buy_fill_clocks", None)
+        if clocks is None:
+            self._buy_fill_clocks = {}
+            clocks = self._buy_fill_clocks
+        clocks[str(intent.get("trade_id") or "")] = (fill_ts, price)
+
+    def _apply_observed_post_fill_range(self, symbol: str, trade_id: str, fill_ts: float, fill_price: float) -> None:
+        """Set high and low from prints at or after the fill. A gap leaves the fill price."""
+        from backend.config.protected_execution import PROTECTED_LIMIT_ORDER_TIMEOUT_SEC
+        from backend.services.day_order_flow_tape import read_tape
+
+        if fill_ts <= 0 or fill_price <= 0:
+            return
+        prints = read_tape(symbol, since_ts=float(fill_ts), until_ts=time.time())
+        if not prints or float(prints[0].trade_ts) > float(fill_ts) + float(PROTECTED_LIMIT_ORDER_TIMEOUT_SEC):
+            logger.info("BUY_EXCURSION_UNAVAILABLE symbol=%s trade=%s fill_ts=%.3f", symbol, trade_id, fill_ts)
+            return
+        prices = [float(fill_price), *[float(item.price) for item in prints]]
+        high = max(prices)
+        low = min(prices)
+        lots = self._symbol_lots(symbol) if callable(getattr(self, "_symbol_lots", None)) else []
+        for pos in lots:
+            if str(getattr(pos, "trade_id", "") or "") == str(trade_id):
+                pos.highest_price = high
+                pos.lowest_price = low
+        with contextlib.suppress(Exception), connect_rw(self.db_path) as conn:
+            conn.execute(
+                """
+                    UPDATE portfolio_engine_positions
+                    SET highest_price=?, lowest_price=?
+                    WHERE trade_id=?
+                    """,
+                (high, low, str(trade_id)),
+            )
+            conn.commit()
+
     async def _classify_resting_buys(self, symbol: str) -> None:
         """After a protective sell, read a same-symbol BUY once. The sell is not delayed for this."""
         from backend.services.day_entry_reservations import release_reservation
@@ -9831,7 +9971,7 @@ class PortfolioEngine:
         applied = apply_venue_order(self.db_path, order)
         self._release_terminal_buy_quote(order, client_order_id)
         if applied.get("reason") == "NEEDS_TRADES":
-            priority = "exit" if str(order.get("side") or "").lower() == "sell" else "background"
+            priority = "exit" if str(order.get("side") or "").lower() == "sell" else "entry"
             trades = await self._live_service.fetch_order_trades(
                 "binanceus",
                 symbol,
@@ -9843,6 +9983,7 @@ class PortfolioEngine:
                 merged = merge_venue_trades_into_order(order, trades.get("trades"))
                 applied = apply_venue_order(self.db_path, merged)
                 self._release_terminal_buy_quote(merged, client_order_id)
+        self._stash_buy_fill_clock(order, client_order_id)
         return applied
 
     async def _execution_book_is_fresh(self, symbol: str) -> dict[str, Any] | None:
@@ -11648,6 +11789,7 @@ class PortfolioEngine:
                 self.last_buy_reject_reason = _scalp_outcome or "EXCHANGE_REJECTED"
                 if buy_failure_keeps_quote(_scalp_outcome):
                     logger.error("BUY_CASH_HELD_UNCONFIRMED symbol=%s engine=SCALP_V2 outcome=%s client=%s", norm, _scalp_outcome, scalp_client_id)
+                    self._schedule_ambiguous_buy_recovery(str(scalp_client_id or ""))
                     return None
                 release_claim(
                     self.db_path,
@@ -13258,6 +13400,7 @@ class PortfolioEngine:
                     self.last_buy_failure_reason = error_msg
                     if buy_failure_keeps_quote(_buy_outcome):
                         logger.error("BUY_CASH_HELD_UNCONFIRMED symbol=%s outcome=%s client=%s", exchange_symbol, _buy_outcome, client_order_id)
+                        self._schedule_ambiguous_buy_recovery(str(client_order_id or ""))
                     else:
                         logger.error("LIVE_BUY_FAILED: %s - %s", exchange_symbol, error_msg)
                         if _entry_reserved:
@@ -13432,6 +13575,7 @@ class PortfolioEngine:
                     )
                 if _buy_client_allocated and _entry_reserved:
                     logger.error("BUY_CASH_HELD_UNCONFIRMED symbol=%s outcome=exception client=%s", symbol, client_order_id)
+                    self._schedule_ambiguous_buy_recovery(str(client_order_id or ""))
                     return None
                 if _entry_reserved:
                     self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
