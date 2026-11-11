@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from backend.services.buy_entry_settlement import (
+    completed_trade_row,
     entry_is_settled,
     flat_buy_needs_recovery,
     merge_terminal_learn,
@@ -16,6 +17,7 @@ from backend.services.buy_entry_settlement import (
 )
 from backend.services.portfolio_engine import PortfolioEngine
 from backend.services.strategy_order_intent import allocate_intent, apply_venue_order
+from backend.services.trade_learning_writer import TradeLearningRecord, consume_setup_outcomes_for_ranking, record_trade_outcome
 
 
 def _buy(db: str, *, status: str, filled: float = 0.25, venue: float = 0.0, qty: float = 1.0) -> str:
@@ -124,3 +126,47 @@ def test_terminal_label_waits_and_then_combines_both_sell_chunks(tmp_path):
     assert merged["mfe_pct"] == pytest.approx((101 - 100) / 100)
     assert merged["mae_pct"] == pytest.approx((100 - 90) / 100)
     assert merged["close_key"] == "scalp-btc"
+
+
+def _outcome(db: str, *, pnl: float, settled: bool | None, terminal: bool | None, setup: str = "HTF_PULLBACK") -> None:
+    extra: dict = {"setup_type": setup, "engine_id": "SCALP_V2"}
+    if settled is not None:
+        extra["entry_settled"] = settled
+    if terminal is not None:
+        extra["strategy_terminal"] = terminal
+    record_trade_outcome(
+        TradeLearningRecord(
+            symbol="BTC/USDT",
+            exit_price=100.0,
+            net_profit_usd=pnl,
+            net_profit_pct=pnl / 100.0,
+            close_reason="SCALP_V2_CATASTROPHIC_STOP",
+            event_key=f"row-{pnl}-{settled}-{terminal}",
+            extra=extra,
+        ),
+        db_path=db,
+    )
+
+
+def test_setup_score_ignores_the_unsettled_loser_and_counts_the_final_winner(tmp_path):
+    db = str(tmp_path / "rank.db")
+    _outcome(db, pnl=-5.0, settled=False, terminal=False)
+    before = consume_setup_outcomes_for_ranking(db, "HTF_PULLBACK", engine_id=None)
+    assert before["n"] == 0
+    assert completed_trade_row({"entry_settled": False}) is False
+    assert completed_trade_row({}) is True
+    _outcome(db, pnl=7.0, settled=True, terminal=True)
+    after = consume_setup_outcomes_for_ranking(db, "HTF_PULLBACK", engine_id=None)
+    assert after["n"] == 1
+    assert after["wins"] == 1
+    assert after["expectancy_usd"] == pytest.approx(7.0)
+
+
+def test_three_execution_rows_are_one_completed_trade(tmp_path):
+    db = str(tmp_path / "three.db")
+    for pnl in (-2.0, 4.0, 5.0):
+        _outcome(db, pnl=pnl, settled=False, terminal=False)
+    _outcome(db, pnl=7.0, settled=True, terminal=True)
+    ranked = consume_setup_outcomes_for_ranking(db, "HTF_PULLBACK")
+    assert ranked["n"] == 1
+    assert ranked["expectancy_usd"] == pytest.approx(7.0)

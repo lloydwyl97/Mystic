@@ -672,6 +672,10 @@ def realized_closes(db_path: str, engine_id: str) -> list[dict[str, Any]]:
         ).fetchall()
         for o in outcomes:
             extra = _json(o["extra_json"])
+            from backend.services.buy_entry_settlement import completed_trade_row
+
+            if not completed_trade_row(extra):
+                continue
             holding = _json(o["indicators_while_holding_json"])
             entered, closed = float(o["entry_timestamp"]), float(o["exit_timestamp"])
             buy, sell = _close_rows(conn, engine, o["symbol"], str(extra.get("original_trade_id") or ""), closed)

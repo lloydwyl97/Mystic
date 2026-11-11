@@ -2028,9 +2028,14 @@ def seed_policy_gap(db_path: str, engine: str, *, apply: bool = False) -> dict[s
                 out["refused"] = "POLICY_GAP_STATE_EXISTS"
                 return out
             excluded = ",".join("?" * len(POLICY_SEED_EXCLUDED_EXITS))
+            from backend.services.buy_entry_settlement import completed_trade_predicate
+
+            columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(trade_learning_outcomes)")}
+            terminal_sql = f" AND {completed_trade_predicate('extra_json')}" if "extra_json" in columns else ""
             outcomes = conn.execute(
                 f"SELECT symbol, entry_timestamp, exit_timestamp, net_profit_pct, close_reason FROM trade_learning_outcomes "
-                f"WHERE UPPER(COALESCE(engine_id,''))=? AND entry_timestamp>=? AND net_profit_pct IS NOT NULL AND COALESCE(close_reason,'') NOT IN ({excluded}) ORDER BY exit_timestamp",
+                f"WHERE UPPER(COALESCE(engine_id,''))=? AND entry_timestamp>=? AND net_profit_pct IS NOT NULL AND COALESCE(close_reason,'') NOT IN ({excluded}) "
+                f"{terminal_sql} ORDER BY exit_timestamp",
                 (engine_id, anchor, *POLICY_SEED_EXCLUDED_EXITS),
             ).fetchall()
             for outcome in outcomes:

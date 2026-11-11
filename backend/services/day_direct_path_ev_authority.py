@@ -233,12 +233,17 @@ def _learning_vetoed_coins(db_path: str) -> set[str]:
         import sqlite3
 
         with sqlite3.connect(db_path, timeout=5) as conn:
+            columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(trade_learning_outcomes)")}
+            from backend.services.buy_entry_settlement import completed_trade_predicate
+
+            terminal_sql = f" AND {completed_trade_predicate('extra_json')}" if "extra_json" in columns else ""
             for api in DAY_TRADE_SYMBOLS:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT net_profit_usd FROM trade_learning_outcomes
                     WHERE symbol = ? AND mode IN ('paper', 'live')
                       AND net_profit_usd IS NOT NULL
+                      {terminal_sql}
                     ORDER BY exit_timestamp DESC LIMIT ?
                     """,
                     (api, _LEARNING_VETO_LOOKBACK),

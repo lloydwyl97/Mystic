@@ -7860,10 +7860,14 @@ class PortfolioEngine:
                 },
                 extra=extra_payload,
             )
-            from backend.services.buy_entry_settlement import entry_is_settled
+            from backend.services.buy_entry_settlement import entry_is_settled, peek_unsettled_learns
 
             _trade_for_settle = str(getattr(position, "trade_id", "") or "")
-            extra_payload["entry_settled"] = entry_is_settled(self.db_path, _trade_for_settle)
+            _settled_now = entry_is_settled(self.db_path, _trade_for_settle)
+            _pending_now = peek_unsettled_learns(self.db_path, _trade_for_settle) if _settled_now else []
+            extra_payload["entry_settled"] = _settled_now
+            extra_payload["strategy_terminal"] = bool(_settled_now and not _pending_now)
+            extra_payload["trade_id"] = _trade_for_settle
             record_trade_outcome(record, db_path=self.db_path, mode_override=(TradingMode.LIVE if self._live_execution_enabled else None))
             try:
                 from backend.services.adaptive_learning import learn_from_close
@@ -7931,15 +7935,18 @@ class PortfolioEngine:
                     remember_unsettled_learn,
                 )
 
-                if not entry_is_settled(self.db_path, _trade_for_settle):
+                if not _settled_now:
                     remember_unsettled_learn(self.db_path, _trade_for_settle, _learn_kwargs, _facts)
-                else:
-                    _pending = peek_unsettled_learns(self.db_path, _trade_for_settle)
-                    if _pending:
-                        _learn_kwargs = merge_terminal_learn([*_pending, {"learn": _learn_kwargs, "facts": _facts}])
+                    return
+                if _pending_now:
+                    _chunks = [*_pending_now, {"learn": _learn_kwargs, "facts": _facts}]
+                    _learn_kwargs = merge_terminal_learn(_chunks)
                     learn_from_close(self.db_path, **_learn_kwargs)
-                    if _pending:
-                        clear_unsettled_learns(self.db_path, _trade_for_settle)
+                    self._write_terminal_trade_row(_trade_for_settle, _chunks, _learn_kwargs)
+                    self._apply_completed_trade_quality(_trade_for_settle, _chunks)
+                    clear_unsettled_learns(self.db_path, _trade_for_settle)
+                    return
+                learn_from_close(self.db_path, **_learn_kwargs)
             except Exception:
                 logger.warning("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)
             opened_iso = None
@@ -10377,6 +10384,86 @@ class PortfolioEngine:
                 return
         self._emit_deferred_terminal_learning()
 
+    def _write_terminal_trade_row(self, trade_id: str, chunks: list[dict[str, Any]], learn: dict[str, Any]) -> None:
+        """One completed-entry row. The per-sell rows stay execution records."""
+        from backend.services.trade_learning_writer import TradeLearningRecord, record_trade_outcome
+
+        facts = [dict(item.get("facts") or {}) for item in chunks if isinstance(item, dict)]
+        if not facts:
+            return
+        pnl = sum(float(item.get("net_profit_usd") or 0.0) for item in facts)
+        cost = sum(float(item.get("entry_price") or 0.0) * float(item.get("quantity") or 0.0) for item in facts)
+        qty = sum(float(item.get("quantity") or 0.0) for item in facts)
+        start = float(facts[0].get("entry_timestamp") or learn.get("entered_at") or 0.0)
+        end = max(float(item.get("exit_timestamp") or 0.0) for item in facts)
+        record_trade_outcome(
+            TradeLearningRecord(
+                symbol=str(learn.get("symbol") or ""),
+                entry_timestamp=start or None,
+                exit_timestamp=end or None,
+                entry_price=float(facts[0].get("entry_price") or 0.0) or None,
+                quantity=qty or None,
+                net_profit_usd=pnl,
+                net_profit_pct=(pnl / cost) if cost else learn.get("net_pct"),
+                hold_seconds=(end - start) if start and end > start else None,
+                close_reason=str(learn.get("exit_reason") or ""),
+                event_key=f"trade-final:{trade_id}",
+                extra={
+                    "entry_settled": True,
+                    "strategy_terminal": True,
+                    "trade_id": trade_id,
+                    "engine_id": str(learn.get("engine") or ""),
+                    "setup": str(learn.get("setup") or ""),
+                    "regime": str(learn.get("regime") or ""),
+                },
+            ),
+            db_path=self.db_path,
+            mode_override=(TradingMode.LIVE if self._live_execution_enabled else None),
+        )
+
+    def _apply_completed_trade_quality(self, trade_id: str, chunks: list[dict[str, Any]]) -> None:
+        """Fold one finished entry into setup, bucket, memory, and the win/loss window."""
+        facts = [dict(item.get("facts") or {}) for item in chunks if isinstance(item, dict)]
+        learns = [dict(item.get("learn") or {}) for item in chunks if isinstance(item, dict)]
+        if not facts or not learns:
+            return
+        pnl = sum(float(item.get("net_profit_usd") or 0.0) for item in facts)
+        symbol = str(learns[-1].get("symbol") or "")
+        setup = str(learns[0].get("setup") or "")
+        regime = str(learns[0].get("regime") or "neutral")
+        if symbol in getattr(self, "coin_performance", {}):
+            perf = self.coin_performance[symbol]
+            perf.trades_24h += 1
+            is_win = pnl > 0
+            perf._outcome_history.append(is_win)
+            perf.win_count_20 = sum(1 for item in perf._outcome_history if item)
+            perf.loss_count_20 = sum(1 for item in perf._outcome_history if not item)
+            perf.total_trades_20 = len(perf._outcome_history)
+            if is_win:
+                perf.avg_win = pnl if perf.avg_win == 0 else perf.avg_win * 0.9 + pnl * 0.1
+            else:
+                perf.avg_loss = abs(pnl) if perf.avg_loss == 0 else perf.avg_loss * 0.9 + abs(pnl) * 0.1
+            perf.update_expectancy()
+        from types import SimpleNamespace
+
+        positive_lows = [float(item.get("lowest_price") or 0.0) for item in facts if float(item.get("lowest_price") or 0.0) > 0]
+        lot = SimpleNamespace(
+            symbol=symbol,
+            entry_thesis=setup,
+            day_route_regime_at_entry=regime,
+            entry_time=float(facts[0].get("entry_timestamp") or 0.0),
+            entry_price=float(facts[0].get("entry_price") or 0.0),
+            highest_price=max(float(item.get("highest_price") or 0.0) for item in facts),
+            lowest_price=min(positive_lows) if positive_lows else 0.0,
+            quantity=sum(float(item.get("quantity") or 0.0) for item in facts),
+            trade_id=trade_id,
+            engine_id=str(learns[0].get("engine") or ""),
+        )
+        with contextlib.suppress(Exception):
+            self._record_thesis_regime_outcome(lot, pnl)
+        with contextlib.suppress(Exception):
+            self._record_day_bucket_outcome(lot, pnl, exit_trigger=str(learns[-1].get("exit_reason") or ""))
+
     def _emit_deferred_terminal_learning(self) -> None:
         """Write the one trade-id label once the buy is settled and the lot is flat."""
         from backend.services.adaptive_learning import learn_from_close
@@ -10400,6 +10487,8 @@ class PortfolioEngine:
                 continue
             try:
                 learn_from_close(self.db_path, **learn)
+                self._write_terminal_trade_row(trade_id, chunks, learn)
+                self._apply_completed_trade_quality(trade_id, chunks)
             except Exception:
                 logger.warning("DEFERRED_TERMINAL_LEARN_FAILED trade=%s", trade_id, exc_info=True)
                 continue
@@ -17173,15 +17262,23 @@ class PortfolioEngine:
 
         # Update coin performance (Phase 6). Live path produces only TP / MANUAL /
         # DUST sells, none of which trigger the loss-streak counter.
+        from backend.services.buy_entry_settlement import entry_is_settled, peek_unsettled_learns
+
+        _entry_trade = str(getattr(position, "trade_id", "") or "")
+        _entry_settled_now = entry_is_settled(self.db_path, _entry_trade)
+        _entry_pending = peek_unsettled_learns(self.db_path, _entry_trade) if _entry_settled_now else []
+        _count_completed_trade = _entry_settled_now and not _entry_pending
         await self._update_coin_performance(
             symbol,
             realized_pnl,
             is_loss=(realized_pnl < 0),
+            count_trade=_count_completed_trade,
         )
-        with contextlib.suppress(Exception):
-            self._record_thesis_regime_outcome(position, float(realized_pnl))
-        with contextlib.suppress(Exception):
-            self._record_day_bucket_outcome(position, float(realized_pnl), exit_trigger=exit_trigger)
+        if _count_completed_trade:
+            with contextlib.suppress(Exception):
+                self._record_thesis_regime_outcome(position, float(realized_pnl))
+            with contextlib.suppress(Exception):
+                self._record_day_bucket_outcome(position, float(realized_pnl), exit_trigger=exit_trigger)
 
         # Canonical: total_equity = cash_balance + positions_value (market)
         await self._recompute_positions_values()
@@ -17414,15 +17511,16 @@ class PortfolioEngine:
                     [oid, *((live_order_sell or {}).get("_mystic_order_ids") or [])],
                 )
 
-        with contextlib.suppress(Exception):
-            self._record_trade_pattern_memory(
-                symbol=normalized_symbol,
-                position=position,
-                net_pnl=float(realized_pnl),
-                net_outcome_pct=float(pnl_pct),
-                hold_seconds=float(hold_time_seconds or 0.0),
-                reason=learning_close_reason,
-            )
+        if _count_completed_trade:
+            with contextlib.suppress(Exception):
+                self._record_trade_pattern_memory(
+                    symbol=normalized_symbol,
+                    position=position,
+                    net_pnl=float(realized_pnl),
+                    net_outcome_pct=float(pnl_pct),
+                    hold_seconds=float(hold_time_seconds or 0.0),
+                    reason=learning_close_reason,
+                )
 
         # Track fees/slippage for scoreboard
         self._total_fees_paid += fee
@@ -24146,8 +24244,14 @@ class PortfolioEngine:
         symbol: str,
         realized_pnl: float,
         is_loss: bool = False,
+        *,
+        count_trade: bool = True,
     ) -> None:
-        """Update per-coin performance metrics and check pause rules"""
+        """Update per-coin performance metrics and check pause rules.
+
+        Realized dollars land on every sell. The win/loss sample is one
+        completed entry, so an interim chunk does not add a trade.
+        """
         if symbol not in self.coin_performance:
             self.coin_performance[symbol] = CoinPerformance(symbol=symbol)
             self._prune_coin_performance()
@@ -24155,28 +24259,29 @@ class PortfolioEngine:
         perf = self.coin_performance[symbol]
         current_time = time.time()
 
-        # Update 24h metrics
-        perf.trades_24h += 1
+        # Update 24h metrics. Dollars are execution PnL. The trade count is not.
         perf.pnl_24h += realized_pnl
+        if count_trade:
+            perf.trades_24h += 1
 
-        # Update rolling 20-trade metrics using a bounded deque for correct window rollover
-        is_win = realized_pnl > 0
-        perf._outcome_history.append(is_win)
-        perf.win_count_20 = sum(1 for o in perf._outcome_history if o)
-        perf.loss_count_20 = sum(1 for o in perf._outcome_history if not o)
-        perf.total_trades_20 = len(perf._outcome_history)
+            # Update rolling 20-trade metrics using a bounded deque for correct window rollover
+            is_win = realized_pnl > 0
+            perf._outcome_history.append(is_win)
+            perf.win_count_20 = sum(1 for o in perf._outcome_history if o)
+            perf.loss_count_20 = sum(1 for o in perf._outcome_history if not o)
+            perf.total_trades_20 = len(perf._outcome_history)
 
-        if is_win:
-            # Update average win (exponential moving average)
-            if perf.avg_win == 0:
-                perf.avg_win = realized_pnl
+            if is_win:
+                # Update average win (exponential moving average)
+                if perf.avg_win == 0:
+                    perf.avg_win = realized_pnl
+                else:
+                    perf.avg_win = perf.avg_win * 0.9 + realized_pnl * 0.1
+            # Update average loss
+            elif perf.avg_loss == 0:
+                perf.avg_loss = abs(realized_pnl)
             else:
-                perf.avg_win = perf.avg_win * 0.9 + realized_pnl * 0.1
-        # Update average loss
-        elif perf.avg_loss == 0:
-            perf.avg_loss = abs(realized_pnl)
-        else:
-            perf.avg_loss = perf.avg_loss * 0.9 + abs(realized_pnl) * 0.1
+                perf.avg_loss = perf.avg_loss * 0.9 + abs(realized_pnl) * 0.1
 
         # Rolling last-N loss hits. When DAY is LIVE this is live-mode closes only.
         # Paper/learning history stays in coin_performance rows; it must not pause LIVE.
@@ -24192,11 +24297,12 @@ class PortfolioEngine:
                 sticky_hits=perf.stop_loss_hits_10,
                 live_pnls=live_pnls,
             )
-        elif is_loss:
+        elif count_trade and is_loss:
             perf.stop_loss_hits_10 = min(10, perf.stop_loss_hits_10 + 1)
 
-        # Update expectancy
-        perf.update_expectancy()
+        if count_trade:
+            # Update expectancy
+            perf.update_expectancy()
 
         # COIN UNIVERSE RULES: profit_factor from rolling 20
         perf.profit_factor = perf.compute_profit_factor()

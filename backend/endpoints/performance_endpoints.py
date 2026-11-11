@@ -179,6 +179,7 @@ def _today_day_trade_stats() -> dict[str, Any]:
         "today_start": today_start.isoformat(),
         "today_closed_sells": sells,
         "today_win_rate_pct": round(win_rate, 1),
+        "win_rate_basis": "sell_execution",
     }
 
 
@@ -291,6 +292,7 @@ def _historical_diagnostic_context() -> dict[str, Any]:
             "scope": _HISTORICAL_DIAGNOSTIC_SCOPE,
             "all_time_closed_sells": all_sells,
             "all_time_win_rate_pct": round(all_win_rate, 1),
+            "win_rate_basis": "sell_execution",
             "note": "HISTORICAL DIAGNOSTIC ONLY — not current operator performance.",
         }
     )

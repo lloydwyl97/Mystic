@@ -250,6 +250,33 @@ def merge_terminal_learn(chunks: list[dict[str, Any]]) -> dict[str, Any]:
     return {key: out.get(key) for key in _LEARN_KEYS}
 
 
+def completed_trade_row(extra: object) -> bool:
+    """True when a learning row is a finished entry, not an interim sell chunk.
+
+    Rows written before this field existed have neither key. They stay in
+    historical reports. An explicit ``entry_settled`` false, or
+    ``strategy_terminal`` false, is an execution record.
+    """
+    if not isinstance(extra, dict):
+        return True
+    if "entry_settled" not in extra and "strategy_terminal" not in extra:
+        return True
+    if extra.get("entry_settled") is False:
+        return False
+    if "strategy_terminal" in extra:
+        return bool(extra.get("strategy_terminal"))
+    return True
+
+
+def completed_trade_predicate(column: str = "extra_json") -> str:
+    """SQL for completed_trade_row. Invalid or pre-field JSON stays included."""
+    return (
+        f"({column} IS NULL OR TRIM(COALESCE({column}, '')) = '' OR json_valid({column}) = 0 "
+        f"OR (COALESCE(json_extract({column}, '$.entry_settled'), 1) != 0 "
+        f"AND COALESCE(json_extract({column}, '$.strategy_terminal'), 1) != 0))"
+    )
+
+
 def settlement_rows(db_path: str, *, now: float | None = None) -> list[dict[str, Any]]:
     """Buys that still own the lifecycle even when the local position is flat."""
     from backend.services.strategy_order_intent import _connect

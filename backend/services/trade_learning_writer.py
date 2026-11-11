@@ -476,12 +476,15 @@ def consume_setup_outcomes_for_ranking(
         conn = sqlite3.connect(db_path, timeout=10)
         try:
             conn.row_factory = sqlite3.Row
+            from backend.services.buy_entry_settlement import completed_trade_predicate
+
             rows = conn.execute(
                 f"""
                 SELECT net_profit_usd, extra_json, rank_data_json, close_reason,
                        hold_seconds, indicators_while_holding_json
                 FROM {TABLE_NAME}
                 WHERE realized_profit_unknown = 0 AND net_profit_usd IS NOT NULL{version_sql}
+                  AND {completed_trade_predicate("extra_json")}
                 ORDER BY id DESC LIMIT ?
                 """,
                 (*version_params, max(20, int(limit) * 6)),
@@ -506,6 +509,10 @@ def consume_setup_outcomes_for_ranking(
             rank = json.loads(row["rank_data_json"] or "{}") if row["rank_data_json"] else {}
         with contextlib.suppress(Exception):
             indicators = json.loads(row["indicators_while_holding_json"] or "{}") if row["indicators_while_holding_json"] else {}
+        from backend.services.buy_entry_settlement import completed_trade_row
+
+        if not completed_trade_row(extra):
+            continue
         setup_row = str(extra.get("setup_type_canonical") or extra.get("setup_type") or extra.get("setup") or rank.get("setup") or "").strip().upper()
         if setup_row != setup_u:
             continue

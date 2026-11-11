@@ -1448,6 +1448,11 @@ def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:
                         raw = row["extra_json"]
                         if raw:
                             extra = json.loads(raw) if isinstance(raw, str) else {}
+                    from backend.services.buy_entry_settlement import completed_trade_row
+
+                    if not completed_trade_row(extra):
+                        counters["skipped"] += 1
+                        continue
                     setup_name = str(extra.get("setup") or "")
                     conn.execute(
                         """
