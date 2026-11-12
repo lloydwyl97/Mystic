@@ -10626,7 +10626,71 @@ class PortfolioEngine:
                 return order
         return None
 
-    async def _progress_working_sell(self, symbol: str, *, allow_cancel: bool) -> None:
+    async def _book_ready_fee_pending(
+        self,
+        position: Any,
+        symbol: str,
+        current_bar: int,
+        *,
+        price: float | None,
+    ) -> None:
+        """Book one terminal fill whose commission can be read. The price is the fill, not a new decision mark."""
+        try:
+            from backend.services.strategy_order_intent import unbooked_protective_sells
+
+            trade_id = str(getattr(position, "trade_id", "") or "")
+            if not trade_id or not getattr(self, "db_path", None):
+                return
+            if not unbooked_protective_sells(self.db_path, trade_id):
+                return
+            ready_pending = await self._canonical_pending_sell(position)
+            if not isinstance(ready_pending, dict):
+                return
+            position._ready_pending_sell = ready_pending
+            book_px = float(price or 0.0)
+            if book_px <= 0.0:
+                book_px = float(ready_pending.get("average") or 0.0)
+            if book_px <= 0.0:
+                return
+            await self.execute_sell_fifo(
+                symbol,
+                float(position.quantity or 0.0),
+                book_px,
+                ExitType.STRATEGY,
+                "FEE_PENDING_ENRICHED",
+                current_bar=current_bar,
+                force_sell=True,
+                engine_id=str(getattr(position, "engine_id", "") or ""),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("FEE_PENDING_ENRICH_FAILED symbol=%s", symbol, exc_info=True)
+
+    def _note_sell_probe(self, symbol: str, intent: dict[str, Any], result: str) -> None:
+        """Remember the last venue classification separately from the last mark attempt."""
+        state = getattr(self, "_sell_probe_state", None)
+        if not isinstance(state, dict):
+            state = {}
+            self._sell_probe_state = state
+        state[normalize_symbol(symbol)] = {
+            "at": time.time(),
+            "result": str(result or ""),
+            "trade_id": str(intent.get("trade_id") or ""),
+            "client_order_id": str(intent.get("client_order_id") or ""),
+            "engine_id": str(intent.get("engine_id") or ""),
+        }
+        self._last_order_probe_at = state[normalize_symbol(symbol)]["at"]
+        self._last_order_probe_result = str(result or "")
+        logger.info(
+            "SELL_PROBE_RESULT symbol=%s engine=%s trade_id=%s result=%s",
+            symbol,
+            intent.get("engine_id"),
+            intent.get("trade_id"),
+            result,
+        )
+
+    async def _progress_working_sell(self, symbol: str, *, allow_cancel: bool, cancel_only: bool = False) -> None:
         """Adopt fills on a live protective SELL. Cancel it only after its own timeout and a fresh book.
 
         A dead order releases its client id so the next exit pass can submit at the fresh book.
@@ -10640,20 +10704,43 @@ class PortfolioEngine:
         self._last_sell_probe_epoch = time.time()
         timeout = float(PROTECTED_LIMIT_ORDER_TIMEOUT_SEC)
         for intent in working_sell_intents(self.db_path, symbol):
-            probed = await self._probe_intent(intent)
-            if probed.get("unconfirmed"):
-                continue
-            if probed.get("absent"):
-                mark_intent_absent(self.db_path, str(intent.get("client_order_id") or ""))
-                self.note_sell_symbol_released()
-                continue
-            order = probed["order"]
-            await self._apply_probed_order(order, str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""), wait=False)
-            if not order_is_working(order):
-                self.note_sell_symbol_released()
+            order = None
+            if not cancel_only:
+                probed = await self._probe_intent(intent)
+                if probed.get("rate_limited"):
+                    probe_result = "rate_limited"
+                elif probed.get("unconfirmed"):
+                    probe_result = "unconfirmed"
+                elif probed.get("absent"):
+                    probe_result = "absent"
+                else:
+                    found = probed.get("order") if isinstance(probed.get("order"), dict) else {}
+                    probe_result = str(found.get("status") or "found")
+                self._note_sell_probe(symbol, intent, probe_result)
+                if probed.get("rate_limited"):
+                    logger.warning(
+                        "SELL_PROBE_WEIGHT_REFUSED symbol=%s trade_id=%s client_order_id=%s — order status was not classified; the mark was not the blocker",
+                        symbol,
+                        intent.get("trade_id"),
+                        intent.get("client_order_id"),
+                    )
+                if probed.get("unconfirmed"):
+                    continue
+                if probed.get("absent"):
+                    mark_intent_absent(self.db_path, str(intent.get("client_order_id") or ""))
+                    self.note_sell_symbol_released()
+                    continue
+                order = probed["order"]
+                await self._apply_probed_order(order, str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""), wait=False)
+                if not order_is_working(order):
+                    self.note_sell_symbol_released()
+                    continue
+                if not allow_cancel:
+                    continue
+            elif not allow_cancel:
                 continue
             age = time.time() - float(intent.get("created_at") or time.time())
-            if not allow_cancel or age < timeout:
+            if age < timeout:
                 continue
             book = await self._execution_book_is_fresh(symbol)
             if book is None:
@@ -10670,7 +10757,7 @@ class PortfolioEngine:
                 "drift_bps": ((limit_px - bid) / bid * 10000.0) if bid > 0.0 and limit_px > 0.0 else None,
                 "remaining_qty": max(0.0, float(intent.get("quantity") or 0.0) - float(intent.get("filled_qty") or 0.0)),
             }
-            oid = str(order.get("id") or intent.get("exchange_order_id") or "")
+            oid = str((order or {}).get("id") or intent.get("exchange_order_id") or "")
             if not oid:
                 continue
             with contextlib.suppress(Exception):
@@ -18613,26 +18700,69 @@ class PortfolioEngine:
 
             try:
                 positions_evaluated += 1
+                try:
+                    await self._progress_working_sell(symbol, allow_cancel=False)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "SELL_PROGRESS_FAILED engine=%s symbol=%s trade_id=%s",
+                        _lot_engine,
+                        symbol,
+                        getattr(position, "trade_id", ""),
+                        exc_info=True,
+                    )
+
                 executable_bid: float | None = None
-                if _lot_engine == "SCALP_V2":
-                    mark_info, executable_bid = await self._scalp_exit_quote(symbol, executable_quote_only=executable_quote_only)
-                    if mark_info is None:
-                        try:
-                            await self._progress_working_sell(symbol, allow_cancel=False)
-                        except Exception:
-                            logger.warning("SELL_PROGRESS_FAILED symbol=%s", symbol, exc_info=True)
-                        continue
-                else:
-                    mark_info = await self._resolve_exit_monitor_mark(symbol)
+                marks = getattr(self, "_exit_mark_state", None)
+                if not isinstance(marks, dict):
+                    marks = {}
+                    self._exit_mark_state = marks
+                marks[symbol] = {"attempt_at": time.time(), "failure": ""}
+                self._last_mark_attempt_at = marks[symbol]["attempt_at"]
+                self._last_mark_failure = ""
+                try:
+                    if _lot_engine == "SCALP_V2":
+                        mark_info, executable_bid = await self._scalp_exit_quote(symbol, executable_quote_only=executable_quote_only)
+                        if mark_info is None:
+                            await self._book_ready_fee_pending(position, symbol, current_bar, price=None)
+                            continue
+                    else:
+                        mark_info = await self._resolve_exit_monitor_mark(symbol)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    marks[symbol]["failure"] = type(exc).__name__
+                    self._last_mark_failure = type(exc).__name__
+                    probe = (getattr(self, "_sell_probe_state", None) or {}).get(symbol) or {}
+                    logger.exception(
+                        "EXIT_MARK_RESOLUTION_FAILED engine=%s symbol=%s trade_id=%s error=%s last_order_probe_at=%s last_order_probe_result=%s — existing SELL was progressed; a new SELL waits",
+                        _lot_engine,
+                        symbol,
+                        getattr(position, "trade_id", ""),
+                        type(exc).__name__,
+                        probe.get("at"),
+                        probe.get("result"),
+                    )
+                    await self._book_ready_fee_pending(position, symbol, current_bar, price=None)
+                    continue
                 telemetry = self._build_exit_check_telemetry(position, mark_info)
                 self._log_exit_check_telemetry(telemetry)
 
-                try:
-                    await self._progress_working_sell(symbol, allow_cancel=_exit_mark_is_usable(mark_info))
-                except Exception:
-                    logger.warning("SELL_PROGRESS_FAILED symbol=%s", symbol, exc_info=True)
-
-                if not _exit_mark_is_usable(mark_info):
+                if _exit_mark_is_usable(mark_info):
+                    try:
+                        await self._progress_working_sell(symbol, allow_cancel=True, cancel_only=True)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "SELL_CANCEL_FAILED engine=%s symbol=%s trade_id=%s",
+                            _lot_engine,
+                            symbol,
+                            getattr(position, "trade_id", ""),
+                            exc_info=True,
+                        )
+                else:
                     any_stale_marks = True
                     logger.warning(
                         "EXIT_MARK_STALE_NO_SELL symbol=%s source=%s age=%s mark=%s",
@@ -18641,28 +18771,11 @@ class PortfolioEngine:
                         mark_info.get("mark_age_seconds"),
                         mark_info.get("mark_used"),
                     )
+                    await self._book_ready_fee_pending(position, symbol, current_bar, price=None)
                     continue
 
                 current_price = float(mark_info["mark_used"])
-                try:
-                    from backend.services.strategy_order_intent import unbooked_protective_sells
-
-                    if unbooked_protective_sells(self.db_path, str(getattr(position, "trade_id", "") or "")):
-                        ready_pending = await self._canonical_pending_sell(position)
-                        if isinstance(ready_pending, dict):
-                            position._ready_pending_sell = ready_pending
-                            await self.execute_sell_fifo(
-                                symbol,
-                                float(position.quantity or 0.0),
-                                current_price,
-                                ExitType.STRATEGY,
-                                "FEE_PENDING_ENRICHED",
-                                current_bar=current_bar,
-                                force_sell=True,
-                                engine_id=str(getattr(position, "engine_id", "") or ""),
-                            )
-                except Exception:
-                    logger.warning("FEE_PENDING_ENRICH_FAILED symbol=%s", symbol, exc_info=True)
+                await self._book_ready_fee_pending(position, symbol, current_bar, price=current_price)
                 obs_ts = mark_info.get("mark_timestamp")
                 last_obs = getattr(position, "_last_mark_ts", None)
                 if isinstance(obs_ts, (int, float)) and isinstance(last_obs, (int, float)) and float(obs_ts) < float(last_obs):

@@ -27,8 +27,9 @@ def _monitor(tmp_path, monkeypatch, symbols: list[tuple[str, str]]):
     eng._learning_heartbeat_last = {symbol: time.time() for _engine_id, symbol in symbols}
     progressed: list[str] = []
 
-    async def _progress(symbol, allow_cancel=True):
-        progressed.append(symbol)
+    async def _progress(symbol, allow_cancel=True, cancel_only=False):
+        if not cancel_only:
+            progressed.append(symbol)
 
     eng._progress_working_sell = _progress
     checked: list[str] = []
@@ -151,8 +152,8 @@ async def test_mark_failure_on_the_first_lot_still_progresses_the_rest(tmp_path,
     )
     await eng.monitor_all_positions({}, 0)
     assert checked == ["ETH/USDT", "SOL/USDT", "XRP/USDT"]
-    assert progressed == ["ETH/USDT", "SOL/USDT", "XRP/USDT"]
-    assert eng._last_exit_pass_stats == {"evaluated": 3, "failed": 1}
+    assert progressed == ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+    assert eng._last_exit_pass_stats == {"evaluated": 4, "failed": 0}
 
 
 @pytest.mark.asyncio
@@ -182,7 +183,7 @@ async def test_residual_lot_still_runs_when_an_earlier_lot_throws(tmp_path, monk
     eng.open_positions[make_position_key(DAY, "SOL/USDT")].status = "EXIT_RESIDUAL_PENDING"
     await eng.monitor_all_positions({}, 0)
     assert checked == ["SOL/USDT"]
-    assert progressed == ["SOL/USDT"]
+    assert progressed == ["BTC/USDT", "SOL/USDT"]
 
 
 @pytest.mark.asyncio
