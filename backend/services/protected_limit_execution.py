@@ -415,7 +415,12 @@ def evaluate_executable_sell_profit(
     return base
 
 
-async def _fetch_order_book(ccxt_symbol: str, *, priority: str = "background") -> ExecutableBook | None:
+async def _fetch_order_book(
+    ccxt_symbol: str,
+    *,
+    priority: str = "background",
+    surface_errors: bool = False,
+) -> ExecutableBook | None:
     """Fetch L2 via live_market_data service (existing path, depth limit capped)."""
     try:
         from backend.services.live_market_data import live_market_data_service
@@ -436,6 +441,8 @@ async def _fetch_order_book(ccxt_symbol: str, *, priority: str = "background") -
             exchange_ts=ob.get("exchange_ts"),
         )
     except Exception as ex:
+        if surface_errors:
+            raise
         logger.warning("PROTECTED_EXEC order book fetch failed %s: %s", ccxt_symbol, ex)
         return None
 

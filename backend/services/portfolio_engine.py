@@ -10535,14 +10535,33 @@ class PortfolioEngine:
         return applied
 
     async def _execution_book_is_fresh(self, symbol: str) -> dict[str, Any] | None:
-        """The book a replacement would use. None when it is missing or stale."""
-        from backend.services.protected_limit_execution import FRESHNESS_FRESH, _fetch_order_book, assess_book_freshness
+        """The book a replacement would use. None when it is missing or stale.
 
-        book = await _fetch_order_book(symbol)
+        This read exists only to decide whether an already-working protective
+        SELL may be canceled. It uses exit priority so the protective reserve
+        can pay for it. Ordinary depth reads stay on their own priority.
+        """
+        from backend.services.protected_limit_execution import FRESHNESS_FRESH, _fetch_order_book, assess_book_freshness
+        from backend.utils.binance_weight_limiter import CircuitOpenError, RateLimitedError
+
+        try:
+            book = await _fetch_order_book(symbol, priority="exit", surface_errors=True)
+        except (RateLimitedError, CircuitOpenError):
+            logger.warning("CANCEL_BOOK_WEIGHT_REFUSED symbol=%s — existing GTC stays working; no DELETE", symbol)
+            return None
+        except Exception:
+            logger.warning("CANCEL_BOOK_FETCH_FAILED symbol=%s — existing GTC stays working; no DELETE", symbol, exc_info=True)
+            return None
         if book is None or not book.bids or not book.asks:
+            logger.warning("CANCEL_BOOK_FETCH_FAILED symbol=%s — empty book; existing GTC stays working; no DELETE", symbol)
             return None
         freshness = assess_book_freshness(symbol, book)
         if freshness.get("freshness_result") != FRESHNESS_FRESH:
+            logger.warning(
+                "CANCEL_BOOK_FETCH_FAILED symbol=%s result=%s — existing GTC stays working; no DELETE",
+                symbol,
+                freshness.get("freshness_result"),
+            )
             return None
         try:
             bid = float(book.bids[0][0])
@@ -10744,6 +10763,11 @@ class PortfolioEngine:
                 continue
             book = await self._execution_book_is_fresh(symbol)
             if book is None:
+                logger.warning(
+                    "GTC_STILL_WORKING symbol=%s client_order_id=%s — cancel book unavailable; no DELETE",
+                    symbol,
+                    intent.get("client_order_id"),
+                )
                 continue
             limit_px = float(intent.get("limit_price") or 0.0)
             bid = float(book.get("best_bid") or 0.0)
@@ -10768,10 +10792,24 @@ class PortfolioEngine:
                 logger.warning("SELL_CANCEL_CONFIRM_FAILED symbol=%s order=%s", symbol, oid, exc_info=True)
                 continue
             if str(again.get("status") or "") != "success" or not isinstance(again.get("order"), dict):
+                logger.warning(
+                    "SELL_CANCEL_CONFIRM_FAILED symbol=%s order=%s status=%s rate_limited=%s — GTC remains working",
+                    symbol,
+                    oid,
+                    again.get("status"),
+                    again.get("rate_limited"),
+                )
                 continue
             await self._apply_probed_order(again["order"], str(intent.get("symbol") or symbol), str(intent.get("client_order_id") or ""), wait=False)
             if not order_is_working(again.get("order")):
                 self.note_sell_symbol_released()
+            else:
+                logger.warning(
+                    "GTC_STILL_WORKING symbol=%s order=%s status=%s",
+                    symbol,
+                    oid,
+                    str((again.get("order") or {}).get("status") or ""),
+                )
 
     async def _recover_strategy_order_intents(self) -> int:
         """Find venue orders for intents that died before a fill was stored, then book them once."""

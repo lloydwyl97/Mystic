@@ -352,6 +352,22 @@ def test_exact_29_still_cannot_buy_the_background_cancel_book() -> None:
     assert weight_grant_allowed(1100, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is False
 
 
+def test_exit_priority_cancel_book_is_paid_by_the_reserve_and_background_is_not() -> None:
+    assert weight_grant_allowed(PROTECTIVE_WEIGHT_RESERVE, DEPTH_WEIGHT, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True)
+    assert weight_grant_allowed(PROTECTIVE_WEIGHT_RESERVE, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    assert weight_grant_allowed(1100, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is False
+    assert weight_grant_allowed(4, DEPTH_WEIGHT, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    remaining = ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT
+    remaining = _spend(remaining, ORDER_STATUS_WEIGHT, "exit")
+    remaining = _spend(remaining, DEPTH_WEIGHT, "exit")
+    remaining = _spend(remaining, ORDER_CANCEL_WEIGHT, "exit")
+    remaining = _spend(remaining, ORDER_STATUS_WEIGHT, "exit")
+    assert remaining == 11
+    assert ORDER_STATUS_WEIGHT + DEPTH_WEIGHT + ORDER_CANCEL_WEIGHT + ORDER_STATUS_WEIGHT == 14
+    assert ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT > 14
+    assert PROTECTIVE_WEIGHT_RESERVE >= (8 * 6 * 6) + 14
+
+
 def test_one_gtc_fallback_plus_seven_full_retry_budgets_fits_without_mytrades() -> None:
     seven_full = 7 * MANDATORY_EXIT_SAME_CALL_ATTEMPTS * (DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT)
     five_zero_fills = 5 * (DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT)
