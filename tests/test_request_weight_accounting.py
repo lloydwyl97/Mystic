@@ -297,3 +297,68 @@ async def test_order_book_is_not_fetched_when_weight_is_refused(monkeypatch) -> 
     result = await service.get_order_book("BTC/USDT", limit=10)
     assert result["fetch_failed"] is True
     assert called == []
+
+
+def _spend(remaining: int, weight: int, priority: str, *, pending: bool = False) -> int:
+    assert weight_grant_allowed(remaining, weight, priority=priority, reserve=PROTECTIVE_WEIGHT_RESERVE, pending=pending)
+    return remaining - weight
+
+
+def test_reserve_contract_is_eight_by_six_clean_attempts_plus_one_recovery_bundle() -> None:
+    clean = DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT
+    recovery = ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT
+    assert clean == 6
+    assert recovery == 25
+    assert COMBINED_ENGINE_MAX_POSITIONS == 8
+    assert MANDATORY_EXIT_SAME_CALL_ATTEMPTS == 6
+    assert PROTECTIVE_WEIGHT_RESERVE == 8 * 6 * 6 + 25
+    assert PROTECTIVE_WEIGHT_RESERVE == 313
+
+
+def test_exact_313_pays_eight_first_sells_and_still_has_the_recovery_bundle() -> None:
+    remaining = PROTECTIVE_WEIGHT_RESERVE
+    for _lot in range(COMBINED_ENGINE_MAX_POSITIONS):
+        remaining = _spend(remaining, DEPTH_WEIGHT, "exit")
+        remaining = _spend(remaining, ORDER_SUBMIT_WEIGHT, "exit")
+    assert remaining == 313 - 48
+    assert weight_grant_allowed(remaining, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    remaining = _spend(remaining, ORDER_STATUS_WEIGHT, "exit")
+    remaining = _spend(remaining, ORDER_CANCEL_WEIGHT, "exit")
+    remaining = _spend(remaining, ORDER_STATUS_WEIGHT, "exit")
+    assert remaining == 313 - 48 - 9
+    assert weight_grant_allowed(remaining, MY_TRADES_WEIGHT, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False)
+
+
+def test_exact_25_pays_probe_cancel_and_confirm_and_defers_mytrades() -> None:
+    remaining = ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT + ORDER_CANCEL_WEIGHT
+    assert remaining == 25
+    remaining = _spend(remaining, ORDER_STATUS_WEIGHT, "exit")
+    assert weight_grant_allowed(remaining, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    remaining = _spend(remaining, ORDER_CANCEL_WEIGHT, "exit")
+    remaining = _spend(remaining, ORDER_STATUS_WEIGHT, "exit")
+    assert remaining == 16
+    assert weight_grant_allowed(remaining, MY_TRADES_WEIGHT, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    assert weight_grant_allowed(3, ORDER_STATUS_WEIGHT, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    assert weight_grant_allowed(ORDER_STATUS_WEIGHT, ORDER_STATUS_WEIGHT, priority="exit", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False)
+
+
+def test_exact_29_still_cannot_buy_the_background_cancel_book() -> None:
+    remaining = ORDER_STATUS_WEIGHT + ORDER_CANCEL_WEIGHT + ORDER_STATUS_WEIGHT + MY_TRADES_WEIGHT
+    assert remaining == 29
+    remaining = _spend(remaining, ORDER_STATUS_WEIGHT, "exit")
+    assert weight_grant_allowed(remaining, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    assert weight_grant_allowed(318, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False)
+    assert weight_grant_allowed(317, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=False) is False
+    assert weight_grant_allowed(1100, DEPTH_WEIGHT, priority="background", reserve=PROTECTIVE_WEIGHT_RESERVE, pending=True) is False
+
+
+def test_one_gtc_fallback_plus_seven_full_retry_budgets_fits_without_mytrades() -> None:
+    seven_full = 7 * MANDATORY_EXIT_SAME_CALL_ATTEMPTS * (DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT)
+    five_zero_fills = 5 * (DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT)
+    gtc_attempt = DEPTH_WEIGHT + ORDER_SUBMIT_WEIGHT + ORDER_STATUS_WEIGHT + ORDER_SUBMIT_WEIGHT
+    one_poll = ORDER_STATUS_WEIGHT
+    in_call_confirm = ORDER_CANCEL_WEIGHT + ORDER_STATUS_WEIGHT
+    hard = seven_full + five_zero_fills + gtc_attempt + one_poll + in_call_confirm
+    assert hard == 302
+    assert hard <= PROTECTIVE_WEIGHT_RESERVE
+    assert hard + MY_TRADES_WEIGHT > PROTECTIVE_WEIGHT_RESERVE
