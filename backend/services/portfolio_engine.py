@@ -18593,6 +18593,8 @@ class PortfolioEngine:
         # Skip DUST_PENDING - they are reconciled by dust_reconciliation_loop
         # === END DUST_INVARIANT_LOCK ===
         any_stale_marks = False
+        positions_evaluated = 0
+        position_passes_failed = 0
         for _key, position in list(self.open_positions.items()):
             # Two-engine contract: strategy symbol from the position, never the
             # composite memory key. Each engine's lot is evaluated independently
@@ -18609,217 +18611,253 @@ class PortfolioEngine:
             if engine_ids is not None and _lot_engine not in engine_ids:
                 continue
 
-            executable_bid: float | None = None
-            if _lot_engine == "SCALP_V2":
-                mark_info, executable_bid = await self._scalp_exit_quote(symbol, executable_quote_only=executable_quote_only)
-                if mark_info is None:
-                    try:
-                        await self._progress_working_sell(symbol, allow_cancel=False)
-                    except Exception:
-                        logger.warning("SELL_PROGRESS_FAILED symbol=%s", symbol, exc_info=True)
-                    continue
-            else:
-                mark_info = await self._resolve_exit_monitor_mark(symbol)
-            telemetry = self._build_exit_check_telemetry(position, mark_info)
-            self._log_exit_check_telemetry(telemetry)
-
             try:
-                await self._progress_working_sell(symbol, allow_cancel=_exit_mark_is_usable(mark_info))
-            except Exception:
-                logger.warning("SELL_PROGRESS_FAILED symbol=%s", symbol, exc_info=True)
-
-            if not _exit_mark_is_usable(mark_info):
-                any_stale_marks = True
-                logger.warning(
-                    "EXIT_MARK_STALE_NO_SELL symbol=%s source=%s age=%s mark=%s",
-                    symbol,
-                    mark_info.get("mark_source"),
-                    mark_info.get("mark_age_seconds"),
-                    mark_info.get("mark_used"),
-                )
-                continue
-
-            current_price = float(mark_info["mark_used"])
-            try:
-                from backend.services.strategy_order_intent import unbooked_protective_sells
-
-                if unbooked_protective_sells(self.db_path, str(getattr(position, "trade_id", "") or "")):
-                    ready_pending = await self._canonical_pending_sell(position)
-                    if isinstance(ready_pending, dict):
-                        position._ready_pending_sell = ready_pending
-                        await self.execute_sell_fifo(
-                            symbol,
-                            float(position.quantity or 0.0),
-                            current_price,
-                            ExitType.STRATEGY,
-                            "FEE_PENDING_ENRICHED",
-                            current_bar=current_bar,
-                            force_sell=True,
-                            engine_id=str(getattr(position, "engine_id", "") or ""),
-                        )
-            except Exception:
-                logger.warning("FEE_PENDING_ENRICH_FAILED symbol=%s", symbol, exc_info=True)
-            obs_ts = mark_info.get("mark_timestamp")
-            last_obs = getattr(position, "_last_mark_ts", None)
-            if isinstance(obs_ts, (int, float)) and isinstance(last_obs, (int, float)) and float(obs_ts) < float(last_obs):
-                logger.warning(
-                    "EXIT_MARK_OUT_OF_ORDER symbol=%s obs=%s last=%s — watermark and sell unchanged",
-                    symbol,
-                    obs_ts,
-                    last_obs,
-                )
-                continue
-
-            # Update high/low watermarks (for MFE/MAE diagnostics).
-            # High-water folds executable mark AND the live 1m high already
-            # fetched on this path so a brief post-entry print is not lost
-            # between 45s book-mid samples. Exits still use current_price (mid).
-            from backend.services.day_high_water import (
-                first_full_minute_epoch,
-                fold_high_water,
-                load_feature_1m_candles,
-                max_post_entry_1m_high,
-                usable_kline_high,
-            )
-
-            old_high = position.highest_price
-            old_low = float(getattr(position, "lowest_price", 0.0) or 0.0)
-            entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
-            kline_high = usable_kline_high(
-                entry_ts,
-                mark_info.get("kline_1m_open_time"),
-                mark_info.get("kline_1m_high"),
-            )
-            hist_high = 0.0
-            if not getattr(position, "_hw_1m_backfilled", False):
-                hist_high = max_post_entry_1m_high(
-                    entry_ts,
-                    load_feature_1m_candles(symbol, first_full_minute_epoch(entry_ts)),
-                )
-                position._hw_1m_backfilled = True
-            position.highest_price = fold_high_water(
-                position.highest_price,
-                current_price,
-                kline_high,
-                hist_high,
-            )
-            if not hasattr(position, "lowest_price") or position.lowest_price <= 0:
-                position.lowest_price = min(position.entry_price, current_price)
-            else:
-                position.lowest_price = min(position.lowest_price, current_price)
-
-            # Persist either watermark so MAE/wick-stop memory survives restarts
-            watermark_changed = position.highest_price > old_high or float(position.lowest_price or 0.0) < old_low or old_low <= 0
-            profile = get_coin_profile(symbol)
-            from backend.services.day_controlled_exits import (
-                apply_break_even_and_mfe_trail,
-                refresh_trailing_stop,
-            )
-
-            if watermark_changed:
-                refresh_trailing_stop(position, current_price, profile)
-            # Break-even + MFE-tier ratchet must run every monitor cycle, not
-            # only on new-HH/new-LL. Positions whose peak MFE was reached in a
-            # prior cycle (or before this code path was live) would otherwise
-            # never see their stop lifted to break-even, and a subsequent
-            # reversal would exit via giveback/stall for a full loss.
-            be_changed = apply_break_even_and_mfe_trail(position, current_price)
-            if watermark_changed or be_changed:
-                await self._persist_position_to_sqlite(position)
-            if isinstance(obs_ts, (int, float)):
-                position._last_mark_ts = float(obs_ts)
-
-            # LEARNING INGESTION: open-position heartbeat (throttled per symbol).
-            # Generates learning rows while holding, before any close happens.
-            try:
-                hb_last = getattr(self, "_learning_heartbeat_last", None)
-                if hb_last is None:
-                    hb_last = {}
-                    self._learning_heartbeat_last = hb_last
-                hb_gap = float(os.getenv("AI_LEARNING_HEARTBEAT_GAP_SEC", "300"))
-                if time.time() - hb_last.get(symbol, 0.0) >= hb_gap:
-                    hb_last[symbol] = time.time()
-                    from backend.services.ai_learning_ingestion import record_position_heartbeat
-
-                    await asyncio.to_thread(
-                        record_position_heartbeat,
-                        symbol=symbol,
-                        trade_id=str(position.trade_id or ""),
-                        entry_price=float(position.entry_price or 0.0),
-                        mark=float(current_price),
-                        entry_time_epoch=float(position.entry_time or 0.0),
-                        thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
-                        thesis_target_level=float(getattr(position, "thesis_target_level", 0.0) or 0.0),
-                        entry_thesis=str(getattr(position, "entry_thesis", "") or ""),
-                        quantity=float(position.quantity or 0.0),
-                        entry_fee=float(getattr(position, "entry_fee", 0.0) or 0.0),
-                        thesis_score=float(getattr(position, "thesis_score", 0.0) or 0.0),
-                        entry_vwap=float(getattr(position, "entry_vwap", 0.0) or 0.0),
-                        highest_price=float(getattr(position, "highest_price", 0.0) or 0.0),
-                        lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
-                    )
-            except Exception:
-                logger.debug("learning heartbeat skipped for %s", symbol, exc_info=True)
-
-            miss_kw: list[str] | None = None
-            if hold_day_missing is not None:
-                raw_m = hold_day_missing.get(_key)
-                if raw_m is None:
-                    raw_m = hold_day_missing.get(symbol)
-                if raw_m is None:
-                    raw_m = hold_day_missing.get(normalize_symbol(symbol))
-                if isinstance(raw_m, list):
-                    miss_kw = list(raw_m)
-                elif raw_m is None:
-                    miss_kw = ["hold_missing_map_key_absent"]
+                positions_evaluated += 1
+                executable_bid: float | None = None
+                if _lot_engine == "SCALP_V2":
+                    mark_info, executable_bid = await self._scalp_exit_quote(symbol, executable_quote_only=executable_quote_only)
+                    if mark_info is None:
+                        try:
+                            await self._progress_working_sell(symbol, allow_cancel=False)
+                        except Exception:
+                            logger.warning("SELL_PROGRESS_FAILED symbol=%s", symbol, exc_info=True)
+                        continue
                 else:
-                    miss_kw = [str(raw_m)]
+                    mark_info = await self._resolve_exit_monitor_mark(symbol)
+                telemetry = self._build_exit_check_telemetry(position, mark_info)
+                self._log_exit_check_telemetry(telemetry)
 
-            day_bundle: dict[str, Any] | None = None
-            if hold_day_bundles is not None:
-                raw_bd = hold_day_bundles.get(_key)
-                if raw_bd is None:
-                    raw_bd = hold_day_bundles.get(symbol)
-                if raw_bd is None:
-                    raw_bd = hold_day_bundles.get(normalize_symbol(symbol))
-                if isinstance(raw_bd, dict):
-                    day_bundle = raw_bd
-
-            exit_result = await self._check_exit_conditions(
-                position,
-                current_price,
-                current_bar,
-                day_hold_bundle=day_bundle,
-                day_hold_missing=miss_kw,
-                executable_bid=executable_bid,
-            )
-
-            if exit_result:
-                exits_executed.append(exit_result)
-            else:
                 try:
-                    from backend.services.day_decision_state import (
-                        OPEN_POSITION_HOLD,
-                        build_hold_record,
-                        persist_hold_record,
-                    )
-
-                    persist_hold_record(
-                        str(self.db_path),
-                        build_hold_record(
-                            symbol=str(symbol),
-                            category=OPEN_POSITION_HOLD,
-                            reason="NO_EXIT_CONDITION",
-                            authority="monitor_all_positions/_check_exit_conditions",
-                            observed={"mark": current_price, "qty": float(getattr(position, "quantity", 0) or 0)},
-                        ),
-                    )
+                    await self._progress_working_sell(symbol, allow_cancel=_exit_mark_is_usable(mark_info))
                 except Exception:
-                    logger.debug("hold-state open-position persist skipped", exc_info=True)
+                    logger.warning("SELL_PROGRESS_FAILED symbol=%s", symbol, exc_info=True)
 
+                if not _exit_mark_is_usable(mark_info):
+                    any_stale_marks = True
+                    logger.warning(
+                        "EXIT_MARK_STALE_NO_SELL symbol=%s source=%s age=%s mark=%s",
+                        symbol,
+                        mark_info.get("mark_source"),
+                        mark_info.get("mark_age_seconds"),
+                        mark_info.get("mark_used"),
+                    )
+                    continue
+
+                current_price = float(mark_info["mark_used"])
+                try:
+                    from backend.services.strategy_order_intent import unbooked_protective_sells
+
+                    if unbooked_protective_sells(self.db_path, str(getattr(position, "trade_id", "") or "")):
+                        ready_pending = await self._canonical_pending_sell(position)
+                        if isinstance(ready_pending, dict):
+                            position._ready_pending_sell = ready_pending
+                            await self.execute_sell_fifo(
+                                symbol,
+                                float(position.quantity or 0.0),
+                                current_price,
+                                ExitType.STRATEGY,
+                                "FEE_PENDING_ENRICHED",
+                                current_bar=current_bar,
+                                force_sell=True,
+                                engine_id=str(getattr(position, "engine_id", "") or ""),
+                            )
+                except Exception:
+                    logger.warning("FEE_PENDING_ENRICH_FAILED symbol=%s", symbol, exc_info=True)
+                obs_ts = mark_info.get("mark_timestamp")
+                last_obs = getattr(position, "_last_mark_ts", None)
+                if isinstance(obs_ts, (int, float)) and isinstance(last_obs, (int, float)) and float(obs_ts) < float(last_obs):
+                    logger.warning(
+                        "EXIT_MARK_OUT_OF_ORDER symbol=%s obs=%s last=%s — watermark and sell unchanged",
+                        symbol,
+                        obs_ts,
+                        last_obs,
+                    )
+                    continue
+
+                # Update high/low watermarks (for MFE/MAE diagnostics).
+                # High-water folds executable mark AND the live 1m high already
+                # fetched on this path so a brief post-entry print is not lost
+                # between 45s book-mid samples. Exits still use current_price (mid).
+                from backend.services.day_high_water import (
+                    first_full_minute_epoch,
+                    fold_high_water,
+                    load_feature_1m_candles,
+                    max_post_entry_1m_high,
+                    usable_kline_high,
+                )
+
+                old_high = position.highest_price
+                old_low = float(getattr(position, "lowest_price", 0.0) or 0.0)
+                entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
+                kline_high = usable_kline_high(
+                    entry_ts,
+                    mark_info.get("kline_1m_open_time"),
+                    mark_info.get("kline_1m_high"),
+                )
+                hist_high = 0.0
+                if not getattr(position, "_hw_1m_backfilled", False):
+                    hist_high = max_post_entry_1m_high(
+                        entry_ts,
+                        load_feature_1m_candles(symbol, first_full_minute_epoch(entry_ts)),
+                    )
+                    position._hw_1m_backfilled = True
+                position.highest_price = fold_high_water(
+                    position.highest_price,
+                    current_price,
+                    kline_high,
+                    hist_high,
+                )
+                if not hasattr(position, "lowest_price") or position.lowest_price <= 0:
+                    position.lowest_price = min(position.entry_price, current_price)
+                else:
+                    position.lowest_price = min(position.lowest_price, current_price)
+
+                # Persist either watermark so MAE/wick-stop memory survives restarts
+                watermark_changed = position.highest_price > old_high or float(position.lowest_price or 0.0) < old_low or old_low <= 0
+                profile = get_coin_profile(symbol)
+                from backend.services.day_controlled_exits import (
+                    apply_break_even_and_mfe_trail,
+                    refresh_trailing_stop,
+                )
+
+                if watermark_changed:
+                    refresh_trailing_stop(position, current_price, profile)
+                # Break-even + MFE-tier ratchet must run every monitor cycle, not
+                # only on new-HH/new-LL. Positions whose peak MFE was reached in a
+                # prior cycle (or before this code path was live) would otherwise
+                # never see their stop lifted to break-even, and a subsequent
+                # reversal would exit via giveback/stall for a full loss.
+                be_changed = apply_break_even_and_mfe_trail(position, current_price)
+                if watermark_changed or be_changed:
+                    try:
+                        await self._persist_position_to_sqlite(position)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "EXIT_WATERMARK_PERSIST_FAILED engine=%s symbol=%s trade_id=%s",
+                            _lot_engine,
+                            symbol,
+                            getattr(position, "trade_id", ""),
+                        )
+                if isinstance(obs_ts, (int, float)):
+                    position._last_mark_ts = float(obs_ts)
+
+                # LEARNING INGESTION: open-position heartbeat (throttled per symbol).
+                # Generates learning rows while holding, before any close happens.
+                try:
+                    hb_last = getattr(self, "_learning_heartbeat_last", None)
+                    if hb_last is None:
+                        hb_last = {}
+                        self._learning_heartbeat_last = hb_last
+                    hb_gap = float(os.getenv("AI_LEARNING_HEARTBEAT_GAP_SEC", "300"))
+                    if time.time() - hb_last.get(symbol, 0.0) >= hb_gap:
+                        hb_last[symbol] = time.time()
+                        from backend.services.ai_learning_ingestion import record_position_heartbeat
+
+                        await asyncio.to_thread(
+                            record_position_heartbeat,
+                            symbol=symbol,
+                            trade_id=str(position.trade_id or ""),
+                            entry_price=float(position.entry_price or 0.0),
+                            mark=float(current_price),
+                            entry_time_epoch=float(position.entry_time or 0.0),
+                            thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
+                            thesis_target_level=float(getattr(position, "thesis_target_level", 0.0) or 0.0),
+                            entry_thesis=str(getattr(position, "entry_thesis", "") or ""),
+                            quantity=float(position.quantity or 0.0),
+                            entry_fee=float(getattr(position, "entry_fee", 0.0) or 0.0),
+                            thesis_score=float(getattr(position, "thesis_score", 0.0) or 0.0),
+                            entry_vwap=float(getattr(position, "entry_vwap", 0.0) or 0.0),
+                            highest_price=float(getattr(position, "highest_price", 0.0) or 0.0),
+                            lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
+                        )
+                except Exception:
+                    logger.debug("learning heartbeat skipped for %s", symbol, exc_info=True)
+
+                miss_kw: list[str] | None = None
+                if hold_day_missing is not None:
+                    raw_m = hold_day_missing.get(_key)
+                    if raw_m is None:
+                        raw_m = hold_day_missing.get(symbol)
+                    if raw_m is None:
+                        raw_m = hold_day_missing.get(normalize_symbol(symbol))
+                    if isinstance(raw_m, list):
+                        miss_kw = list(raw_m)
+                    elif raw_m is None:
+                        miss_kw = ["hold_missing_map_key_absent"]
+                    else:
+                        miss_kw = [str(raw_m)]
+
+                day_bundle: dict[str, Any] | None = None
+                if hold_day_bundles is not None:
+                    raw_bd = hold_day_bundles.get(_key)
+                    if raw_bd is None:
+                        raw_bd = hold_day_bundles.get(symbol)
+                    if raw_bd is None:
+                        raw_bd = hold_day_bundles.get(normalize_symbol(symbol))
+                    if isinstance(raw_bd, dict):
+                        day_bundle = raw_bd
+
+                exit_result = await self._check_exit_conditions(
+                    position,
+                    current_price,
+                    current_bar,
+                    day_hold_bundle=day_bundle,
+                    day_hold_missing=miss_kw,
+                    executable_bid=executable_bid,
+                )
+
+                if exit_result:
+                    exits_executed.append(exit_result)
+                else:
+                    try:
+                        from backend.services.day_decision_state import (
+                            OPEN_POSITION_HOLD,
+                            build_hold_record,
+                            persist_hold_record,
+                        )
+
+                        persist_hold_record(
+                            str(self.db_path),
+                            build_hold_record(
+                                symbol=str(symbol),
+                                category=OPEN_POSITION_HOLD,
+                                reason="NO_EXIT_CONDITION",
+                                authority="monitor_all_positions/_check_exit_conditions",
+                                observed={"mark": current_price, "qty": float(getattr(position, "quantity", 0) or 0)},
+                            ),
+                        )
+                    except Exception:
+                        logger.debug("hold-state open-position persist skipped", exc_info=True)
+
+            except asyncio.CancelledError:
+                positions_evaluated -= 1
+                raise
+            except Exception as exc:
+                positions_evaluated -= 1
+                position_passes_failed += 1
+                logger.exception(
+                    "EXIT_POSITION_PASS_FAILED engine=%s symbol=%s trade_id=%s error=%s — next pass still evaluates this position",
+                    _lot_engine,
+                    symbol,
+                    getattr(position, "trade_id", ""),
+                    type(exc).__name__,
+                )
+                continue
+
+        self._last_exit_pass_stats = {
+            "evaluated": positions_evaluated,
+            "failed": position_passes_failed,
+        }
         self._exit_mark_price_source_stale = any_stale_marks
 
-        await self._emit_day_health_telemetry()
+        try:
+            await self._emit_day_health_telemetry()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("EXIT_MONITOR_HEALTH_TELEMETRY_FAILED")
 
         return exits_executed
 

@@ -2890,9 +2890,12 @@ class PortfolioEngineIntegration:
                 DAY_MODE_ENABLED = False
             root_level = logging.getLogger().level
             root_level_name = logging.getLevelName(root_level) if root_level else "NOTSET"
+            pass_stats = getattr(getattr(self, "engine", None), "_last_exit_pass_stats", None) or {}
             logger.warning(
-                "EXIT_CHECK_HEARTBEAT active_positions=%d day_mode=%s root_loglevel=%s monitor_interval_sec=%s",
+                "EXIT_CHECK_HEARTBEAT active_positions=%d positions_evaluated=%s position_passes_failed=%s day_mode=%s root_loglevel=%s monitor_interval_sec=%s",
                 len(filtered_positions),
+                pass_stats.get("evaluated", 0),
+                pass_stats.get("failed", 0),
                 DAY_MODE_ENABLED,
                 root_level_name,
                 self._exit_monitor_interval,
@@ -2911,6 +2914,13 @@ class PortfolioEngineIntegration:
                 engine_ids=engine_ids,
                 executable_quote_only=engine_ids is not None,
             )
+            pass_stats = getattr(self.engine, "_last_exit_pass_stats", None) or {}
+            if int(pass_stats.get("failed") or 0) > 0:
+                logger.warning(
+                    "EXIT_PASS_PARTIAL positions_evaluated=%s position_passes_failed=%s",
+                    pass_stats.get("evaluated", 0),
+                    pass_stats.get("failed", 0),
+                )
 
             if filtered_positions and self.engine and engine_ids is None:
                 with contextlib.suppress(Exception):
