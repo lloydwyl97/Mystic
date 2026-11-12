@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS day_outcome_bandit_arms (
     last_pnl REAL,
     last_exit_reason TEXT,
     last_updated REAL NOT NULL,
-    n_obs INTEGER NOT NULL DEFAULT 0
+    n_obs INTEGER NOT NULL DEFAULT 0,
+    clean_terminal_n INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_day_bandit_symbol ON day_outcome_bandit_arms(symbol);
 """
@@ -146,6 +147,9 @@ def ensure_bandit_schema(db_path: str | Path) -> None:
         return
     with sqlite3.connect(key, timeout=15) as conn:
         conn.executescript(_SCHEMA)
+        cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(day_outcome_bandit_arms)")}
+        if "clean_terminal_n" not in cols:
+            conn.execute("ALTER TABLE day_outcome_bandit_arms ADD COLUMN clean_terminal_n INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     _BANDIT_SCHEMA_READY.add(key)
 
@@ -231,11 +235,11 @@ def record_bandit_outcome(
     with sqlite3.connect(str(db_path), timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT alpha, beta, wins, losses, total_pnl, n_obs FROM day_outcome_bandit_arms WHERE arm_key=?",
+            "SELECT alpha, beta, wins, losses, total_pnl, n_obs, clean_terminal_n FROM day_outcome_bandit_arms WHERE arm_key=?",
             (key,),
         ).fetchone()
         if row is None:
-            alpha, beta, wins, losses, total_pnl, n_obs = PRIOR_ALPHA, PRIOR_BETA, 0, 0, 0.0, 0
+            alpha, beta, wins, losses, total_pnl, n_obs, clean_n = PRIOR_ALPHA, PRIOR_BETA, 0, 0, 0.0, 0, 0
         else:
             alpha = float(row["alpha"] or PRIOR_ALPHA)
             beta = float(row["beta"] or PRIOR_BETA)
@@ -243,6 +247,7 @@ def record_bandit_outcome(
             losses = int(row["losses"] or 0)
             total_pnl = float(row["total_pnl"] or 0.0)
             n_obs = int(row["n_obs"] or 0)
+            clean_n = int(row["clean_terminal_n"] or 0)
 
         if win:
             alpha += w
@@ -252,6 +257,7 @@ def record_bandit_outcome(
             losses += 1
         total_pnl += pnl
         n_obs += 1
+        clean_n += 1
 
         # Soft decay when window exceeded (keep prior mass).
         if n_obs > SLIDING_WINDOW:
@@ -263,8 +269,8 @@ def record_bandit_outcome(
             """
             INSERT INTO day_outcome_bandit_arms (
                 arm_key, symbol, setup, regime, alpha, beta, wins, losses,
-                total_pnl, last_pnl, last_exit_reason, last_updated, n_obs
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                total_pnl, last_pnl, last_exit_reason, last_updated, n_obs, clean_terminal_n
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(arm_key) DO UPDATE SET
                 alpha=excluded.alpha,
                 beta=excluded.beta,
@@ -274,7 +280,8 @@ def record_bandit_outcome(
                 last_pnl=excluded.last_pnl,
                 last_exit_reason=excluded.last_exit_reason,
                 last_updated=excluded.last_updated,
-                n_obs=excluded.n_obs
+                n_obs=excluded.n_obs,
+                clean_terminal_n=excluded.clean_terminal_n
             """,
             (
                 key,
@@ -290,6 +297,7 @@ def record_bandit_outcome(
                 str(exit_reason or "")[:120],
                 now,
                 n_obs,
+                clean_n,
             ),
         )
         conn.commit()
@@ -416,6 +424,7 @@ def get_arm_stats(
                 "beta": beta,
                 "mean": mean,
                 "n_obs": 0,
+                "clean_terminal_n": 0,
                 "wins": 0,
                 "losses": 0,
                 "total_pnl": 0.0,
@@ -427,6 +436,10 @@ def get_arm_stats(
     beta = float(row["beta"] or PRIOR_BETA)
     mean = alpha / (alpha + beta) if (alpha + beta) > 0 else 0.5
     n_obs = int(row["n_obs"] or 0)
+    try:
+        clean_n = int(row["clean_terminal_n"] or 0)
+    except (IndexError, KeyError):
+        clean_n = 0
     starved = n_obs >= MIN_OBS_FOR_STARVE and mean < STARVE_MEAN_MAX and int(row["losses"] or 0) > int(row["wins"] or 0)
     return {
         "arm_key": key,
@@ -434,6 +447,7 @@ def get_arm_stats(
         "beta": beta,
         "mean": mean,
         "n_obs": n_obs,
+        "clean_terminal_n": clean_n,
         "wins": int(row["wins"] or 0),
         "losses": int(row["losses"] or 0),
         "total_pnl": float(row["total_pnl"] or 0.0),
@@ -461,6 +475,7 @@ def sample_arm(
         sample = 0.5
     starved = bool(stats["starved"])
     n_obs = int(stats.get("n_obs") or 0)
+    experience_n = int(stats.get("clean_terminal_n") or 0)
     peer_n = int(stats.get("peer_n_obs") or 0)
     mean = float(stats["mean"])
     if starved:
@@ -471,7 +486,7 @@ def sample_arm(
         # No evidence at all → mid-range explore. Cap below MAX_SIZE_FRESH so
         # the bandit does not oversize a truly-unknown arm.
         size_factor = min(1.0, MAX_SIZE_FRESH)
-    elif n_obs < N_OBS_FOR_UPSIZE:
+    elif experience_n < N_OBS_FOR_UPSIZE:
         # Fresh arm (including peer-informed): use empirical mean but cap
         # size at MAX_SIZE_FRESH so an early lucky streak cannot bet the farm.
         raw = 0.4 + mean * (MAX_SIZE_FRESH - 0.4) * 2.0  # map mean [0,1] into [0.4, MAX_SIZE_FRESH+small]
@@ -489,7 +504,8 @@ def sample_arm(
         "size_factor": float(size_factor),
         "hard_block": False,
         "candidate_eligible": True,
-        "size_factor_cap": ("starve" if starved else "fresh" if n_obs < N_OBS_FOR_UPSIZE else "top"),
+        "size_factor_cap": ("starve" if starved else "fresh" if experience_n < N_OBS_FOR_UPSIZE else "top"),
+        "clean_terminal_n": experience_n,
     }
 
 
@@ -555,6 +571,7 @@ def apply_bandit_to_decision_data(
     dd["day_bandit_mean"] = round(float(sampled["mean"]), 5)
     dd["day_bandit_sample"] = round(float(sampled["sample"]), 5)
     dd["day_bandit_n_obs"] = int(sampled["n_obs"])
+    dd["day_bandit_clean_terminal_n"] = int(sampled.get("clean_terminal_n") or 0)
     dd["day_bandit_wins"] = int(sampled["wins"])
     dd["day_bandit_losses"] = int(sampled["losses"])
     dd["day_bandit_total_pnl"] = round(float(sampled["total_pnl"]), 4)

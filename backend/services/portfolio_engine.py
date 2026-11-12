@@ -10463,6 +10463,22 @@ class PortfolioEngine:
             self._record_thesis_regime_outcome(lot, pnl)
         with contextlib.suppress(Exception):
             self._record_day_bucket_outcome(lot, pnl, exit_trigger=str(learns[-1].get("exit_reason") or ""))
+        with contextlib.suppress(Exception):
+            from backend.services.day_outcome_bandit import record_bandit_outcome
+            from backend.services.learning_provenance import day_strategy_learning_allowed
+
+            reason = str(learns[-1].get("exit_reason") or "")
+            engine = str(learns[0].get("engine") or "")
+            if day_strategy_learning_allowed(engine, reason, is_dust=bool(learns[-1].get("is_dust"))):
+                record_bandit_outcome(
+                    symbol=symbol,
+                    setup=setup,
+                    regime=regime,
+                    pnl_usd=pnl,
+                    exit_reason=reason,
+                    db_path=self.db_path,
+                    trade_id=trade_id,
+                )
 
     def _emit_deferred_terminal_learning(self) -> None:
         """Write the one trade-id label once the buy is settled and the lot is flat."""
