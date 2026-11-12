@@ -208,6 +208,24 @@ async def test_exit_failure_skips_cooldown_on_sqlite_lock() -> None:
 
 
 @pytest.mark.asyncio
+async def test_four_exit_pass_failures_do_not_retire_the_position() -> None:
+    integ = PortfolioEngineIntegration.__new__(PortfolioEngineIntegration)
+    integ.exit_failure_count = {}
+    integ.exit_cooldown_until = {}
+    integ.exit_hard_paused = set()
+    integ.redis_client = None
+    day_key = "DAY_V2::BTC/USDT"
+    scalp_key = "SCALP_V2::BTC/USDT"
+    for _ in range(4):
+        await integ._handle_exit_failure(day_key, "timeout")
+    assert day_key not in integ.exit_hard_paused
+    assert scalp_key not in integ.exit_hard_paused
+    assert day_key not in integ.exit_cooldown_until
+    await integ._handle_exit_failure(day_key, "timeout")
+    assert day_key not in integ.exit_hard_paused
+
+
+@pytest.mark.asyncio
 async def test_exit_monitor_locked_error_no_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
     """EXIT_MONITORING_ERROR path with sqlite lock must not cooldown all symbols."""
     source = inspect.getsource(PortfolioEngineIntegration._monitor_positions_once)

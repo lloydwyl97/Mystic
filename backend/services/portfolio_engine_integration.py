@@ -2822,25 +2822,12 @@ class PortfolioEngineIntegration:
         except Exception as e:
             logger.warning("EXIT_MONITOR_REHYDRATE failed: %s", e)
 
-        # PHASE 3 FIX: Apply exit cooldowns and check hard-paused symbols
-        current_time = time.time()
-
         # Build monitor snapshot without mutating engine.open_positions.
         filtered_positions = {}
 
         for symbol, position in list(self.engine.open_positions.items()):
-            # Skip hard-paused symbols
-            if symbol in self.exit_hard_paused:
-                logger.debug(f"EXIT_MONITORING: Skipping hard-paused symbol {symbol}")
-                continue
-
-            # Skip symbols in cooldown
-            cooldown_end = self.exit_cooldown_until.get(symbol, 0)
-            if current_time < cooldown_end:
-                remaining = cooldown_end - current_time
-                logger.debug(f"EXIT_MONITORING: Skipping {symbol} in cooldown ({remaining:.0f}s remaining)")
-                continue
-
+            # A failed exit pass is logged. It does not retire the position from
+            # later passes. The loop cadence is the retry.
             if engine_ids is not None and str(getattr(position, "engine_id", "") or "") not in engine_ids:
                 continue
 
@@ -3114,16 +3101,11 @@ class PortfolioEngineIntegration:
             logger.info("EXIT_HARD_PAUSE_CLEARED_BD_STALE symbols=%s (cooldowns unchanged)", cleared)
 
     async def _handle_exit_failure(self, symbol: str, error_msg: str) -> None:
-        """
-        PHASE 3 FIX: Handle exit failure with exponential backoff and hard-pause.
+        """Log one failed exit pass. The next monitor pass still evaluates the position.
 
-        Backoff strategy:
-        - 1st failure: 60 second cooldown
-        - 2nd failure: 120 second cooldown
-        - 3rd failure: 300 second cooldown
-        - 4th+ failure: Hard-pause symbol (permanent until manual intervention)
-
-        Transient ``database is locked`` must not enter this path (caller filters).
+        A locked database is already retried by the caller and is not counted.
+        Request-weight, stale-book, and lost-ack refusals stay inside the
+        position pass. They do not retire the lot.
         """
         if "database is locked" in str(error_msg).lower() or "database table is locked" in str(error_msg).lower():
             logger.warning(
@@ -3132,31 +3114,7 @@ class PortfolioEngineIntegration:
                 error_msg[:200],
             )
             return
-
-        current_time = time.time()
-
-        # Increment failure count
-        self.exit_failure_count[symbol] = self.exit_failure_count.get(symbol, 0) + 1
-        failure_count = self.exit_failure_count[symbol]
-
-        if failure_count >= 4:
-            # Hard-pause after 4 consecutive failures
-            self.exit_hard_paused.add(symbol)
-            logger.error(f"EXIT_HARD_PAUSED: {symbol} failed {failure_count} times - permanently paused until manual intervention")
-
-            # Set Redis alert flag
-            if self.redis_client:
-                try:
-                    await self.redis_client.set(f"alerts:exit_hard_paused:{symbol}", f"count={failure_count},error={error_msg}", ex=86400)
-                except Exception as redis_err:
-                    logger.warning(f"Failed to set Redis alert for {symbol}: {redis_err}")
-
-        else:
-            # Apply exponential backoff cooldown
-            cooldown_seconds = [60, 120, 300][min(failure_count - 1, 2)]  # 60s, 120s, 300s
-            self.exit_cooldown_until[symbol] = current_time + cooldown_seconds
-
-            logger.warning(f"EXIT_FAILED: {symbol} failure #{failure_count} - cooldown for {cooldown_seconds}s | Error: {error_msg}")
+        logger.warning("EXIT_PASS_FAILED symbol=%s err=%s — next pass still evaluates this position", symbol, str(error_msg)[:200])
 
     def _wake_exit_monitor(self) -> None:
         """Run another exit pass without waiting out the 45s cadence."""
