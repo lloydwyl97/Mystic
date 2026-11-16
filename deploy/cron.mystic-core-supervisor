@@ -1,0 +1,10 @@
+# Fast core supervisor. The loop itself polls every 2 seconds.
+# This crontab line only starts that loop when it is not already running.
+# The 45-second boot sleep stays: Redis and the network need it.
+# Install for the mystic user (do not remove the existing @reboot core line
+# or the */5 watchdog):
+#
+#   (crontab -l; cat deploy/cron.mystic-core-supervisor | sed '/^#/d') | crontab -
+#
+@reboot sleep 45 && cd /home/mystic/mystic && ./venv/bin/python3 scripts/core_supervisor.py ensure >> logs/core_supervisor.log 2>&1
+* * * * * cd /home/mystic/mystic && ./venv/bin/python3 scripts/core_supervisor.py ensure >> logs/core_supervisor.log 2>&1

@@ -1,8 +1,9 @@
 #!/bin/bash
-# Mystic core-stack watchdog — checks the canonical core processes are alive.
-# If any are missing, does a clean full restart via start_mystic.sh core
-# (the script itself stops everything first, so a partial-restart here
-# would fight it — a full restart is the correct, already-idempotent path).
+# Mystic core-stack watchdog — secondary backstop for the fast supervisor.
+# scripts/core_supervisor.py restarts a single dead worker within seconds.
+# This cron job still does a full `start_mystic.sh core` when something is
+# missing and the fast supervisor is not already in a targeted restart.
+# Full restart stops every core process first, so it must not race that restart.
 #
 # DEPLOY LOCK: if /run/mystic/deploy.lock (or the legacy
 # /tmp/mystic_maintenance.lock) exists, this watchdog must NOT start or
@@ -15,6 +16,7 @@ set -u
 REPO="${MYSTIC_WATCHDOG_REPO:-/home/mystic/mystic}"
 LOG="${MYSTIC_WATCHDOG_LOG:-$REPO/logs/watchdog_mystic.log}"
 LOCK="${MYSTIC_WATCHDOG_FLOCK:-/run/mystic/watchdog.flock}"
+BUSY="${MYSTIC_SUPERVISOR_BUSY:-/run/mystic/core_supervisor.busy}"
 DEPLOY_LOCK="${MYSTIC_DEPLOY_LOCK:-/run/mystic/deploy.lock}"
 MAINTENANCE_LOCK="${MYSTIC_MAINTENANCE_LOCK:-/tmp/mystic_maintenance.lock}"
 START_CMD="${MYSTIC_WATCHDOG_START_CMD:-}"
@@ -97,6 +99,15 @@ if [ "$missing" -eq 1 ]; then
     # lock is created between the scan above and this point.
     if deploy_lock_held; then
         exit 0
+    fi
+    if [ -f "$BUSY" ]; then
+        now_s=$(date +%s)
+        busy_s=$(stat -c %Y "$BUSY" 2>/dev/null || echo 0)
+        age=$((now_s - busy_s))
+        if [ "$age" -ge 0 ] && [ "$age" -lt 90 ]; then
+            _log "WATCHDOG_DEFER_FAST_SUPERVISOR age_s=$age"
+            exit 0
+        fi
     fi
     _log "restarting core stack"
     if [ -n "$START_CMD" ]; then
