@@ -79,6 +79,29 @@ if ! flock -n 9; then
     exit 0
 fi
 
+# The fast supervisor is the 2-second layer. If its process is gone, start it
+# before considering a full-core restart. A just-started supervisor restarts a
+# single dead worker itself; this cron must not stop the stack in the same pass.
+supervisor_started=0
+if ! pgrep -f 'scripts/core_supervisor.py run' >/dev/null 2>&1; then
+    _log "FAST_SUPERVISOR_MISSING"
+    if [ -n "${MYSTIC_SUPERVISOR_ENSURE_CMD:-}" ]; then
+        if bash -c "$MYSTIC_SUPERVISOR_ENSURE_CMD"; then
+            supervisor_started=1
+        else
+            _log "FAST_SUPERVISOR_ENSURE_FAILED"
+        fi
+    elif [ -x "$REPO/venv/bin/python3" ] && [ -f "$REPO/scripts/core_supervisor.py" ]; then
+        if (cd "$REPO" && ./venv/bin/python3 scripts/core_supervisor.py ensure); then
+            supervisor_started=1
+        else
+            _log "FAST_SUPERVISOR_ENSURE_FAILED"
+        fi
+    else
+        _log "FAST_SUPERVISOR_ENSURE_FAILED reason=no_python"
+    fi
+fi
+
 missing=0
 force_missing="${MYSTIC_WATCHDOG_FORCE_MISSING:-}"
 if [ "$force_missing" = "1" ]; then
@@ -98,6 +121,10 @@ if [ "$missing" -eq 1 ]; then
     # Re-check the deploy lock right before acting — closes the race where a
     # lock is created between the scan above and this point.
     if deploy_lock_held; then
+        exit 0
+    fi
+    if [ "$supervisor_started" -eq 1 ]; then
+        _log "WATCHDOG_DEFER_FAST_SUPERVISOR reason=just_started"
         exit 0
     fi
     if [ -f "$BUSY" ]; then

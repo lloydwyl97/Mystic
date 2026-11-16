@@ -14,9 +14,12 @@ ownership is known and the first exit pass has run.
 from __future__ import annotations
 
 import argparse
+import calendar
 import contextlib
 import fcntl
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -30,6 +33,12 @@ STORM_WINDOW_SEC = 120.0
 BACKOFF_SEC = 60.0
 FULL_CORE_MISSING = 3
 BUSY_STALE_SEC = 90.0
+# Exit passes log a heartbeat about every 45s. 180s is four missed passes,
+# the same headroom already used for live_market_data:ohlcv_loop.
+EXIT_HEARTBEAT_STALE_SEC = 180.0
+MARKET_DATA_STALE_SEC = 180.0
+SUPERVISOR_STALE_SEC = 180.0
+_EXIT_HEARTBEAT_RE = re.compile(rb"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z).{0,240}EXIT_CHECK_HEARTBEAT")
 
 # Highest priority first. Portfolio owns exit monitoring.
 SERVICES: tuple[tuple[str, str, str], ...] = (
@@ -73,11 +82,17 @@ def choose_action(
     deploy_locked: bool,
     lifecycle_busy: bool,
     portfolio_exit_ready: bool = False,
+    hung: Iterable[str] = (),
 ) -> Action:
     """One decision. Does not start a process."""
-    present = set(alive)
+    stalled = set(hung)
+    present = set(alive) - stalled
     missing = [name for name in service_names() if name not in present]
     events: list[str] = []
+    if "portfolio" in stalled:
+        events.append("PORTFOLIO_EXIT_LOOP_STALE")
+    if "market_data" in stalled:
+        events.append("MARKET_DATA_LOOP_STALE")
     for name in service_names():
         if name in present:
             if name in state.lost_at and name in state.recovery_started:
@@ -149,6 +164,42 @@ def portfolio_exit_ready(log_path: Path, offset: int) -> bool:
         return b"EXIT_MONITOR_LOOP" in handle.read()
 
 
+def last_exit_heartbeat_age(log_path: Path, *, now: float | None = None, tail_bytes: int = 262144) -> float | None:
+    """Age of the newest EXIT_CHECK_HEARTBEAT in the log tail. None if no line is visible."""
+    if not log_path.is_file():
+        return None
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - tail_bytes))
+            blob = handle.read()
+    except OSError:
+        return None
+    stamps = _EXIT_HEARTBEAT_RE.findall(blob)
+    if not stamps:
+        return None
+    try:
+        parsed = time.strptime(stamps[-1].decode(), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    moment = time.time() if now is None else now
+    return max(0.0, moment - calendar.timegm(parsed))
+
+
+def classify_start_failure(rc: int, text: str) -> str:
+    lowered = text.lower()
+    if "writer lock" in lowered or "already running" in lowered:
+        return "writer_lock"
+    if "lifecycle" in lowered:
+        return "lifecycle_lock"
+    if "redis" in lowered and "unavailable" in lowered:
+        return "redis_unavailable"
+    if "sqlite" in lowered or ("database" in lowered and "missing" in lowered):
+        return "sqlite_missing"
+    return f"start_failed rc={rc}"
+
+
 def log_offset(log_path: Path) -> int:
     try:
         return log_path.stat().st_size
@@ -170,6 +221,9 @@ class Supervisor:
         log: Callable[[str], None],
         portfolio_log: Path,
         busy_path: Path,
+        heartbeat_path: Path | None = None,
+        portfolio_heartbeat_age: Callable[[], float | None] | None = None,
+        market_heartbeat_age: Callable[[], float | None] | None = None,
         poll_sec: float = POLL_SEC,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
@@ -184,15 +238,33 @@ class Supervisor:
         self.log = log
         self.portfolio_log = portfolio_log
         self.busy_path = busy_path
+        self.heartbeat_path = heartbeat_path
+        self.portfolio_heartbeat_age = portfolio_heartbeat_age or (lambda: last_exit_heartbeat_age(portfolio_log))
+        self.market_heartbeat_age = market_heartbeat_age or (lambda: None)
         self.poll_sec = poll_sec
         self.sleep = sleep
         self.clock = clock
         self.state = SupervisorState()
 
+    def _hung(self, alive: set[str], now: float) -> set[str]:
+        hung: set[str] = set()
+        recent = now - self.state.recovery_started.get("portfolio", 0.0) < EXIT_HEARTBEAT_STALE_SEC
+        if "portfolio" in alive and not recent:
+            age = self.portfolio_heartbeat_age()
+            if age is not None and age > EXIT_HEARTBEAT_STALE_SEC:
+                hung.add("portfolio")
+        if "market_data" in alive:
+            age = self.market_heartbeat_age()
+            if age is not None and age > MARKET_DATA_STALE_SEC:
+                hung.add("market_data")
+        return hung
+
     def tick(self) -> Action:
         now = self.clock()
+        self._touch_heartbeat()
+        alive = self.alive()
         action = choose_action(
-            self.alive(),
+            alive,
             now=now,
             state=self.state,
             redis_ok=self.redis_ok(),
@@ -200,6 +272,7 @@ class Supervisor:
             deploy_locked=self.deploy_locked(),
             lifecycle_busy=self.lifecycle_busy(),
             portfolio_exit_ready=portfolio_exit_ready(self.portfolio_log, self.state.log_offset),
+            hung=self._hung(alive, now),
         )
         for event in action.events:
             self.log(event)
@@ -220,7 +293,13 @@ class Supervisor:
                 self.busy_path.unlink()
         note_restart(self.state, service, now)
         if code != 0:
-            self.log(f"CORE_SUPERVISOR_RESTART_FAILED service={service} rc={code}")
+            self.log(f"CORE_SUPERVISOR_RESTART_FAILED service={service} reason=start_failed rc={code}")
+
+    def _touch_heartbeat(self) -> None:
+        if self.heartbeat_path is None:
+            return
+        self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+        self.heartbeat_path.write_text(f"{time.time()}\n")
 
     def run(self, *, ticks: int | None = None) -> None:
         done = 0
@@ -234,15 +313,43 @@ class Supervisor:
 def _pgrep_alive() -> set[str]:
     found: set[str] = set()
     for name, pattern, _mode in SERVICES:
-        result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, check=False)
+        try:
+            result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, check=False, timeout=3)
+        except subprocess.TimeoutExpired:
+            continue
         if result.returncode == 0 and result.stdout.strip():
             found.add(name)
     return found
 
 
 def _redis_ok() -> bool:
-    result = subprocess.run(["redis-cli", "ping"], capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(["redis-cli", "ping"], capture_output=True, text=True, check=False, timeout=3)
+    except subprocess.TimeoutExpired:
+        return False
     return result.returncode == 0 and "PONG" in (result.stdout or "")
+
+
+def _market_heartbeat_age() -> float | None:
+    if not _redis_ok():
+        return None
+    try:
+        result = subprocess.run(
+            ["redis-cli", "HGET", "task_heartbeat:live_market_data:ohlcv_loop", "last_beat_epoch"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, time.time() - float(raw))
+    except ValueError:
+        return None
 
 
 def _db_ok(repo: Path) -> bool:
@@ -271,7 +378,10 @@ def _lifecycle_busy(path: Path) -> bool:
 
 
 def _start_mode(repo: Path, mode: str) -> int:
-    result = subprocess.run(["./start_mystic.sh", mode], cwd=str(repo), check=False)
+    result = subprocess.run(["./start_mystic.sh", mode], cwd=str(repo), capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        reason = classify_start_failure(result.returncode, f"{result.stdout}\n{result.stderr}")
+        _emit(repo / "logs" / "core_supervisor.log", f"CORE_SUPERVISOR_RESTART_FAILED service={mode} reason={reason}")
     return result.returncode
 
 
@@ -290,6 +400,10 @@ def _lock(path: Path):
     except BlockingIOError:
         handle.close()
         return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
     return handle
 
 
@@ -308,14 +422,43 @@ def build(repo: Path) -> Supervisor:
         log=lambda message: _emit(log_path, message),
         portfolio_log=repo / "logs" / "mystic_portfolio.log",
         busy_path=Path(os.getenv("MYSTIC_SUPERVISOR_BUSY", "/run/mystic/core_supervisor.busy")),
+        heartbeat_path=Path(os.getenv("MYSTIC_SUPERVISOR_HEARTBEAT", "/run/mystic/core_supervisor.heartbeat")),
+        market_heartbeat_age=_market_heartbeat_age,
     )
 
 
+def _heartbeat_file_age(path: Path) -> float | None:
+    try:
+        return max(0.0, time.time() - float(path.read_text().strip()))
+    except (OSError, ValueError):
+        return None
+
+
+def _replace_stale_supervisor(lock_path: Path, heartbeat_path: Path) -> None:
+    """A live PID that has stopped polling still holds the flock. Release it."""
+    age = _heartbeat_file_age(heartbeat_path)
+    if age is None or age <= SUPERVISOR_STALE_SEC:
+        return
+    try:
+        pid = int(lock_path.read_text().strip())
+    except (OSError, ValueError):
+        return
+    if pid == os.getpid():
+        return
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGTERM)
+
+
 def ensure(repo: Path) -> int:
-    """Start the loop if this host does not already have one. Cron calls this."""
-    held = _lock(Path(os.getenv("MYSTIC_SUPERVISOR_LOCK", "/run/mystic/core_supervisor.lock")))
+    """Start the loop if this host does not already have one. Cron and the watchdog call this."""
+    lock_path = Path(os.getenv("MYSTIC_SUPERVISOR_LOCK", "/run/mystic/core_supervisor.lock"))
+    heartbeat_path = Path(os.getenv("MYSTIC_SUPERVISOR_HEARTBEAT", "/run/mystic/core_supervisor.heartbeat"))
+    held = _lock(lock_path)
     if held is None:
-        return 0
+        _replace_stale_supervisor(lock_path, heartbeat_path)
+        held = _lock(lock_path)
+        if held is None:
+            return 0
     held.close()
     subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "run"],

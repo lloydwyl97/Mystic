@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import os
 import sqlite3
 import subprocess
@@ -10,7 +11,16 @@ from pathlib import Path
 
 import pytest
 
-from scripts.core_supervisor import POLL_SEC, Supervisor, SupervisorState, choose_action, portfolio_exit_ready
+from scripts.core_supervisor import (
+    POLL_SEC,
+    Supervisor,
+    SupervisorState,
+    _lock,
+    choose_action,
+    classify_start_failure,
+    last_exit_heartbeat_age,
+    portfolio_exit_ready,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 ALL = {"portfolio", "market_data", "api", "signal", "context", "learning"}
@@ -187,11 +197,175 @@ def test_repeated_crashes_do_not_overlap(tmp_path: Path):
     assert not (tmp_path / "busy").exists()
 
 
+def test_stale_exit_heartbeat_restarts_a_live_portfolio_pid(tmp_path: Path):
+    started: list[str] = []
+    supervisor = Supervisor(
+        repo=tmp_path,
+        alive=lambda: set(ALL),
+        redis_ok=lambda: True,
+        db_ok=lambda: True,
+        deploy_locked=lambda: False,
+        lifecycle_busy=lambda: False,
+        start=lambda mode: started.append(mode) or 0,
+        log=lambda _message: None,
+        portfolio_log=tmp_path / "mystic_portfolio.log",
+        busy_path=tmp_path / "busy",
+        portfolio_heartbeat_age=lambda: 200.0,
+        market_heartbeat_age=lambda: 10.0,
+        clock=lambda: 1_000.0,
+    )
+    supervisor.tick()
+    assert started == ["portfolio"]
+    # The grace window after that restart must not immediately fire again.
+    supervisor.tick()
+    assert started == ["portfolio"]
+
+
+def test_fresh_exit_heartbeat_is_not_a_restart(tmp_path: Path):
+    started: list[str] = []
+    supervisor = Supervisor(
+        repo=tmp_path,
+        alive=lambda: set(ALL),
+        redis_ok=lambda: True,
+        db_ok=lambda: True,
+        deploy_locked=lambda: False,
+        lifecycle_busy=lambda: False,
+        start=lambda mode: started.append(mode) or 0,
+        log=lambda _message: None,
+        portfolio_log=tmp_path / "mystic_portfolio.log",
+        busy_path=tmp_path / "busy",
+        portfolio_heartbeat_age=lambda: 40.0,
+        market_heartbeat_age=lambda: 40.0,
+        clock=lambda: 1_000.0,
+    )
+    supervisor.tick()
+    assert started == []
+
+
+def test_stale_market_data_heartbeat_restarts_only_live_md(tmp_path: Path):
+    started: list[str] = []
+    supervisor = Supervisor(
+        repo=tmp_path,
+        alive=lambda: set(ALL),
+        redis_ok=lambda: True,
+        db_ok=lambda: True,
+        deploy_locked=lambda: False,
+        lifecycle_busy=lambda: False,
+        start=lambda mode: started.append(mode) or 0,
+        log=lambda _message: None,
+        portfolio_log=tmp_path / "mystic_portfolio.log",
+        busy_path=tmp_path / "busy",
+        portfolio_heartbeat_age=lambda: 20.0,
+        market_heartbeat_age=lambda: 200.0,
+        clock=lambda: 1_000.0,
+    )
+    supervisor.tick()
+    assert started == ["live_md"]
+
+
+def test_exit_heartbeat_age_reads_the_newest_line(tmp_path: Path):
+    log = tmp_path / "mystic_portfolio.log"
+    log.write_text("2026-11-16T03:30:00Z | WARNING | EXIT_CHECK_HEARTBEAT\n2026-11-16T03:31:00Z | WARNING | EXIT_CHECK_HEARTBEAT\n")
+    moment = calendar.timegm(time.strptime("2026-11-16T03:32:00Z", "%Y-%m-%dT%H:%M:%SZ"))
+    age = last_exit_heartbeat_age(log, now=moment)
+    assert age == 60.0
+
+
+def test_unknown_exit_heartbeat_does_not_restart(tmp_path: Path):
+    started: list[str] = []
+    supervisor = Supervisor(
+        repo=tmp_path,
+        alive=lambda: set(ALL),
+        redis_ok=lambda: True,
+        db_ok=lambda: True,
+        deploy_locked=lambda: False,
+        lifecycle_busy=lambda: False,
+        start=lambda mode: started.append(mode) or 0,
+        log=lambda _message: None,
+        portfolio_log=tmp_path / "missing.log",
+        busy_path=tmp_path / "busy",
+        portfolio_heartbeat_age=lambda: None,
+        market_heartbeat_age=lambda: None,
+        clock=lambda: 1_000.0,
+    )
+    supervisor.tick()
+    assert started == []
+
+
+def test_start_failure_reasons():
+    assert classify_start_failure(1, "ABORT: portfolio order writer lock is held") == "writer_lock"
+    assert classify_start_failure(1, "ERROR: another start/stop is holding lifecycle") == "lifecycle_lock"
+    assert classify_start_failure(1, "Redis warmup failed after retries unavailable") == "redis_unavailable"
+    assert classify_start_failure(2, "boom") == "start_failed rc=2"
+
+
+def test_second_supervisor_lock_exits(tmp_path: Path):
+    first = _lock(tmp_path / "core_supervisor.lock")
+    assert first is not None
+    assert _lock(tmp_path / "core_supervisor.lock") is None
+    first.close()
+    second = _lock(tmp_path / "core_supervisor.lock")
+    assert second is not None
+    second.close()
+
+
+def test_active_position_uses_the_same_storm_backoff():
+    state = SupervisorState()
+    state.backoff_until["portfolio"] = 160.0
+    state.lost_at["portfolio"] = 90.0
+    flat = _decide(ALL - {"portfolio"}, state=state, now=120.0)
+    active = _decide(ALL - {"portfolio"}, state=state, now=120.0)
+    assert flat.kind == "skip" and active.kind == "skip"
+    assert any("restart_storm" in event for event in flat.events)
+
+
 def test_boot_cron_keeps_the_45_second_delay_and_starts_the_supervisor():
     text = (REPO / "deploy" / "cron.mystic-core-supervisor").read_text()
     assert "@reboot sleep 45 &&" in text
     assert "scripts/core_supervisor.py ensure" in text
     assert "sleep 45" in text
+
+
+def test_future_busy_file_does_not_suppress_the_watchdog(tmp_path: Path):
+    env = os.environ.copy()
+    env.update(
+        {
+            "MYSTIC_DEPLOY_LOCK": str(tmp_path / "deploy.lock"),
+            "MYSTIC_MAINTENANCE_LOCK": str(tmp_path / "maintenance.lock"),
+            "MYSTIC_WATCHDOG_LOG": str(tmp_path / "watchdog.log"),
+            "MYSTIC_WATCHDOG_FLOCK": str(tmp_path / "flock"),
+            "MYSTIC_WATCHDOG_REPO": str(tmp_path),
+            "MYSTIC_WATCHDOG_START_CMD": f"touch '{tmp_path / 'started'}'",
+            "MYSTIC_WATCHDOG_FORCE_MISSING": "1",
+            "MYSTIC_SUPERVISOR_BUSY": str(tmp_path / "busy"),
+        }
+    )
+    subprocess.run(["touch", "-d", "+2 days", str(tmp_path / "busy")], check=True)
+    out = subprocess.run(["bash", str(REPO / "watchdog_mystic.sh")], cwd=str(REPO), env=env, text=True, capture_output=True, check=False)
+    assert out.returncode == 0
+    assert (tmp_path / "started").exists()
+    assert "WATCHDOG_DEFER_FAST_SUPERVISOR" not in (tmp_path / "watchdog.log").read_text()
+
+
+def test_watchdog_starts_a_missing_supervisor_before_a_full_restart(tmp_path: Path):
+    env = os.environ.copy()
+    env.update(
+        {
+            "MYSTIC_DEPLOY_LOCK": str(tmp_path / "deploy.lock"),
+            "MYSTIC_MAINTENANCE_LOCK": str(tmp_path / "maintenance.lock"),
+            "MYSTIC_WATCHDOG_LOG": str(tmp_path / "watchdog.log"),
+            "MYSTIC_WATCHDOG_FLOCK": str(tmp_path / "flock"),
+            "MYSTIC_WATCHDOG_REPO": str(tmp_path),
+            "MYSTIC_WATCHDOG_START_CMD": f"touch '{tmp_path / 'started'}'",
+            "MYSTIC_WATCHDOG_FORCE_MISSING": "1",
+            "MYSTIC_SUPERVISOR_ENSURE_CMD": f"touch '{tmp_path / 'ensured'}'",
+        }
+    )
+    out = subprocess.run(["bash", str(REPO / "watchdog_mystic.sh")], cwd=str(REPO), env=env, text=True, capture_output=True, check=False)
+    assert out.returncode == 0
+    assert (tmp_path / "ensured").exists()
+    assert not (tmp_path / "started").exists()
+    assert "FAST_SUPERVISOR_MISSING" in (tmp_path / "watchdog.log").read_text()
 
 
 def test_watchdog_defers_while_the_fast_supervisor_is_restarting(tmp_path: Path):
