@@ -72,19 +72,97 @@ def test_retention_keeps_newest_and_generations(cfg):
     assert paths[29] not in keep
 
 
-def test_retention_never_deletes_newest_pinned_unverified_or_open(cfg):
+def test_retention_never_deletes_newest_pinned_recent_unverified_or_open(cfg):
     newest = _fake_backup(cfg, NOW)
+    fallback = _fake_backup(cfg, NOW - timedelta(days=1), compressed=True)
     pinned = _fake_backup(cfg, NOW - timedelta(days=40), compressed=True)
-    unverified = _fake_backup(cfg, NOW - timedelta(days=41), verified=False)
+    unverified = _fake_backup(cfg, NOW, verified=False)
     opened = _fake_backup(cfg, NOW - timedelta(days=42), compressed=True)
     doomed = _fake_backup(cfg, NOW - timedelta(days=43), compressed=True)
     (cfg.backup_dir / m.PIN_FILE).write_text(f"# forensic\n{pinned.name}\n")
     out = m.apply_backup_retention(cfg, mode="aggressive", dry_run=False, opened={os.path.realpath(opened)}, now=NOW, compress=lambda _b: {"status": "ok"})
-    for p in (newest, pinned, unverified, opened):
+    for p in (newest, fallback, pinned, unverified, opened):
         assert p.exists(), p
     assert not doomed.exists()
     assert not m.manifest_path_for(doomed).exists()
     assert any(a["action"] == "skip_open_backup" for a in out["actions"])
+
+
+def test_ancient_unverified_backup_does_not_pin_disk_when_two_verified_exist(cfg):
+    newest = _fake_backup(cfg, NOW)
+    fallback = _fake_backup(cfg, NOW - timedelta(days=1), compressed=True)
+    ancient = _fake_backup(cfg, NOW - timedelta(days=41), verified=False, compressed=True)
+    out = m.apply_backup_retention(cfg, mode="normal", dry_run=False, opened=set(), now=NOW, compress=lambda _b: {"status": "ok"})
+    assert newest.exists() and fallback.exists()
+    assert not ancient.exists()
+    assert any(a["action"] == "delete_backup" and a["path"].endswith(ancient.name) for a in out["actions"])
+
+
+def test_single_verified_backup_keeps_an_unverified_file(cfg):
+    only = _fake_backup(cfg, NOW)
+    extra = _fake_backup(cfg, NOW - timedelta(days=41), verified=False, compressed=True)
+    m.apply_backup_retention(cfg, mode="normal", dry_run=False, opened=set(), now=NOW, compress=lambda _b: {"status": "ok"})
+    assert only.exists() and extra.exists()
+
+
+def test_archive_copies_are_removed_once_two_verified_backups_exist(cfg):
+    _fake_backup(cfg, NOW)
+    _fake_backup(cfg, NOW - timedelta(days=1), compressed=True)
+    archive = cfg.home / "backups" / "archive"
+    archive.mkdir()
+    old = archive / "mystic_trading.db.pre_audit_20260929T142427Z.gz"
+    old.write_bytes(b"old-archive")
+    side = archive / "mystic_trading.db.pre_audit_20260929T142427Z.sha256"
+    side.write_bytes(b"abc")
+    young = archive / "mystic_trading.db.just_written.gz"
+    young.write_bytes(b"young")
+    stamp = (NOW - timedelta(days=40)).timestamp()
+    os.utime(old, (stamp, stamp))
+    os.utime(side, (stamp, stamp))
+    dry = m.apply_backup_retention(cfg, mode="normal", dry_run=True, opened=set(), now=NOW, compress=lambda _b: {"status": "ok"})
+    assert old.exists() and any(a["action"] == "delete_archive" for a in dry["actions"])
+    m.apply_backup_retention(cfg, mode="normal", dry_run=False, opened=set(), now=NOW, compress=lambda _b: {"status": "ok"})
+    assert not old.exists() and not side.exists()
+    assert young.exists()
+
+
+def test_archive_is_kept_when_only_one_verified_backup_exists(cfg):
+    _fake_backup(cfg, NOW)
+    archive = cfg.home / "backups" / "archive"
+    archive.mkdir()
+    old = archive / "mystic_trading.db.pre_audit_20260929T142427Z.gz"
+    old.write_bytes(b"only-copy-besides-one")
+    stamp = (NOW - timedelta(days=40)).timestamp()
+    os.utime(old, (stamp, stamp))
+    m.apply_backup_retention(cfg, mode="normal", dry_run=False, opened=set(), now=NOW, compress=lambda _b: {"status": "ok"})
+    assert old.exists()
+
+
+def test_failed_backup_leaves_the_previous_verified_file(cfg, monkeypatch):
+    previous = _fake_backup(cfg, NOW - timedelta(days=1))
+    _live_db(cfg)
+    monkeypatch.setattr(m, "sqlite_integrity", lambda _p: "corrupt")
+    res = m.create_backup(cfg, dry_run=False)
+    assert res["status"] == "error"
+    assert previous.exists()
+    assert m.list_backups(cfg.backup_dir)[0].path == previous
+
+
+def test_partial_backup_is_not_a_catalog_entry(cfg):
+    _fake_backup(cfg, NOW)
+    partial = cfg.backup_dir / (m.backup_name(NOW - timedelta(hours=3)) + ".partial")
+    partial.write_bytes(b"not-finished")
+    names = {b.path.name for b in m.list_backups(cfg.backup_dir)}
+    assert partial.name not in names
+    assert partial.exists()
+
+
+def test_thirty_cycles_stay_within_the_generation_cap(cfg):
+    for day in range(30):
+        _fake_backup(cfg, NOW - timedelta(days=day), compressed=day > 0)
+    backups = m.list_backups(cfg.backup_dir)
+    keep = m.select_retained(backups, now=NOW, keep_hourly=24, keep_daily=3, keep_weekly=2, pinned=set(), unverified_max_age=timedelta(days=14))
+    assert len(keep) <= 5
 
 
 def test_retention_ignores_files_it_did_not_create(cfg):

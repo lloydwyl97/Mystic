@@ -7,10 +7,12 @@ are the existing ``sqlite_large_table_retention`` policies (aggressive disk mode
 PASSIVE WAL checkpoint. VACUUM is never run.
 
 Safety invariants:
-  * deletions are limited to explicit Mystic patterns and to backups this module created
-    and verified; unknown files are reported, never removed
-  * the live DB, the newest verified backup, pinned backups and any file open by a process
-    are never deleted
+  * deletions are limited to catalog backups and to old database copies under the backups
+    root. Other unknown files are reported, never removed
+  * the live DB, the newest verified backup, one older verified fallback, pinned backups
+    and any file open by a process are never deleted
+  * an unverified backup older than the weekly horizon is not kept forever once two
+    verified restore points exist
   * a held deploy lock turns every run into measure-only
   * one run at a time (flock); ``dry_run`` performs no filesystem or database mutation
 """
@@ -456,20 +458,29 @@ def select_retained(
     keep_daily: int,
     keep_weekly: int,
     pinned: set[str],
+    unverified_max_age: timedelta | None = None,
 ) -> set[Path]:
     """Generation policy. Returns the set of backup paths to keep.
 
-    Always kept: newest verified, pinned, and anything unverified (never judged, never
-    deleted). Then the newest per hour for ``keep_hourly`` hours, the newest per day for
+    Always kept: newest verified, pinned, and a recent unverified file that has not yet
+    been judged. An unverified file older than ``unverified_max_age`` is not kept once
+    two verified restore points exist, so a missing ``integrity=ok`` cannot pin disk
+    forever. Then the newest per hour for ``keep_hourly`` hours, the newest per day for
     ``keep_daily`` distinct days and the newest per ISO week for ``keep_weekly`` weeks.
     """
     keep: set[Path] = set()
     newest = newest_verified(backups)
     if newest:
         keep.add(newest.path)
+    verified_count = sum(1 for b in backups if b.verified)
     for b in backups:
-        if not b.verified or b.path.name in pinned:
+        if b.path.name in pinned:
             keep.add(b.path)
+            continue
+        if not b.verified:
+            aged_out = unverified_max_age is not None and verified_count >= 2 and (now - b.ts) > unverified_max_age
+            if not aged_out:
+                keep.add(b.path)
     verified = sorted((b for b in backups if b.verified), key=lambda b: b.ts, reverse=True)
 
     def _bucketed(key: Callable[[BackupInfo], Any], limit: int, candidates: list[BackupInfo]) -> None:
@@ -508,9 +519,15 @@ def create_backup(cfg: MaintConfig, *, dry_run: bool, reason: str = "scheduled")
         return {"status": "error", "error": f"live db missing: {db}"}
     db_bytes = db.stat().st_size + _size(Path(f"{db}-wal"))
     cfg.backup_dir.mkdir(parents=True, exist_ok=True)
-    free = shutil.disk_usage(cfg.backup_dir).free
     need = int(db_bytes * 1.05) + cfg.backup_free_reserve_bytes
+    free = shutil.disk_usage(cfg.backup_dir).free
+    if free < need and not dry_run:
+        # Drop redundant old copies before refusing. This does not remove the newest
+        # verified backup or the last remaining verified fallback.
+        apply_backup_retention(cfg, mode="normal", dry_run=False, opened=open_paths())
+        free = shutil.disk_usage(cfg.backup_dir).free
     if free < need:
+        logger.warning("BACKUP_SKIPPED_INSUFFICIENT_SPACE free_bytes=%s need_bytes=%s", free, need)
         return {"status": "skipped", "reason": "insufficient_free_space", "free_bytes": free, "need_bytes": need}
     ts = utc_now().replace(microsecond=0)
     final = cfg.backup_dir / backup_name(ts)
@@ -533,10 +550,16 @@ def create_backup(cfg: MaintConfig, *, dry_run: bool, reason: str = "scheduled")
         integrity = sqlite_integrity(partial)
         if integrity != "ok":
             partial.unlink(missing_ok=True)
+            logger.warning("BACKUP_VERIFY_FAILED name=%s integrity=%s", final.name, integrity[:200])
             return {"status": "error", "error": f"integrity_check failed: {integrity[:200]}"}
         digest = sha256_file(partial)
         with open(partial, "rb") as fh:
             os.fsync(fh.fileno())
+        # Publish the database before the manifest. A crash in between leaves a young
+        # unverified file, which the next verify pass adopts. A partial name is never
+        # treated as a finished backup.
+        partial.replace(final)
+        _chown(final, cfg.owner)
         manifest = {
             "name": final.name,
             "source": str(db),
@@ -544,13 +567,11 @@ def create_backup(cfg: MaintConfig, *, dry_run: bool, reason: str = "scheduled")
             "verified_utc": _iso(utc_now()),
             "integrity": "ok",
             "sha256": digest,
-            "bytes": partial.stat().st_size,
+            "bytes": final.stat().st_size,
             "compressed": False,
             "reason": reason,
         }
         _write_json_atomic(manifest_path_for(final), manifest)
-        partial.replace(final)
-        _chown(final, cfg.owner)
         _chown(manifest_path_for(final), cfg.owner)
     except Exception as exc:
         partial.unlink(missing_ok=True)
@@ -603,6 +624,7 @@ def verify_unverified_backups(
         except sqlite3.Error as exc:
             integrity = f"unreadable: {exc}"
         if integrity != "ok":
+            logger.warning("BACKUP_VERIFY_FAILED name=%s integrity=%s", info.path.name, integrity[:200])
             out["failed"].append({"name": info.path.name, "integrity": integrity[:200]})
             out["status"] = "error"
             out["error"] = f"unverified backup failed integrity_check: {info.path.name}"
@@ -792,6 +814,39 @@ def compress_backup(info: BackupInfo, *, owner: str = "mystic") -> dict[str, Any
     return {"status": "ok", "path": str(gz), "bytes_before": info.manifest.get("bytes"), "bytes_after": gz.stat().st_size}
 
 
+def redundant_archive_copies(cfg: MaintConfig, backups: list[BackupInfo], *, now: datetime, max_age: timedelta) -> list[Path]:
+    """Old database copies outside the catalog.
+
+    ``backups/archive`` and similarly named snapshots are not seen by ``list_backups``.
+    They are redundant once two verified catalog backups exist and the file is older
+    than the weekly horizon. Model directories and other names are left alone.
+    """
+    if sum(1 for b in backups if b.verified) < 2 or not cfg.backups_root.is_dir():
+        return []
+    catalog = cfg.backup_dir.resolve()
+    found: list[Path] = []
+    for path in cfg.backups_root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            if path.resolve().is_relative_to(catalog):
+                continue
+        except (OSError, ValueError):
+            continue
+        name = path.name
+        if not (name.startswith("mystic_trading") or name.startswith("scalp_state")):
+            continue
+        if not (name.endswith(".db") or name.endswith(".gz") or name.endswith(".sha256")):
+            continue
+        try:
+            age = now.timestamp() - path.stat().st_mtime
+        except OSError:
+            continue
+        if age > max_age.total_seconds():
+            found.append(path)
+    return found
+
+
 def apply_backup_retention(
     cfg: MaintConfig,
     *,
@@ -804,20 +859,24 @@ def apply_backup_retention(
     backups = list_backups(cfg.backup_dir)
     aggressive = mode in ("aggressive", "critical")
     pinned = pinned_names(cfg.backup_dir)
+    moment = now or utc_now()
+    weeks = cfg.aggressive_keep_weekly if aggressive else cfg.keep_weekly
+    unverified_max_age = timedelta(days=max(int(weeks), 0) * 7)
     keep = select_retained(
         backups,
-        now=now or utc_now(),
+        now=moment,
         keep_hourly=cfg.keep_hourly,
         keep_daily=cfg.aggressive_keep_daily if aggressive else cfg.keep_daily,
-        keep_weekly=cfg.aggressive_keep_weekly if aggressive else cfg.keep_weekly,
+        keep_weekly=weeks,
         pinned=pinned,
+        unverified_max_age=unverified_max_age,
     )
     newest = newest_verified(backups)
     actions: list[dict[str, Any]] = []
     reclaimed = 0
     errors: list[str] = []
     for b in backups:
-        if b.path in keep or not b.verified or b.path.name in pinned or (newest and b.path == newest.path):
+        if b.path in keep or b.path.name in pinned or (newest and b.path == newest.path):
             continue
         if _is_open(b.path, opened):
             _action(actions, "skip_open_backup", b.path, dry_run=dry_run)
@@ -843,7 +902,23 @@ def apply_backup_retention(
             reclaimed += size - int(res.get("bytes_after") or 0)
         else:
             errors.append(f"compress {b.path.name}: {res.get('error')}")
+            logger.warning("BACKUP_ROTATION_FAILED compress %s: %s", b.path.name, res.get("error"))
+    for path in redundant_archive_copies(cfg, backups, now=moment, max_age=unverified_max_age):
+        if _is_open(path, opened) or path.name in pinned:
+            _action(actions, "skip_open_backup", path, dry_run=dry_run)
+            continue
+        size = _size(path)
+        _action(actions, "delete_archive", path, dry_run=dry_run, bytes=size)
+        if not dry_run:
+            path.unlink(missing_ok=True)
+        reclaimed += size
     unmanaged = unmanaged_backups(cfg)
+    newest_age_h = None
+    if newest is not None:
+        newest_age_h = round((moment - newest.ts).total_seconds() / 3600.0, 1)
+        logger.info("BACKUP_LAST_VERIFIED_AGE hours=%s name=%s", newest_age_h, newest.path.name)
+    if errors:
+        logger.warning("BACKUP_ROTATION_FAILED errors=%s", "; ".join(errors)[:300])
     return {
         "backups": len(backups),
         "unmanaged": unmanaged,
@@ -852,6 +927,7 @@ def apply_backup_retention(
         "pinned": sorted(n for n in pinned if BACKUP_RE.match(n)),
         "newest_verified": newest.path.name if newest else None,
         "newest_verified_utc": newest.manifest.get("verified_utc") if newest else None,
+        "newest_verified_age_hours": newest_age_h,
         "actions": actions,
         "bytes_reclaimed": reclaimed,
         "errors": errors,
@@ -1392,7 +1468,7 @@ def _run_owner_task(cfg: MaintConfig, task: str, *args: str) -> dict[str, Any]:
     cmd = [sys.executable, str(script), task, *args]
     if os.geteuid() == 0 and cfg.owner != "root":
         cmd = ["runuser", "-u", cfg.owner, "--", "nice", "-n", "19", "ionice", "-c3", *cmd]
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "MAINT_INSIDE_LOCK": "1"}
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(cfg.repo), env=env, check=False)
     try:
         return json.loads(res.stdout.strip().splitlines()[-1])

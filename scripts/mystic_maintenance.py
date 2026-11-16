@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -43,14 +44,25 @@ def main(argv: list[str] | None = None) -> int:
         m.record_post_reboot(cfg, out)
     elif args.task == "status":
         out = m.maintenance_status_summary(cfg)
-    elif args.task == "backup-create":
-        out = m.create_backup(cfg, dry_run=args.dry_run)
-    elif args.task == "backup-verify":
-        out = m.verify_unverified_backups(cfg, dry_run=args.dry_run)
-    elif args.task == "backup-adopt":
-        out = m.adopt_deploy_snapshots(cfg, dry_run=args.dry_run)
-    elif args.task == "backup-retention":
-        out = m.apply_backup_retention(cfg, mode=args.mode, dry_run=args.dry_run, opened=m.open_paths())
+    elif args.task in {"backup-create", "backup-verify", "backup-adopt", "backup-retention"}:
+
+        def _task() -> dict:
+            if args.task == "backup-create":
+                return m.create_backup(cfg, dry_run=args.dry_run)
+            if args.task == "backup-verify":
+                return m.verify_unverified_backups(cfg, dry_run=args.dry_run)
+            if args.task == "backup-adopt":
+                return m.adopt_deploy_snapshots(cfg, dry_run=args.dry_run)
+            return m.apply_backup_retention(cfg, mode=args.mode, dry_run=args.dry_run, opened=m.open_paths())
+
+        if os.environ.get("MAINT_INSIDE_LOCK") == "1":
+            out = _task()
+        else:
+            try:
+                with m.maintenance_lock(cfg.lock_path):
+                    out = _task()
+            except m.MaintenanceLockBusyError:
+                out = {"status": "error", "error": "maintenance_lock_busy"}
     elif args.task == "db-report":
         out = m.db_report(cfg.live_db, checkpoint_threshold_bytes=cfg.wal_checkpoint_bytes, dry_run=args.dry_run)
     else:
