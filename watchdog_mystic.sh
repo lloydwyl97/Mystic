@@ -30,19 +30,24 @@ _log() {
     echo "$(_utc_now) $*" >> "$LOG"
 }
 
+LOCK_SH="${MYSTIC_DEPLOY_LOCK_SH:-$(dirname "$0")/scripts/mystic_deploy_lock.sh}"
+
 deploy_lock_held() {
-    local path
-    for path in "$DEPLOY_LOCK" "$MAINTENANCE_LOCK"; do
-        [ -z "$path" ] && continue
-        if [ -e "$path" ] || [ -L "$path" ]; then
-            if [ ! -f "$path" ]; then
-                _log "WATCHDOG_SUPPRESSED_MALFORMED_LOCK path=$path"
-                return 0
-            fi
-            _log "WATCHDOG_SUPPRESSED_DEPLOYMENT_LOCK path=$path"
-            return 0
-        fi
-    done
+    local out rc
+    if [ ! -f "$LOCK_SH" ]; then
+        _log "DEPLOY_LOCK_CHECK_UNAVAILABLE path=$LOCK_SH"
+        return 1
+    fi
+    out=$("$LOCK_SH" check 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        _log "WATCHDOG_SUPPRESSED_DEPLOYMENT_LOCK"
+        return 0
+    fi
+    if [ "$rc" -eq 3 ]; then
+        _log "$out"
+        return 1
+    fi
     return 1
 }
 

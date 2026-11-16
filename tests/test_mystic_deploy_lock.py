@@ -118,31 +118,32 @@ def test_lock_removal_resumes_normal_watchdog(tmp_path: Path):
     assert (tmp_path / "started").exists()
 
 
-def test_legacy_maintenance_lock_also_suppresses(tmp_path: Path):
+def test_legacy_maintenance_lock_without_owner_does_not_suppress(tmp_path: Path):
     env = _lock_env(tmp_path, MYSTIC_WATCHDOG_FORCE_MISSING="1")
     (tmp_path / "maintenance.lock").write_text("legacy\n")
     _run([str(WATCHDOG)], env)
-    assert not (tmp_path / "started").exists()
-    assert "WATCHDOG_SUPPRESSED_DEPLOYMENT_LOCK" in _log(tmp_path)
+    assert (tmp_path / "started").exists()
+    assert "DEPLOY_LOCK_OWNER_DEAD" in _log(tmp_path)
+    assert not (tmp_path / "maintenance.lock").exists()
 
 
-def test_malformed_directory_lock_fails_safe(tmp_path: Path):
+def test_malformed_directory_lock_does_not_suppress_forever(tmp_path: Path):
     env = _lock_env(tmp_path, MYSTIC_WATCHDOG_FORCE_MISSING="1")
     (tmp_path / "deploy.lock").mkdir()
     _run([str(WATCHDOG)], env)
-    assert not (tmp_path / "started").exists()
-    assert "WATCHDOG_SUPPRESSED_MALFORMED_LOCK" in _log(tmp_path)
+    assert (tmp_path / "started").exists()
+    assert "DEPLOY_LOCK_STALE" in _log(tmp_path)
+    assert not (tmp_path / "deploy.lock").exists()
 
 
-def test_malformed_unreadable_lock_fails_safe(tmp_path: Path):
+def test_malformed_unreadable_lock_does_not_suppress_forever(tmp_path: Path):
     env = _lock_env(tmp_path, MYSTIC_WATCHDOG_FORCE_MISSING="1")
     lock = tmp_path / "deploy.lock"
     lock.write_text("{not-json")
     lock.chmod(stat.S_IWUSR)
-    # Still a regular file; unreadable content is still a lock (fail safe).
     _run([str(WATCHDOG)], env)
-    assert not (tmp_path / "started").exists()
-    assert "WATCHDOG_SUPPRESSED_DEPLOYMENT_LOCK" in _log(tmp_path)
+    assert (tmp_path / "started").exists()
+    assert "DEPLOY_LOCK_STALE" in _log(tmp_path)
 
 
 def test_lock_script_check_matches_watchdog(tmp_path: Path):
@@ -218,6 +219,101 @@ def test_parallel_acquire_exactly_one_winner(tmp_path):
     assert _run([str(LOCK_SH), "status"], env).returncode == 0
     assert _run([str(LOCK_SH), "release"], env).returncode == 0
     assert _run([str(LOCK_SH), "status"], env).returncode == 1
+
+
+def _live_owner() -> subprocess.Popen[str]:
+    return subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def test_sigkill_owner_is_recovered_and_supervision_resumes(tmp_path: Path):
+    owner = _live_owner()
+    try:
+        env = _lock_env(tmp_path, MYSTIC_DEPLOY_OWNER_PID=str(owner.pid), MYSTIC_WATCHDOG_FORCE_MISSING="1")
+        acquired = _run([str(LOCK_SH), "acquire", "--sha", "deadbeef"], env)
+        assert acquired.returncode == 0
+        assert "DEPLOY_LOCK_ACQUIRED" in acquired.stdout
+        text = (tmp_path / "deploy.lock").read_text()
+        assert f'"pid": "{owner.pid}"' in text
+        assert "starttime_ticks" in text
+        assert "deadbeef" in text
+        owner.kill()
+        owner.wait(timeout=5)
+        owner = None
+        check = _run([str(LOCK_SH), "check"], env)
+        assert check.returncode == 3
+        assert "DEPLOY_LOCK_OWNER_DEAD" in check.stdout
+        assert "DEPLOY_LOCK_RECOVERED" in check.stdout
+        assert not (tmp_path / "deploy.lock").exists()
+        watched = _run([str(WATCHDOG)], env)
+        assert watched.returncode == 0
+        assert (tmp_path / "started").exists()
+    finally:
+        if owner is not None and owner.poll() is None:
+            owner.kill()
+
+
+def test_shell_loss_leaves_the_lock_until_check(tmp_path: Path):
+    env = _lock_env(tmp_path)
+    script = f"'{LOCK_SH}' acquire --reason shell-loss; kill -9 $$"
+    subprocess.run(["bash", "-c", script], env={**os.environ, **env}, check=False)
+    assert (tmp_path / "deploy.lock").is_file()
+    check = _run([str(LOCK_SH), "check"], env)
+    assert check.returncode == 3
+    assert not (tmp_path / "deploy.lock").exists()
+
+
+def test_pid_reuse_with_a_different_start_time_is_not_the_owner(tmp_path: Path):
+    owner = _live_owner()
+    try:
+        env = _lock_env(tmp_path, MYSTIC_DEPLOY_OWNER_PID=str(owner.pid))
+        assert _run([str(LOCK_SH), "acquire"], env).returncode == 0
+        text = (tmp_path / "deploy.lock").read_text()
+        current = text.split('"starttime_ticks": "')[1].split('"')[0]
+        (tmp_path / "deploy.lock").write_text(text.replace(f'"starttime_ticks": "{current}"', '"starttime_ticks": "1"'))
+        held = _run([str(LOCK_SH), "check"], env)
+        assert held.returncode == 3
+        assert owner.poll() is None
+        assert not (tmp_path / "deploy.lock").exists()
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+
+
+def test_live_owner_blocks_the_watchdog_and_a_second_acquire(tmp_path: Path):
+    owner = _live_owner()
+    try:
+        env = _lock_env(tmp_path, MYSTIC_DEPLOY_OWNER_PID=str(owner.pid), MYSTIC_WATCHDOG_FORCE_MISSING="1")
+        assert _run([str(LOCK_SH), "acquire", "--sha", "aaa"], env).returncode == 0
+        second = _run([str(LOCK_SH), "acquire", "--sha", "bbb"], env)
+        assert second.returncode == 1
+        assert "bbb" not in (tmp_path / "deploy.lock").read_text()
+        assert _run([str(LOCK_SH), "check"], env).returncode == 0
+        watched = _run([str(WATCHDOG)], env)
+        assert watched.returncode == 0
+        assert not (tmp_path / "started").exists()
+        assert "WATCHDOG_SUPPRESSED_DEPLOYMENT_LOCK" in _log(tmp_path)
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+
+
+def test_stale_lock_does_not_block_a_portfolio_restart_decision(tmp_path: Path):
+    env = _lock_env(tmp_path)
+    (tmp_path / "deploy.lock").write_text("{")
+    check = _run([str(LOCK_SH), "check"], env)
+    assert check.returncode == 3
+    from scripts.core_supervisor import SupervisorState, choose_action
+
+    action = choose_action(
+        {"market_data", "api", "signal", "context", "learning"},
+        now=10.0,
+        state=SupervisorState(),
+        redis_ok=True,
+        db_ok=True,
+        deploy_locked=False,
+        lifecycle_busy=False,
+    )
+    assert action.mode == "portfolio"
 
 
 def test_watchdog_is_not_a_trading_gate():

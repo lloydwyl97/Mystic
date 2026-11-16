@@ -407,6 +407,19 @@ def _lock(path: Path):
     return handle
 
 
+def _deploy_locked(repo: Path) -> bool:
+    """True only while the recorded deploy owner is still that same process."""
+    script = repo / "scripts" / "mystic_deploy_lock.sh"
+    if not script.is_file():
+        return False
+    result = subprocess.run([str(script), "check"], capture_output=True, text=True, check=False)
+    if result.returncode == 3:
+        message = (result.stdout or "").strip().replace("\n", " | ") or "DEPLOY_LOCK_RECOVERED"
+        _emit(repo / "logs" / "core_supervisor.log", message)
+        return False
+    return result.returncode == 0
+
+
 def build(repo: Path) -> Supervisor:
     log_path = repo / "logs" / "core_supervisor.log"
     return Supervisor(
@@ -414,9 +427,7 @@ def build(repo: Path) -> Supervisor:
         alive=_pgrep_alive,
         redis_ok=_redis_ok,
         db_ok=lambda: _db_ok(repo),
-        deploy_locked=lambda: (
-            _path_exists(Path(os.getenv("MYSTIC_DEPLOY_LOCK", "/run/mystic/deploy.lock"))) or _path_exists(Path(os.getenv("MYSTIC_MAINTENANCE_LOCK", "/tmp/mystic_maintenance.lock")))
-        ),
+        deploy_locked=lambda: _deploy_locked(repo),
         lifecycle_busy=lambda: _lifecycle_busy(repo / "logs" / "mystic_lifecycle.lock"),
         start=lambda mode: _start_mode(repo, mode),
         log=lambda message: _emit(log_path, message),

@@ -15,7 +15,9 @@
 #   mystic_deploy_lock.sh release
 #   mystic_deploy_lock.sh check     # exit 0 = watchdog must stay down
 #
-# There is no auto-expiry. A stale lock needs an explicit release.
+# There is no time limit. The lock is valid only while its owner process is
+# still the same process (pid + /proc start time). A dead or reused pid is
+# recovered by `check` so supervision is not suppressed forever.
 
 set -u
 
@@ -30,11 +32,58 @@ _lock_dir() {
     dirname -- "$CANONICAL_LOCK"
 }
 
+_proc_starttime() {
+    local pid="$1"
+    local stat rest
+    [ -r "/proc/${pid}/stat" ] || return 1
+    stat=$(cat "/proc/${pid}/stat") || return 1
+    # comm can contain spaces. starttime is field 22, so field 20 after "pid (comm)".
+    rest="${stat#*) }"
+    awk '{print $20}' <<<"$rest"
+}
+
+_json_field() {
+    local path="$1"
+    local key="$2"
+    sed -n "s/.*\"${key}\": *\"\\([^\"]*\\)\".*/\\1/p" "$path" | head -1
+}
+
+_owner_alive() {
+    local path="$1"
+    local pid starttime now host
+    pid=$(_json_field "$path" pid)
+    starttime=$(_json_field "$path" starttime_ticks)
+    [ -n "$pid" ] && [ -n "$starttime" ] || return 1
+    now=$(_proc_starttime "$pid") || return 1
+    [ "$now" = "$starttime" ] || return 1
+    host=$(_json_field "$path" hostname)
+    if [ -n "$host" ] && [ "$host" != "$(hostname 2>/dev/null || echo unknown)" ]; then
+        return 1
+    fi
+    return 0
+}
+
+_quarantine() {
+    local path="$1"
+    local dest="${path}.recovered.$(_utc_now | tr -d ':').$$"
+    if mv -- "$path" "$dest" 2>/dev/null; then
+        echo "DEPLOY_LOCK_RECOVERED path=$path dest=$dest"
+        return 0
+    fi
+    rm -rf -- "$path" 2>/dev/null || true
+    echo "DEPLOY_LOCK_RECOVERED path=$path dest=removed"
+}
+
 _write_lock() {
     local path="$1"
     local sha="${2:-}"
     local reason="${3:-deploy}"
-    local dir
+    local dir owner_pid starttime
+    owner_pid="${MYSTIC_DEPLOY_OWNER_PID:-$PPID}"
+    starttime=$(_proc_starttime "$owner_pid") || {
+        echo "ERROR: deploy owner pid=$owner_pid is not alive" >&2
+        return 1
+    }
     dir=$(_lock_dir)
     if ! mkdir -p "$dir" 2>/dev/null; then
         echo "ERROR: cannot create lock directory $dir" >&2
@@ -49,7 +98,8 @@ _write_lock() {
   "created_at": "$(_utc_now)",
   "operator": "$(id -un 2>/dev/null || echo unknown)",
   "hostname": "$(hostname 2>/dev/null || echo unknown)",
-  "pid": "$$",
+  "pid": "${owner_pid}",
+  "starttime_ticks": "${starttime}",
   "intended_sha": "${sha}",
   "reason": "${reason}"
 }
@@ -104,6 +154,7 @@ case "$cmd" in
         if [ "$LEGACY_LOCK" != "$CANONICAL_LOCK" ]; then
             printf '%s\n' "legacy_alias_of=$CANONICAL_LOCK" >"$LEGACY_LOCK" 2>/dev/null || true
         fi
+        echo "DEPLOY_LOCK_ACQUIRED path=$CANONICAL_LOCK pid=${MYSTIC_DEPLOY_OWNER_PID:-$PPID}"
         echo "acquired $CANONICAL_LOCK"
         ;;
     status)
@@ -134,22 +185,38 @@ case "$cmd" in
         if [ "$removed" -eq 0 ]; then
             echo "already unlocked"
         else
+            echo "DEPLOY_LOCK_RELEASED"
             echo "released"
         fi
         ;;
     check)
-        # Exit 0 => watchdog must not start/restart Mystic.
+        # Exit 0 => a live owner holds the lock; supervision must wait.
+        # Exit 1 => no lock.
+        # Exit 3 => stale or malformed lock was recovered; supervision may run.
+        stale=0
         for path in "$CANONICAL_LOCK" "$LEGACY_LOCK"; do
             [ -z "$path" ] && continue
-            if [ -e "$path" ] || [ -L "$path" ]; then
-                if [ ! -f "$path" ]; then
-                    echo "WATCHDOG_SUPPRESSED_MALFORMED_LOCK path=$path"
-                    exit 0
-                fi
+            [ "$CANONICAL_LOCK" = "$LEGACY_LOCK" ] && [ "$path" = "$LEGACY_LOCK" ] && [ "$stale" -eq 1 ] && continue
+            if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+                continue
+            fi
+            if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+                echo "DEPLOY_LOCK_STALE reason=malformed path=$path"
+                _quarantine "$path"
+                stale=1
+                continue
+            fi
+            if _owner_alive "$path"; then
                 echo "WATCHDOG_SUPPRESSED_DEPLOYMENT_LOCK path=$path"
                 exit 0
             fi
+            echo "DEPLOY_LOCK_OWNER_DEAD path=$path"
+            _quarantine "$path"
+            stale=1
         done
+        if [ "$stale" -eq 1 ]; then
+            exit 3
+        fi
         exit 1
         ;;
     *)
