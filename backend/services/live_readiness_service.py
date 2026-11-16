@@ -63,11 +63,11 @@ _EXCHANGE_AUTH_CACHE: tuple[float, dict[str, Any]] | None = None
 _EXCHANGE_AUTH_TTL_SEC: float = 180.0
 
 
-async def _fetch_exchange_account_auth() -> dict[str, Any]:
+async def _fetch_exchange_account_auth(*, force: bool = False) -> dict[str, Any]:
     """Signed Binance.US account probe — permissions and USDT balance only (cached 180s to protect 1200 weight limit)."""
     global _EXCHANGE_AUTH_CACHE
     now_mono = time.monotonic()
-    if _EXCHANGE_AUTH_CACHE is not None and (now_mono - _EXCHANGE_AUTH_CACHE[0]) < _EXCHANGE_AUTH_TTL_SEC:
+    if not force and _EXCHANGE_AUTH_CACHE is not None and (now_mono - _EXCHANGE_AUTH_CACHE[0]) < _EXCHANGE_AUTH_TTL_SEC:
         return dict(_EXCHANGE_AUTH_CACHE[1])
 
     import hashlib

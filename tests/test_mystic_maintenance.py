@@ -367,14 +367,25 @@ def test_gate_blocks(kwargs, reason):
     assert reason in _gate(**kwargs)
 
 
-def _reboot_harness(cfg, *, statuses, orders=0):
-    calls = {"reboot": 0, "backup": 0}
+def _reboot_harness(cfg, *, statuses, orders=0, exposure=None, arm=None, clear=None, checkpoint=None):
+    calls = {"reboot": 0, "backup": 0, "arm": 0, "clear": 0}
     seq = iter(statuses)
+    seen = exposure if exposure is not None else (lambda: [])
 
     def backup():
         calls["backup"] += 1
         _fake_backup(cfg, m.utc_now().replace(microsecond=0))
         return {"status": "ok"}
+
+    def _arm():
+        calls["arm"] += 1
+        if arm is not None:
+            return arm()
+        return {"armed": True, "we_set": True, "previous_mode": "RESUME", "previous_reason": ""}
+
+    def _clear():
+        calls["clear"] += 1
+        return True if clear is None else clear()
 
     out = m.maybe_reboot(
         cfg,
@@ -385,16 +396,28 @@ def _reboot_harness(cfg, *, statuses, orders=0):
         reboot=lambda: calls.__setitem__("reboot", calls["reboot"] + 1),
         held_pending=lambda: [],
         upgrade_held=lambda _pkgs: {},
+        exposure=seen,
+        arm_barrier=_arm,
+        clear_barrier=_clear,
+        checkpoint=checkpoint or (lambda: {"ok": True}),
+        sleep=lambda _seconds: None,
     )
     return out, calls
 
 
 def test_reboot_takes_backup_then_rechecks_then_reboots(cfg):
     cfg.reboot_flag.write_text("*** System restart required ***")
-    out, calls = _reboot_harness(cfg, statuses=[_status(), _status()])
-    assert calls == {"reboot": 1, "backup": 1}
+    out, calls = _reboot_harness(cfg, statuses=[_status(), _status(), _status()])
+    assert calls["reboot"] == 1 and calls["backup"] == 1 and calls["arm"] == 1 and calls["clear"] == 0
     assert out["rebooted"] is True
     assert json.loads(cfg.reboot_marker.read_text())["reason"] == "reboot-required"
+
+
+def test_busy_checkpoint_defers_and_clears_the_barrier(cfg):
+    cfg.reboot_flag.write_text("x")
+    out, calls = _reboot_harness(cfg, statuses=[_status(), _status(), _status()], checkpoint=lambda: {"ok": False, "busy": 1})
+    assert calls["reboot"] == 0 and calls["arm"] == 1 and calls["clear"] == 1
+    assert out["deferral_reason"] == "wal_checkpoint:busy"
 
 
 def test_position_opened_during_backup_defers_reboot(cfg):
@@ -404,16 +427,120 @@ def test_position_opened_during_backup_defers_reboot(cfg):
     assert out["deferral_reason"] == "active_positions:1"
 
 
+def test_buy_intent_during_backup_defers_reboot(cfg):
+    cfg.reboot_flag.write_text("x")
+    seen = iter([[], ["unresolved_buy:PENDING:1"]])
+    out, calls = _reboot_harness(cfg, statuses=[_status(), _status()], exposure=lambda: next(seen))
+    assert calls["reboot"] == 0 and calls["backup"] == 1 and calls["arm"] == 0
+    assert out["deferral_reason"] == "unresolved_buy:PENDING:1"
+
+
+def test_lost_ack_buy_defers_reboot(cfg):
+    cfg.reboot_flag.write_text("x")
+    out, calls = _reboot_harness(cfg, statuses=[_status(), _status()], exposure=lambda: ["unresolved_buy:ACKED:1"])
+    assert calls == {"reboot": 0, "backup": 0, "arm": 0, "clear": 0}
+    assert "unresolved_buy:ACKED:1" in out["deferral_reason"]
+
+
+def test_partial_buy_defers_reboot(cfg):
+    cfg.reboot_flag.write_text("x")
+    out, calls = _reboot_harness(cfg, statuses=[_status(), _status()], exposure=lambda: ["unresolved_buy:PARTIAL:1"])
+    assert calls["reboot"] == 0 and calls["backup"] == 0
+    assert "unresolved_buy:PARTIAL:1" in out["deferral_reason"]
+
+
+def test_working_sell_defers_reboot(cfg):
+    cfg.reboot_flag.write_text("x")
+    out, calls = _reboot_harness(cfg, statuses=[_status(), _status()], exposure=lambda: ["working_sell:WORKING:1"])
+    assert calls["reboot"] == 0
+    assert "working_sell:WORKING:1" in out["deferral_reason"]
+
+
+def test_intent_after_barrier_cancels_reboot_and_clears_pause(cfg):
+    cfg.reboot_flag.write_text("x")
+    seen = iter([[], [], ["unresolved_buy:PENDING:1"]])
+    out, calls = _reboot_harness(cfg, statuses=[_status(), _status(), _status()], exposure=lambda: next(seen))
+    assert calls["reboot"] == 0 and calls["arm"] == 1 and calls["clear"] == 1
+    assert out["deferral_reason"] == "unresolved_buy:PENDING:1"
+    assert out["rebooted"] is False
+
+
+def test_fee_pending_sell_defers_even_when_positions_are_zero(cfg):
+    cfg.reboot_flag.write_text("x")
+    out, calls = _reboot_harness(cfg, statuses=[_status(), _status()], exposure=lambda: ["sell_fee_pending:1"])
+    assert calls["reboot"] == 0
+    assert "sell_fee_pending:1" in out["deferral_reason"]
+
+
+def _ledger(db: Path, mode: str = "RESUME", reason: str = "") -> None:
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE portfolio_engine_ledger (id INTEGER PRIMARY KEY, kill_switch_mode TEXT, kill_switch_reason TEXT, last_updated TEXT)")
+    conn.execute("INSERT INTO portfolio_engine_ledger (id, kill_switch_mode, kill_switch_reason) VALUES (1, ?, ?)", (mode, reason))
+    conn.commit()
+    conn.close()
+
+
+def test_barrier_blocks_new_buys_and_a_later_intent_is_visible(cfg):
+    _live_db(cfg)
+    _ledger(cfg.live_db)
+    conn = sqlite3.connect(cfg.live_db)
+    conn.execute(
+        """
+        CREATE TABLE strategy_order_intents (
+            side TEXT, status TEXT, created_at REAL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+    assert m.reboot_exposure(cfg.live_db) == []
+    armed = m.arm_maintenance_reboot_barrier(cfg.live_db)
+    assert armed["we_set"] is True
+    row = sqlite3.connect(cfg.live_db).execute("SELECT kill_switch_mode, kill_switch_reason FROM portfolio_engine_ledger WHERE id=1").fetchone()
+    assert row == ("PAUSE_BUYS", "MAINTENANCE_REBOOT")
+    conn = sqlite3.connect(cfg.live_db)
+    conn.execute("INSERT INTO strategy_order_intents (side, status, created_at) VALUES ('BUY', 'PENDING', 1)")
+    conn.commit()
+    conn.close()
+    assert any(item.startswith("unresolved_buy:PENDING") for item in m.reboot_exposure(cfg.live_db))
+    assert m.clear_maintenance_reboot_barrier(cfg.live_db) is True
+    row = sqlite3.connect(cfg.live_db).execute("SELECT kill_switch_mode FROM portfolio_engine_ledger WHERE id=1").fetchone()
+    assert row == ("RESUME",)
+
+
+def test_operator_pause_is_not_cleared_when_reboot_is_deferred(cfg):
+    _live_db(cfg)
+    _ledger(cfg.live_db, "PAUSE_BUYS", "operator")
+    armed = m.arm_maintenance_reboot_barrier(cfg.live_db)
+    assert armed["operator_pause"] is True and armed["we_set"] is False
+    assert m.clear_maintenance_reboot_barrier(cfg.live_db) is False
+    row = sqlite3.connect(cfg.live_db).execute("SELECT kill_switch_mode, kill_switch_reason FROM portfolio_engine_ledger WHERE id=1").fetchone()
+    assert row == ("PAUSE_BUYS", "operator")
+
+
+def test_release_waits_for_ownership_recovery():
+    assert m.release_maintenance_reboot_barrier("PAUSE_BUYS", "MAINTENANCE_REBOOT", ownership_known=False) is None
+    assert m.release_maintenance_reboot_barrier("PAUSE_BUYS", "operator", ownership_known=True) is None
+    assert m.release_maintenance_reboot_barrier("PAUSE_BUYS", "MAINTENANCE_REBOOT", ownership_known=True) == ("RESUME", "")
+
+
+def test_partial_file_is_ignored_when_a_reboot_interrupts_backup(cfg):
+    partial = cfg.backup_dir / (m.backup_name(NOW) + ".partial")
+    partial.write_bytes(b"truncated")
+    assert m.list_backups(cfg.backup_dir) == []
+    assert m.newest_verified([]) is None
+
+
 def test_open_order_defers_reboot_without_backup(cfg):
     cfg.reboot_flag.write_text("x")
     out, calls = _reboot_harness(cfg, statuses=[_status()], orders=1)
-    assert calls == {"reboot": 0, "backup": 0}
+    assert calls["reboot"] == 0 and calls["backup"] == 0
     assert "open_exchange_orders:1" in out["deferral_reason"]
 
 
 def test_no_reboot_when_not_required(cfg):
     out, calls = _reboot_harness(cfg, statuses=[])
-    assert calls == {"reboot": 0, "backup": 0} and out["reboot_required"] is False
+    assert calls["reboot"] == 0 and calls["backup"] == 0 and out["reboot_required"] is False
 
 
 def test_held_redis_upgrade_is_reported_and_does_not_reboot(cfg):
@@ -559,15 +686,17 @@ def test_open_orders_probe_loads_env_file_and_unknown_on_auth_failure(tmp_path, 
     monkeypatch.delenv("MAINT_TEST_PROBE_KEY", raising=False)
     seen = {}
 
-    async def ok():
+    async def ok(*_args, **_kwargs):
         seen["key"] = os.environ.get("MAINT_TEST_PROBE_KEY")
+        seen["force"] = _kwargs.get("force")
         return {"binance_api_auth_status": "ok", "errors": [], "open_binance_orders_count": 2}
 
     monkeypatch.setattr(lrs, "_fetch_exchange_account_auth", ok)
     assert m.exchange_open_orders_count(env) == 2
     assert seen["key"] == "loaded"
+    assert seen["force"] is True
 
-    async def missing():
+    async def missing(*_args, **_kwargs):
         return {"binance_api_auth_status": "missing_keys", "errors": ["missing"], "open_binance_orders_count": 0}
 
     monkeypatch.setattr(lrs, "_fetch_exchange_account_auth", missing)

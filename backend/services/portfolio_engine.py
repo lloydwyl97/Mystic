@@ -3442,6 +3442,7 @@ class PortfolioEngine:
             self._last_live_reconcile_time = time.time()
             self._last_live_reconcile_actions = "bootstrap"
             self._ownership_state_known = True
+            self._release_maintenance_reboot_barrier()
             self._account_reconciliation_status = "ok"
             self._write_reconcile_state_file("bootstrap", account_status="ok")
         except Exception as e:
@@ -4130,6 +4131,7 @@ class PortfolioEngine:
             self._last_live_reconcile_time = time.time()
             self._last_live_reconcile_actions = "periodic"
             self._ownership_state_known = True
+            self._release_maintenance_reboot_barrier()
             self._write_reconcile_state_file("periodic")
             return
         qty_epsilon = 1e-10
@@ -4272,6 +4274,7 @@ class PortfolioEngine:
         self._last_live_reconcile_time = time.time()
         self._last_live_reconcile_actions = "periodic"
         self._ownership_state_known = True
+        self._release_maintenance_reboot_barrier()
         self._write_reconcile_state_file("periodic")
 
     def _cash_sync_skip_log(self, reason: str, **kwargs: object) -> None:
@@ -9391,6 +9394,7 @@ class PortfolioEngine:
                 self._account_status = AccountStatus.HEALTHY
 
             self._hydrate_kill_switch_from_ledger_sync()
+            self._release_maintenance_reboot_barrier()
 
             logger.info(f"LOAD_LEDGER: Restored from SQLite (version={row[10]})")
             logger.info(f"LOAD_LEDGER: principal=${self.principal:.2f} cash=${self.cash_balance:.2f}")
@@ -26967,6 +26971,23 @@ class PortfolioEngine:
             self._kill_switch_reason = str(row[1] or "")
         except Exception:
             logger.debug("hydrate kill switch from ledger failed", exc_info=True)
+
+    def _release_maintenance_reboot_barrier(self) -> None:
+        """Entries stay paused through recovery. This pause is not an operator halt."""
+        from backend.services.mystic_maintenance import clear_maintenance_reboot_barrier, release_maintenance_reboot_barrier
+
+        released = release_maintenance_reboot_barrier(
+            self._kill_switch_mode.value,
+            str(self._kill_switch_reason or ""),
+            ownership_known=bool(self._ownership_state_known),
+        )
+        if released is None:
+            return
+        if not clear_maintenance_reboot_barrier(Path(self.db_path)):
+            return
+        self._kill_switch_mode = KillSwitchMode.RESUME
+        self._kill_switch_reason = ""
+        logger.warning("MAINTENANCE_REBOOT_BARRIER_RELEASED after ownership recovery")
 
     def _entries_paused_by_kill_switch(self) -> bool:
         return self._kill_switch_mode in (

@@ -80,6 +80,7 @@ class MaintConfig:
     aggressive_keep_weekly: int = _env_int("MAINT_BACKUP_AGGRESSIVE_KEEP_WEEKLY", 0)
     backup_free_reserve_bytes: int = int(_env_float("MAINT_BACKUP_FREE_RESERVE_GB", 2.0) * GIB)
     reboot_backup_max_age_min: float = _env_float("MAINT_REBOOT_BACKUP_MAX_AGE_MIN", 60)
+    reboot_drain_sec: float = _env_float("MAINT_REBOOT_DRAIN_SEC", 15)
     temp_age_hours: float = _env_float("MAINT_TEMP_AGE_HOURS", 24)
     aggressive_temp_age_hours: float = _env_float("MAINT_AGGRESSIVE_TEMP_AGE_HOURS", 2)
     log_snapshot_compress_hours: float = _env_float("MAINT_LOG_SNAPSHOT_COMPRESS_HOURS", 24)
@@ -1158,6 +1159,184 @@ def http_json(url: str, *, timeout: float = 15.0) -> tuple[int, dict[str, Any] |
         return 0, None
 
 
+MAINTENANCE_REBOOT_REASON = "MAINTENANCE_REBOOT"
+_BUY_UNRESOLVED = ("PENDING", "ACKED", "OPEN", "PARTIAL", "WORKING", "FEE_PENDING")
+_SELL_WORKING = ("PENDING", "ACKED", "OPEN", "PARTIAL", "WORKING")
+_RECONCILE_OK = frozenset({"ok", "healthy", ""})
+
+
+def release_maintenance_reboot_barrier(mode: str, reason: str, *, ownership_known: bool) -> tuple[str, str] | None:
+    """Resume only the reboot pause, and only after ownership recovery has finished."""
+    if ownership_known and str(mode) == "PAUSE_BUYS" and str(reason) == MAINTENANCE_REBOOT_REASON:
+        return "RESUME", ""
+    return None
+
+
+def reboot_exposure(db_path: Path, *, now: float | None = None, reconcile_file: Path | None = None) -> list[str]:
+    """Durable order state a positions_count of zero does not show.
+
+    Missing database means there is nothing to classify, which the caller treats
+    as not-flat. A missing table is empty, not unknown.
+    """
+    if not db_path.is_file():
+        return ["live_db_missing"]
+    moment = time.time() if now is None else float(now)
+    reasons: list[str] = []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return ["live_db_unreadable"]
+    try:
+        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "strategy_order_intents" in tables:
+            buy_marks = ",".join("?" for _ in _BUY_UNRESOLVED)
+            sell_marks = ",".join("?" for _ in _SELL_WORKING)
+            buy_rows = conn.execute(
+                f"SELECT status, COUNT(*) FROM strategy_order_intents WHERE side='BUY' AND status IN ({buy_marks}) GROUP BY status",
+                _BUY_UNRESOLVED,
+            ).fetchall()
+            for status, count in buy_rows:
+                if int(count) > 0:
+                    reasons.append(f"unresolved_buy:{status}:{int(count)}")
+            sell_rows = conn.execute(
+                f"SELECT status, COUNT(*) FROM strategy_order_intents WHERE side='SELL' AND status IN ({sell_marks}) GROUP BY status",
+                _SELL_WORKING,
+            ).fetchall()
+            for status, count in sell_rows:
+                if int(count) > 0:
+                    reasons.append(f"working_sell:{status}:{int(count)}")
+            fee_sells = conn.execute("SELECT COUNT(*) FROM strategy_order_intents WHERE side='SELL' AND status='FEE_PENDING'").fetchone()
+            if fee_sells and int(fee_sells[0]) > 0:
+                reasons.append(f"sell_fee_pending:{int(fee_sells[0])}")
+        if "day_entry_reservations" in tables:
+            active = conn.execute(
+                "SELECT COUNT(*) FROM day_entry_reservations WHERE status='ACTIVE' AND expires_at > ?",
+                (moment,),
+            ).fetchone()
+            if active and int(active[0]) > 0:
+                reasons.append(f"active_reservation:{int(active[0])}")
+    except sqlite3.Error:
+        return ["live_db_unreadable"]
+    finally:
+        conn.close()
+    reasons.extend(reconciliation_blockers(reconcile_file))
+    return reasons
+
+
+def reconciliation_blockers(path: Path | None) -> list[str]:
+    if path is None or not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return ["reconciliation_unreadable"]
+    if not isinstance(payload, dict):
+        return ["reconciliation_unreadable"]
+    status = str(payload.get("account_reconciliation_status") or "").strip().lower()
+    if status not in _RECONCILE_OK:
+        return [f"reconciliation:{status}"]
+    return []
+
+
+def _ledger_kill(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "portfolio_engine_ledger" not in tables:
+        return None
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(portfolio_engine_ledger)")}
+    if "kill_switch_mode" not in cols:
+        return None
+    reason_sql = "COALESCE(kill_switch_reason, '')" if "kill_switch_reason" in cols else "''"
+    row = conn.execute(f"SELECT COALESCE(kill_switch_mode, 'RESUME'), {reason_sql} FROM portfolio_engine_ledger WHERE id=1").fetchone()
+    if row is None:
+        return None
+    return str(row[0] or "RESUME"), str(row[1] or "")
+
+
+def arm_maintenance_reboot_barrier(db_path: Path) -> dict[str, Any]:
+    """Block new buys in the running engine. Sells stay on the in-memory PAUSE_BUYS rule.
+
+    The live process rereads this ledger row on every buy. It does not need a restart.
+    An operator pause is left untouched.
+    """
+    if not db_path.is_file():
+        return {"armed": False, "we_set": False, "error": "live_db_missing"}
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = _ledger_kill(conn)
+        if current is None:
+            conn.rollback()
+            return {"armed": False, "we_set": False, "error": "ledger_missing"}
+        mode, reason = current
+        if mode == "PAUSE_BUYS" and reason == MAINTENANCE_REBOOT_REASON:
+            conn.commit()
+            return {"armed": True, "we_set": False, "previous_mode": mode, "previous_reason": reason}
+        if mode != "RESUME":
+            conn.rollback()
+            return {"armed": True, "we_set": False, "previous_mode": mode, "previous_reason": reason, "operator_pause": True}
+        conn.execute(
+            "UPDATE portfolio_engine_ledger SET kill_switch_mode=?, kill_switch_reason=?, last_updated=? WHERE id=1",
+            ("PAUSE_BUYS", MAINTENANCE_REBOOT_REASON, _iso(utc_now())),
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        with contextlib.suppress(sqlite3.Error):
+            conn.rollback()
+        return {"armed": False, "we_set": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+    logger.warning("MAINT reboot_barrier_armed reason=%s", MAINTENANCE_REBOOT_REASON)
+    return {"armed": True, "we_set": True, "previous_mode": "RESUME", "previous_reason": ""}
+
+
+def clear_maintenance_reboot_barrier(db_path: Path) -> bool:
+    """Drop only the maintenance pause. An operator pause is not cleared."""
+    if not db_path.is_file():
+        return False
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = _ledger_kill(conn)
+        if current is None or current != ("PAUSE_BUYS", MAINTENANCE_REBOOT_REASON):
+            conn.rollback()
+            return False
+        conn.execute(
+            "UPDATE portfolio_engine_ledger SET kill_switch_mode='RESUME', kill_switch_reason='', last_updated=? WHERE id=1",
+            (_iso(utc_now()),),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        with contextlib.suppress(sqlite3.Error):
+            conn.rollback()
+        return False
+    finally:
+        conn.close()
+    logger.warning("MAINT reboot_barrier_cleared")
+    return True
+
+
+def passive_wal_checkpoint(db_path: Path) -> dict[str, Any]:
+    if not db_path.is_file():
+        return {"ok": False, "error": "live_db_missing"}
+    conn = sqlite3.connect(str(db_path), timeout=5)
+    try:
+        row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    except sqlite3.Error as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+    busy = int(row[0]) if row else 1
+    return {"ok": busy == 0, "busy": busy, "log": int(row[1]) if row else 0, "checkpointed": int(row[2]) if row else 0}
+
+
+def expected_reboot_kernel(pkgs: str | None) -> str | None:
+    for line in str(pkgs or "").splitlines():
+        name = line.strip()
+        if name.startswith("linux-image-") and name.endswith("-generic"):
+            return name.removeprefix("linux-image-")
+    return None
+
+
 def exchange_open_orders_count(env_file: Path | None = None) -> int | None:
     """Open Binance.US orders via the existing readiness probe. ``None`` = unknown.
 
@@ -1173,7 +1352,7 @@ def exchange_open_orders_count(env_file: Path | None = None) -> int | None:
             load_dotenv(env_file, override=False)
         from backend.services.live_readiness_service import _fetch_exchange_account_auth
 
-        res = asyncio.run(_fetch_exchange_account_auth())
+        res = asyncio.run(_fetch_exchange_account_auth(force=True))
     except Exception:
         return None
     if res.get("binance_api_auth_status") != "ok" or res.get("errors"):
@@ -1265,9 +1444,19 @@ def maybe_reboot(
     reboot: Callable[[], None] | None = None,
     held_pending: Callable[[], list[str]] | None = None,
     upgrade_held: Callable[[list[str]], dict[str, Any]] | None = None,
+    exposure: Callable[[], list[str]] | None = None,
+    arm_barrier: Callable[[], dict[str, Any]] | None = None,
+    clear_barrier: Callable[[], bool] | None = None,
+    checkpoint: Callable[[], dict[str, Any]] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     fetch_status = fetch_status or (lambda: http_json(cfg.status_url))
     open_orders = open_orders or (lambda: exchange_open_orders_count(cfg.repo / ".env"))
+    exposure = exposure or (lambda: reboot_exposure(cfg.live_db, reconcile_file=cfg.logs_dir / "mystic_live_reconcile.json"))
+    arm_barrier = arm_barrier or (lambda: arm_maintenance_reboot_barrier(cfg.live_db))
+    clear_barrier = clear_barrier or (lambda: clear_maintenance_reboot_barrier(cfg.live_db))
+    checkpoint = checkpoint or (lambda: passive_wal_checkpoint(cfg.live_db))
+    sleep = sleep or time.sleep
     held = (held_pending or held_upgrades_pending)()
     # Held packages are reported. They are not a reboot reason: their maintainer
     # scripts restart services the book depends on, and a pending upgrade of a
@@ -1278,21 +1467,29 @@ def maybe_reboot(
         out["deferral_reason"] = None
         return out
 
+    def _defer(reasons: list[str]) -> dict[str, Any]:
+        out["deferral_reason"] = ",".join(reasons)
+        logger.info("MAINT reboot_deferred %s", out["deferral_reason"])
+        return out
+
     def _gate() -> list[str]:
         code, status = fetch_status()
-        return evaluate_reboot_gate(
+        reasons = evaluate_reboot_gate(
             reboot_required=required,
             deploy_lock=deploy_lock_held(cfg),
             status_code=code,
             status=status,
             open_orders=open_orders(),
         )
+        try:
+            reasons.extend(exposure())
+        except Exception as exc:
+            reasons.append(f"exposure_unreadable:{str(exc)[:120]}")
+        return reasons
 
     reasons = _gate()
     if reasons:
-        out["deferral_reason"] = ",".join(reasons)
-        logger.info("MAINT reboot_deferred %s", out["deferral_reason"])
-        return out
+        return _defer(reasons)
     newest = newest_verified(list_backups(cfg.backup_dir))
     fresh = newest is not None and utc_now() - newest.ts <= timedelta(minutes=cfg.reboot_backup_max_age_min)
     if dry_run:
@@ -1308,8 +1505,26 @@ def maybe_reboot(
     # Positions or orders could have appeared while the backup ran.
     reasons = _gate()
     if reasons:
-        out["deferral_reason"] = ",".join(reasons)
-        return out
+        return _defer(reasons)
+    # The maintenance flock does not stop the portfolio loop. Hold new buys, let an
+    # in-flight submit become a position or an intent, then decide. A timeout never
+    # reboots over whatever is still open, and exits are not paused.
+    barrier = arm_barrier()
+    out["reboot_barrier"] = barrier
+    if not barrier.get("armed"):
+        return _defer([f"reboot_barrier:{barrier.get('error') or 'not_armed'}"])
+    sleep(max(0.0, float(cfg.reboot_drain_sec)))
+    reasons = _gate()
+    if reasons:
+        if barrier.get("we_set"):
+            clear_barrier()
+        return _defer(reasons)
+    wal = checkpoint()
+    out["wal_checkpoint"] = wal
+    if not wal.get("ok"):
+        if barrier.get("we_set"):
+            clear_barrier()
+        return _defer([f"wal_checkpoint:{wal.get('error') or 'busy'}"])
     marker = {
         "requested_utc": _iso(utc_now()),
         "reason": "reboot-required",
@@ -1379,7 +1594,19 @@ def post_reboot_checks(cfg: MaintConfig) -> list[str]:
             failures.append(f"market_data_stale:{name}")
     if not _learning_running():
         failures.append("learning_not_running")
+    wanted = _reboot_kernel_wanted(cfg)
+    if wanted is not None and os.uname().release != wanted:
+        failures.append(f"kernel:{os.uname().release}:wanted:{wanted}")
     return failures
+
+
+def _reboot_kernel_wanted(cfg: MaintConfig) -> str | None:
+    pkgs = _read_text(Path(f"{cfg.reboot_flag}.pkgs"))
+    if not pkgs:
+        with contextlib.suppress(OSError, ValueError):
+            payload = json.loads(cfg.reboot_marker.read_text())
+            pkgs = str(payload.get("pkgs") or "")
+    return expected_reboot_kernel(pkgs)
 
 
 def _learning_running() -> bool:
