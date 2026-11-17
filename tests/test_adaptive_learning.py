@@ -28,7 +28,6 @@ from backend.services.adaptive_learning import (
 from backend.services.day_v2.ranking import clamp_to_sleeve, rank_day_candidates
 from backend.services.day_v2.winner_contract import objective_level, runner_stop
 from backend.services.strategy_version import DAY_STRATEGY_VERSION, SCALP_STRATEGY_VERSION, exit_policy_anchor
-from tests.day_entry_value_support import teach_entry
 
 DAY = "DAY_V2"
 SCALP = "SCALP_V2"
@@ -57,8 +56,9 @@ def test_a_i_day_markout_updates_state_and_next_candidate_reads_it(tmp_path):
     assert diagnostic["n_forward"] >= 1
     # A fixed-horizon markout is a DAY diagnostic: it never moves expected net.
     # A cold DAY entry is worth the fresh position's net: minus the round-trip cost.
-    cold = -before["economic"]["expected_cost"]
+    cold = 0.0
     assert diagnostic["expected_net"] == before["expected_net"] == pytest.approx(cold)
+    assert before["continuation_terminal_net"] == pytest.approx(-before["economic"]["expected_cost"])
     # The candidate's lifecycle under the live exit contract does.
     params = LifecycleParams(setup="RANGE_BOUNCE", entry_price=100.0, entry_time=10_000.0, atr_15m=0.4, structural_anchor=99.0, target_price=103.0, atr_1h=1.0, objective_structural=103.0)
     record_candidate(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="neutral", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=10_000.0, lifecycle=params)
@@ -70,13 +70,17 @@ def test_a_i_day_markout_updates_state_and_next_candidate_reads_it(tmp_path):
     # The lifecycle label and the realized-close posterior are diagnostics.
     # Live entry value follows the continuation surface at the fresh state.
     assert after["expected_net"] == before["expected_net"] == pytest.approx(cold)
+    assert after["continuation_terminal_net"] == pytest.approx(before["continuation_terminal_net"])
     assert observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="neutral", metric="trade_net", value=0.01, strategy_version=DAY_STRATEGY_VERSION)
     recorded = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
     assert recorded["expected_net"] == pytest.approx(cold)
     assert recorded["economic"]["trade_net_value"] > 0.0
-    teach_entry(db, "XRPUSDT", "RANGE_BOUNCE", "neutral", 0.01, times=3)
+    from tests.day_entry_value_support import teach_policy
+
+    teach_policy(db, "XRPUSDT", "RANGE_BOUNCE", "neutral", 0.01, times=3)
     funded = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
     assert funded["expected_net"] > 0.0
+    assert funded["continuation_terminal_net"] == pytest.approx(-funded["economic"]["expected_cost"])
     assert funded["size_mult"] > before["size_mult"]
     from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 
@@ -91,7 +95,9 @@ def test_b_c_d_e_f_day_outcome_moves_rank_size_objective_and_runner(tmp_path):
     assert observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="bull", metric="trade_mfe", value=0.04, strategy_version=DAY_STRATEGY_VERSION)
     assert observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="bull", metric="trade_continuation", value=0.9, strategy_version=DAY_STRATEGY_VERSION)
     assert observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="bull", metric="trade_time_to_mfe_min", value=40.0, strategy_version=DAY_STRATEGY_VERSION)
-    teach_entry(db, "BTCUSDT", "HTF_TREND_PULLBACK", "bull", 0.01, times=3)
+    from tests.day_entry_value_support import teach_policy
+
+    teach_policy(db, "BTCUSDT", "HTF_TREND_PULLBACK", "bull", 0.01, times=3)
     assert observe(db, engine=DAY, symbol="SOLUSDT", setup="RANGE_BOUNCE", regime="bear", metric="trade_mae", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
     btc = day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "bull")
     sol = day_decision(db, "SOLUSDT", "RANGE_BOUNCE", "bear")
@@ -218,8 +224,9 @@ def test_s_t_u_no_count_gate_no_legacy(tmp_path):
     db = str(tmp_path / "t.db")
     cold = day_decision(db, "SOLUSDT", "EXHAUSTION_MR", "bear")
     assert cold["confidence"] == 0.0
-    assert cold["expected_net"] == pytest.approx(-cold["economic"]["expected_cost"])
-    assert cold["size_mult"] < 1.0
+    assert cold["expected_net"] == pytest.approx(0.0)
+    assert cold["continuation_terminal_net"] == pytest.approx(-cold["economic"]["expected_cost"])
+    assert cold["size_mult"] == pytest.approx(1.0)
     ranked = rank_day_candidates([_cand("SOLUSDT", cold), _cand("XRPUSDT")], ["SOLUSDT", "XRPUSDT"], 0.0006)
     assert len(ranked) == 2
     assert observe(db, engine=DAY, symbol="SOLUSDT", setup="EXHAUSTION_MR", regime="bear", metric="trade_mfe", value=-0.05, strategy_version="LEGACY_MIXED") is False
@@ -585,7 +592,9 @@ def test_abstention_fires_on_confident_negative_edge(tmp_path):
     db = str(tmp_path / "t.db")
     for _ in range(40):
         observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
-    teach_entry(db, "XRPUSDT", "RANGE_BOUNCE", "", -0.02, times=5)
+    from tests.day_entry_value_support import teach_policy
+
+    teach_policy(db, "XRPUSDT", "RANGE_BOUNCE", "", -0.02, times=20)
     d = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")
     assert d["abstain"] is True
     assert "LEARNED_NEGATIVE_EDGE" in d["abstain_reason"]
@@ -605,7 +614,9 @@ def test_abstention_kill_switch_disables_it(tmp_path, monkeypatch):
     db = str(tmp_path / "t.db")
     for _ in range(40):
         observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
-    teach_entry(db, "XRPUSDT", "RANGE_BOUNCE", "", -0.02, times=5)
+    from tests.day_entry_value_support import teach_policy
+
+    teach_policy(db, "XRPUSDT", "RANGE_BOUNCE", "", -0.02, times=20)
     assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is True
     monkeypatch.setattr(al, "ABSTAIN_ENABLED", False)
     assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is False
@@ -616,9 +627,11 @@ def test_abstention_report_measures_value(tmp_path):
 
     db = str(tmp_path / "t.db")
     # A confident negative-edge DAY key -> should show up as abstaining.
-    teach_entry(db, "XRPUSDT", "RANGE_BOUNCE", "", -0.02, times=5)
+    from tests.day_entry_value_support import teach_policy
+
+    teach_policy(db, "XRPUSDT", "RANGE_BOUNCE", "", -0.02, times=20)
     # A healthy positive key -> stays active.
-    teach_entry(db, "BTCUSDT", "HTF_TREND_PULLBACK", "", 0.02, times=5)
+    teach_policy(db, "BTCUSDT", "HTF_TREND_PULLBACK", "", 0.02, times=5)
     # Record two live skip decisions in the DAY decision log within the window.
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE IF NOT EXISTS day_v2_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, cycle_ts REAL, result TEXT, closest TEXT DEFAULT '', unmet_json TEXT DEFAULT '[]')")
@@ -652,7 +665,9 @@ def test_learned_negative_edge_flag_is_telemetry_on_both_engines(tmp_path):
     assert "LEARNED_NEGATIVE_EDGE" not in scalp
     assert "NO_EXECUTABLE_NET_EDGE" in inspect.getsource(__import__("backend.services.scalp_v2.decision_log", fromlist=["classify_scalp_candidate"]).classify_scalp_candidate)
     db = str(tmp_path / "t.db")
-    teach_entry(db, "XRPUSDT", "RANGE_BOUNCE", "", -0.02, times=5)
+    from tests.day_entry_value_support import teach_policy
+
+    teach_policy(db, "XRPUSDT", "RANGE_BOUNCE", "", -0.02, times=5)
     d = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")
     assert d["abstain"] is True and d["abstain_live_veto"] is False
     assert d["size_mult"] < 1.0

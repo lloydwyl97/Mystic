@@ -191,10 +191,7 @@ def apply_external_outcome(conn: sqlite3.Connection, row: Any, net: float, momen
     state["bias"] = float(state["bias"]) - 0.05 * err
     rate = 0.05
     state["mu"] = [(1.0 - rate) * float(mu) + rate * value for mu, value in zip(state["mu"], values, strict=True)]
-    state["var"] = [
-        max(1e-9, (1.0 - rate) * float(var) + rate * (value - mu) ** 2)
-        for var, value, mu in zip(state["var"], values, state["mu"], strict=True)
-    ]
+    state["var"] = [max(1e-9, (1.0 - rate) * float(var) + rate * (value - mu) ** 2) for var, value, mu in zip(state["var"], values, state["mu"], strict=True)]
     state["n"] = float(state["n"]) + 1.0
     state["total_sum"] = float(state["total_sum"]) + float(net)
     if prediction > 0.0:

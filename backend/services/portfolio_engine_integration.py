@@ -2070,17 +2070,24 @@ class PortfolioEngineIntegration:
         cand["ask_at"] = time.time()
         db_sym_15m = cand["db_symbol"]
         as_of = cand["as_of"]
-        # Non-positive learned net after costs does not get capital. The
-        # candidate is already recorded and still trains. Cold is neutral (0),
-        # so it does not clear costs.
-        if float((cand.get("adaptive") or {}).get("expected_net") or 0.0) <= 0.0:
+        # Capital follows entry_expected_policy_net, the deployed-policy estimate.
+        # The continuation terminal is not an input. Cold is the prior 0, so it
+        # does not clear the existing executable-net check.
+        from backend.services.day_v2.entry_policy_value import entry_funding_authorized
+
+        adapt_gate = cand.get("adaptive") or {}
+        if "entry_expected_policy_net" in adapt_gate:
+            policy_net = float(adapt_gate.get("entry_expected_policy_net") or 0.0)
+        else:
+            policy_net = float(adapt_gate.get("expected_net") or 0.0)
+        if not entry_funding_authorized(policy_net):
             record_day_decision(
                 db_path,
                 symbol,
                 "REJECTED:NO_EXECUTABLE_NET_EDGE",
                 cycle_ts=as_of,
                 closest=signal.setup,
-                unmet=[f"expected_net={float((cand.get('adaptive') or {}).get('expected_net') or 0.0):.6f}"],
+                unmet=[f"entry_expected_policy_net={policy_net:.6f}"],
             )
             logger.info("DAY_V2_NO_NET_EDGE symbol=%s setup=%s", symbol, signal.setup)
             _note_exact(db_path, cand, funded=False, reason="NO_EXECUTABLE_NET_EDGE")

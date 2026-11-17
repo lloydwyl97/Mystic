@@ -61,6 +61,7 @@ _EPISODE_COLUMNS = (
     ("planning_net", "REAL"),
     ("policy_net_version", "TEXT"),
     ("label_taker_fee", "REAL"),
+    ("entry_policy_learned", "INTEGER NOT NULL DEFAULT 0"),
 )
 _CHECK_COLUMNS = (
     ("bid", "REAL"),
@@ -290,7 +291,10 @@ def open_exact_episode(db_path: str, cand: dict[str, Any], candidate_id: int | N
         "setup": str(cand.get("learned_setup") or getattr(signal, "setup", "") or ""),
         "geometry_setup": str(getattr(signal, "setup", "") or ""),
         "regime": str(cand.get("regime_tag") or ""),
-        "expected_net": adaptive.get("expected_net"),
+        "expected_net": adaptive.get("entry_expected_policy_net", adaptive.get("expected_net")),
+        "entry_expected_policy_net": adaptive.get("entry_expected_policy_net", economic.get("entry_expected_policy_net")),
+        "continuation_terminal_net": economic.get("continuation_terminal_net", adaptive.get("continuation_terminal_net")),
+        "entry_value_contract": economic.get("entry_policy_version"),
         "uncalibrated_policy_value": economic.get("uncalibrated_policy_value"),
         "trade_net_calibration": economic.get("trade_net_calibration", economic.get("policy_calibration")),
         "rank_position": rank.get("position"),
@@ -649,6 +653,13 @@ def advance_exact_episodes(db_path: str, *, now: float | None = None, limit: int
         logger.warning("EXACT_POLICY_ADVANCE_FAILED", exc_info=True)
     finally:
         conn.close()
+    try:
+        from backend.services.day_v2.entry_policy_value import apply_resolved_entry_policy_labels
+
+        stats["entry_policy_learned"] = apply_resolved_entry_policy_labels(db_path, now=moment)
+    except Exception:
+        logger.warning("ENTRY_POLICY_APPLY_FAILED", exc_info=True)
+        stats["entry_policy_learned"] = 0
     return stats
 
 
@@ -681,6 +692,9 @@ def _close_real_if_resolved(conn: sqlite3.Connection, row: sqlite3.Row, moment: 
     hold_s = max(0.0, exit_ts - decided_ts)
     max_mfe = _float(excursions["max_mfe"]) if excursions is not None else 0.0
     max_mae = _float(excursions["max_mae"]) if excursions is not None else 0.0
+    planning = None
+    if trigger_bid is not None and float(row["entry_ask"] or 0.0) > 0.0:
+        planning = executable_bid_net(float(row["entry_ask"]), float(trigger_bid), float(row["roundtrip_cost"] or ESTIMATED_ROUNDTRIP_COST))
     conn.execute(
         """
         UPDATE policy_episodes
@@ -689,10 +703,12 @@ def _close_real_if_resolved(conn: sqlite3.Connection, row: sqlite3.Row, moment: 
             exit_reason=COALESCE(NULLIF(exit_reason, ''), ?),
             exit_bid=COALESCE(exit_bid, ?),
             hold_sec=COALESCE(hold_sec, ?),
+            planning_net=COALESCE(planning_net, ?),
+            policy_net_version=CASE WHEN ? IS NOT NULL THEN ? ELSE policy_net_version END,
             learned=1, train_eligible=0, train_applied=0
         WHERE id=? AND status=?
         """,
-        (REAL, net, moment, moment, max_mfe, max_mae, resolved_reason, trigger_bid, hold_s, int(row["id"]), OPEN),
+        (REAL, net, moment, moment, max_mfe, max_mae, resolved_reason, trigger_bid, hold_s, planning, planning, NET_VERSION, int(row["id"]), OPEN),
     )
     if audit_reason and real_reason:
         policy_match = 1 if audit_reason == real_reason else 0

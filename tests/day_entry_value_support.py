@@ -40,6 +40,23 @@ def fresh_state(cost: float = 0.00066) -> dict[str, float]:
     return state_features(entry=1.0, mark=1.0, net=-cost, mfe=0.0, mae=0.0, high_water=1.0, prev_net=None, age_sec=0.0)
 
 
+def teach_policy(db: str, symbol: str, setup: str, regime: str, value: float, *, times: int = 1, now: float | None = None, weight: float = 1.0) -> None:
+    """Fold ``times`` ENTRY_POLICY_VALUE_V1 labels. This is not continuation evidence."""
+    from backend.services.day_v2.entry_policy_value import record_entry_policy_observation
+
+    moment = float(now if now is not None else time.time())
+    for step in range(int(times)):
+        assert record_entry_policy_observation(
+            db,
+            symbol=symbol,
+            setup=setup,
+            regime=regime,
+            value=float(value),
+            weight=float(weight),
+            now=moment + step,
+        )
+
+
 def teach_entry(db: str, symbol: str, setup: str, regime: str, advantage: float, *, times: int = 1, now: float | None = None) -> None:
     """Fold ``times`` fresh-state advantages at every DAY horizon for one key."""
     install_day_surface(db)

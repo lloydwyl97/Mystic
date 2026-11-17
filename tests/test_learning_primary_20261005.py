@@ -21,7 +21,7 @@ from backend.services.day_v2.ranking import rank_day_candidates
 from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 from backend.services.scalp_v2 import exit_evaluator as scalp_exits
 from backend.services.strategy_version import exit_policy_anchor
-from tests.day_entry_value_support import teach_entry
+from tests.day_entry_value_support import teach_policy as teach_entry
 
 DAY = al.DAY_ENGINE
 
@@ -45,7 +45,7 @@ def _cand(symbol: str, setup: str, adaptive: dict) -> dict:
 def test_cold_setups_are_neutral_and_the_name_is_not_an_edge(tmp_path):
     db = str(tmp_path / "c.db")
     nets = [al.day_decision(db, "BTCUSDT", setup, "", now=T0)["expected_net"] for setup in sorted(ENABLED_SETUPS)]
-    assert nets == [pytest.approx(-al_cost())] * len(nets)
+    assert nets == [pytest.approx(0.0)] * len(nets)
     assert "if n <" not in inspect.getsource(al.day_decision)
     for banned in ("HTF bad", "RANGE good"):
         assert banned not in inspect.getsource(al.day_decision)
@@ -56,7 +56,7 @@ def test_one_loss_moves_the_next_decision(tmp_path):
     before = al.day_decision(db, "SOLUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
     teach_entry(db, "SOLUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", -0.01, now=T0)
     after = al.day_decision(db, "SOLUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
-    assert after["expected_net"] < before["expected_net"] == pytest.approx(-al_cost())
+    assert after["expected_net"] < before["expected_net"] == pytest.approx(0.0)
     assert after["size_mult"] < before["size_mult"]
     assert after["economic"]["final_learned_net_edge"] == pytest.approx(after["expected_net"])
 

@@ -86,6 +86,7 @@ def test_a_later_model_does_not_rewrite_the_stored_decision(tmp_path, monkeypatc
 
     monkeypatch.setattr(pe, "continuation_terminal", _down)
     pe.advance_episodes(db, lambda _symbol: 99.5, now=T0 + 30.0)
+
     def _later(*_a, **_k):
         return 1.0
 
@@ -118,6 +119,7 @@ def test_a_real_fill_is_not_a_second_simulated_trade(tmp_path, monkeypatch):
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=? WHERE id=?", (-0.0004, row_id))
     pe.open_episode(db, candidate_id=row_id, engine=DAY, symbol="ETHUSDT", setup="BREAKOUT_CONTINUATION__MARKET", regime="r", entry_ask=2000.0, roundtrip_cost=0.00066, now=T0)
+
     def _ignore(*_a, **_k):
         return -1.0
 
@@ -205,9 +207,7 @@ def test_prediction_is_stored_before_the_outcome_and_is_not_rewritten(tmp_path, 
     pe.advance_episodes(db, lambda _symbol: 99.0, now=T0 + 40.0)
     with sqlite3.connect(db) as conn:
         after = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes").fetchone()[0])
-        exit_at, learned, n = conn.execute(
-            "SELECT e.exit_at, e.learned, s.n FROM policy_episodes e JOIN adaptive_metric_state s ON s.metric='direct_policy_net'"
-        ).fetchone()
+        exit_at, learned, n = conn.execute("SELECT e.exit_at, e.learned, s.n FROM policy_episodes e JOIN adaptive_metric_state s ON s.metric='direct_policy_net'").fetchone()
     assert after["direct_policy"]["mean"] == pytest.approx(before)
     assert after["direct_policy"]["prediction_at"] < exit_at
     assert learned == 1 and n == pytest.approx(1.0)
@@ -274,17 +274,13 @@ def test_a_real_hold_keeps_the_continuation_check_and_closes_on_the_accounting_n
     monkeypatch.setattr(pe, "continuation_terminal", _down)
     pe.advance_episodes(db, lambda _symbol: 99.0, now=T0 + 30.0)
     with sqlite3.connect(db) as conn:
-        status, learned, action = conn.execute(
-            "SELECT e.status, e.learned, c.action FROM policy_episodes e JOIN policy_episode_checks c ON c.episode_id=e.id"
-        ).fetchone()
+        status, learned, action = conn.execute("SELECT e.status, e.learned, c.action FROM policy_episodes e JOIN policy_episode_checks c ON c.episode_id=e.id").fetchone()
     assert status == pe.OPEN and learned == 0 and action == "exit"
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=? WHERE id=?", (-0.0004, row_id))
     pe.advance_episodes(db, lambda _symbol: 50.0, now=T0 + 90.0)
     with sqlite3.connect(db) as conn:
-        kind, net, checks = conn.execute(
-            "SELECT kind, net, (SELECT COUNT(*) FROM policy_episode_checks) FROM policy_episodes"
-        ).fetchone()
+        kind, net, checks = conn.execute("SELECT kind, net, (SELECT COUNT(*) FROM policy_episode_checks) FROM policy_episodes").fetchone()
         parity = conn.execute("SELECT accounting_net, last_check_action FROM policy_fill_parity").fetchone()
     assert kind == pe.REAL and net == pytest.approx(-0.0004) and checks == 1
     assert parity[0] == pytest.approx(-0.0004) and parity[1] == "exit"

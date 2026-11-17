@@ -34,9 +34,11 @@ def test_cold_entry_value_is_minus_cost_and_does_not_abstain(tmp_path):
     entry = al.day_entry_value(db, *KEY, cost=cost, now=T0)
     assert entry["value"] == pytest.approx(-cost) and entry["informed"] is False
     d = al.day_decision(db, *KEY, now=T0)
-    assert d["expected_net"] == pytest.approx(-cost)
+    assert d["continuation_terminal_net"] == pytest.approx(-cost)
+    assert d["entry_expected_policy_net"] == pytest.approx(0.0)
+    assert d["expected_net"] == d["entry_expected_policy_net"]
     assert d["abstain"] is False
-    assert d["economic"]["policy_base"] == al.DAY_ENTRY_VALUE_BASE == "continuation_value"
+    assert d["economic"]["policy_base"] == "ENTRY_POLICY_VALUE_V1"
     assert d["economic"]["continuation_entry_informed"] is False
 
 
@@ -65,7 +67,8 @@ def test_entry_value_equals_the_first_continuation_check_at_fill(tmp_path):
         now=T0,
     )
     assert check["net"] == pytest.approx(-cost)
-    assert d["expected_net"] == pytest.approx(check["terminal"])
+    assert d["continuation_terminal_net"] == pytest.approx(check["terminal"])
+    assert d["entry_expected_policy_net"] == pytest.approx(0.0)
     assert d["economic"]["continuation_entry_advantage"] == pytest.approx(check["advantage"])
     assert d["economic"]["continuation_entry_how"] == cs.installed_aggregator(db, "DAY_V2")
     assert d["economic"]["policy_value"] == pytest.approx(d["expected_net"])
@@ -78,7 +81,8 @@ def test_realized_close_posterior_is_a_diagnostic_not_the_entry_value(tmp_path):
     for _ in range(5):
         al.observe(db, engine=al.DAY_ENGINE, symbol=KEY[0], setup=KEY[1], regime=KEY[2], metric="trade_net", value=-0.02, strategy_version=al.current_strategy_version(al.DAY_ENGINE), now=T0)
     after = al.day_decision(db, *KEY, now=T0)
-    assert after["expected_net"] == pytest.approx(before["expected_net"])
+    assert after["expected_net"] == pytest.approx(before["expected_net"]) == pytest.approx(0.0)
+    assert after["continuation_terminal_net"] == pytest.approx(before["continuation_terminal_net"])
     assert after["economic"]["trade_net_value"] < before["economic"]["trade_net_value"]
 
 
@@ -143,7 +147,8 @@ def test_opportunity_labels_fold_once_with_path_weight(tmp_path, monkeypatch):
     assert cb.fold_recent_advantages(db, now=as_of + 120) == 0
     d = al.day_decision(db, *KEY, now=as_of)
     assert d["economic"]["continuation_entry_informed"] is True
-    assert d["expected_net"] > -canonical_roundtrip_cost_pct()
+    assert d["continuation_terminal_net"] > -canonical_roundtrip_cost_pct()
+    assert d["entry_expected_policy_net"] == pytest.approx(0.0)
 
 
 def test_fresh_entry_has_zero_excursion_tilt_while_open_position_uses_ridge(tmp_path):
@@ -160,7 +165,8 @@ def test_fresh_entry_has_zero_excursion_tilt_while_open_position_uses_ridge(tmp_
     assert trace_fresh is not None
     assert all(item["ridge"] == 0.0 for item in trace_fresh["horizons"])
     d = al.day_decision(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", now=T0 + 20)
-    assert d["expected_net"] > 0.0
+    assert d["continuation_terminal_net"] > 0.0
+    assert d["entry_expected_policy_net"] == pytest.approx(0.0)
 
 
 def test_regime_isolation_prevents_other_regime_losses_from_crushing_positive_regime_edge(tmp_path):
@@ -170,8 +176,9 @@ def test_regime_isolation_prevents_other_regime_losses_from_crushing_positive_re
     teach_entry(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", 0.004, times=2, now=T0)
     pos_reg = al.day_decision(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", now=T0)
     neg_reg = al.day_decision(db, "BTCUSDT", "VWAP_REVERSION__MARKET", "btcup_volhi", now=T0)
-    assert pos_reg["expected_net"] > 0.0
-    assert neg_reg["expected_net"] < 0.0
+    assert pos_reg["continuation_terminal_net"] > 0.0
+    assert neg_reg["continuation_terminal_net"] < 0.0
+    assert pos_reg["entry_expected_policy_net"] == neg_reg["entry_expected_policy_net"] == pytest.approx(0.0)
 
 
 def test_age_zero_opportunity_rows_do_not_corrupt_intra_hold_ridge(tmp_path):

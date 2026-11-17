@@ -65,34 +65,19 @@ RETENTION_JUSTIFICATION: dict[str, str] = {
         "horizon). Not live P&L. Kept 7 days with the states they describe; the longest DAY "
         "horizon is 12h, so a week covers resolution plus a re-run."
     ),
-    "policy_episodes": (
-        "Research-only virtual positions. They are not orders, cash, or account P&L. "
-        "14 days covers continuation resolution and a replay of the entry-time policy trace."
-    ),
-    "policy_episode_checks": (
-        "Immutable continuation decisions for policy episodes. Kept with the episodes, 14 days. "
-        "A replay reads these rows and does not recompute them on a later model."
-    ),
+    "policy_episodes": ("Research-only virtual positions. They are not orders, cash, or account P&L. 14 days covers continuation resolution and a replay of the entry-time policy trace."),
+    "policy_episode_checks": ("Immutable continuation decisions for policy episodes. Kept with the episodes, 14 days. A replay reads these rows and does not recompute them on a later model."),
     "policy_group_scores": (
-        "Research comparison of live entry, direct policy, and the best policy outcome "
-        "for one four-coin decision. Not an order and not account P&L. Kept 14 days with the episodes."
+        "Research comparison of live entry, direct policy, and the best policy outcome for one four-coin decision. Not an order and not account P&L. Kept 14 days with the episodes."
     ),
     "policy_challenger_scores": (
-        "Research scoreboard for state-conditioned policy models. Predictions were stored before "
-        "the outcome. Not an order and not account P&L. Kept 14 days with the episodes."
+        "Research scoreboard for state-conditioned policy models. Predictions were stored before the outcome. Not an order and not account P&L. Kept 14 days with the episodes."
     ),
-    "policy_horizon_marks": (
-        "Executable bids recorded after a research exit, so continuation can be compared with "
-        "holding longer. Not an order. Kept 14 days with the episode."
-    ),
+    "policy_horizon_marks": ("Executable bids recorded after a research exit, so continuation can be compared with holding longer. Not an order. Kept 14 days with the episode."),
     "policy_group_model_scores": (
-        "Research scores for the group-opportunity and coin-residual models. The prediction was "
-        "stored while the episodes were open. Not an order and not account P&L. Kept 14 days."
+        "Research scores for the group-opportunity and coin-residual models. The prediction was stored while the episodes were open. Not an order and not account P&L. Kept 14 days."
     ),
-    "external_policy_applied": (
-        "One row per policy episode whose outside-venue features were learned. Research only. "
-        "Kept 14 days with the episode so a resolved net is not learned twice."
-    ),
+    "external_policy_applied": ("One row per policy episode whose outside-venue features were learned. Research only. Kept 14 days with the episode so a resolved net is not learned twice."),
     "scalp_shadow_rejects": (
         "SCALP shadow gate telemetry sampled per rejected setup. Not an order, fill, accounting "
         "or clock-v2 artifact and not referenced by any sealed lock. 30 days keeps a full month "

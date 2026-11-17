@@ -241,7 +241,8 @@ def test_no_time_rule_sample_gate_or_entry_change():
     assert "age_min" not in decision
     assert "hold_seconds" not in decision
     assert "hold_adv" not in inspect.getsource(al.day_decision)
-    assert "continuation_terminal" not in inspect.getsource(al.day_decision)
+    assert "continuation_terminal(" not in inspect.getsource(al.day_decision)
+    assert "entry_policy_value(" in inspect.getsource(al.day_decision)
     assert "hold_adv" not in inspect.getsource(scalp_executable_edge)
     assert pytest.approx(0.015) == SCALP_V2_CATASTROPHIC_PCT
     assert catastrophic_threshold_price(100.0, 1.0, 0.0) == pytest.approx(97.0)

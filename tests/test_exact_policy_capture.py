@@ -63,6 +63,7 @@ def test_four_symbols_and_invalid_candidates(tmp_path):
 def test_refused_episode_uses_same_decision_and_does_not_touch_cash(tmp_path, monkeypatch):
     db = str(tmp_path / "t.db")
     monkeypatch.setattr("backend.services.exact_policy_capture._book", lambda _symbol: (99.0, 99.2))
+
     def _terminal(*args, **kwargs):
         net = kwargs.get("unrealized_net", args[5] if len(args) > 5 else 0.0)
         return float(net) - 0.01
@@ -144,9 +145,7 @@ def test_downtime_does_not_invent_checks(tmp_path, monkeypatch):
     stats = advance_exact_episodes(db, now=1_000_000.0 + 1000.0)
     assert stats["downtime"] == 1
     conn = sqlite3.connect(db)
-    status, reason, nchecks = conn.execute(
-        "SELECT parity_status, non_parity_reason, (SELECT COUNT(*) FROM policy_episode_checks) FROM policy_episodes"
-    ).fetchone()
+    status, reason, nchecks = conn.execute("SELECT parity_status, non_parity_reason, (SELECT COUNT(*) FROM policy_episode_checks) FROM policy_episodes").fetchone()
     assert status == "NON_PARITY" and reason == "DOWNTIME_GAP" and nchecks == 1
 
 

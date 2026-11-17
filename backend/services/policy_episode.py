@@ -578,7 +578,7 @@ def _spearman(left: list[float], right: list[float]) -> float | None:
     dy = sum((b - my) ** 2 for b in ys)
     if dx <= 0.0 or dy <= 0.0:
         return None
-    return num / ((dx ** 0.5) * (dy ** 0.5))
+    return num / ((dx**0.5) * (dy**0.5))
 
 
 def _snap(raw: str) -> dict[str, Any]:
@@ -809,9 +809,7 @@ def _decision_reason(conn: sqlite3.Connection, symbol: str, decided_at: float) -
 
 def _recover_issued(conn: sqlite3.Connection) -> None:
     """Fill null entry fields from state written at the decision. Never writes a prediction."""
-    rows = conn.execute(
-        "SELECT id, candidate_id, symbol, decided_at, snapshot_json FROM policy_episodes WHERE recovered=0 LIMIT 40"
-    ).fetchall()
+    rows = conn.execute("SELECT id, candidate_id, symbol, decided_at, snapshot_json FROM policy_episodes WHERE recovered=0 LIMIT 40").fetchall()
     for row in rows:
         snap = _snap(str(row["snapshot_json"]))
         issued = snap.get("issued") if isinstance(snap.get("issued"), dict) else {}

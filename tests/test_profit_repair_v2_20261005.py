@@ -31,7 +31,7 @@ from backend.services.economic_state_rebuild import rebuild_scalp
 from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 from backend.services.scalp_v2 import exit_evaluator as scalp_exits
 from backend.services.scalp_v2.executable_edge import REJECT_THRESHOLD_PCT, scalp_executable_edge
-from tests.day_entry_value_support import teach_entry
+from tests.day_entry_value_support import teach_policy
 
 DAY, SCALP = al.DAY_ENGINE, al.SCALP_ENGINE
 T0 = 1_791_200_000.0  # after both economic anchors
@@ -113,7 +113,7 @@ def _claim_rows(db: str, raws: list[float], *, gross_of, start: float = T0, step
 
 def _day_obs(db: str, value: float, *, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="trade_net") -> bool:
     if metric == "trade_net":
-        teach_entry(db, symbol, setup, regime, value, now=T0)
+        teach_policy(db, symbol, setup, regime, value, now=T0)
         return True
     return al.observe(db, engine=DAY, symbol=symbol, setup=setup, regime=regime, metric=metric, value=value, strategy_version=al.current_strategy_version(DAY), now=T0)
 
@@ -295,7 +295,9 @@ def test_blank_regime_rows_never_enter_regime_specific_state(tmp_path):
     known = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
     weights = known["economic"]["level_weights"]
     assert weights["key"] == 0.0 and weights["related"] > 0.0
-    assert known["n_trade_net"] == 0.0 and known["expected_net"] < 0.0
+    assert known["n_trade_net"] == 0.0
+    assert known["economic"]["trade_net_value"] < 0.0
+    assert known["expected_net"] == pytest.approx(0.0)
     blank = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "", now=T0)
     assert blank["economic"]["level_weights"]["key"] == 0.0
     other = al.day_decision(db, "ETHUSDT", "HTF_TREND_PULLBACK", "", now=T0)["economic"]["level_weights"]

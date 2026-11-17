@@ -3946,12 +3946,13 @@ function renderAdaptiveState(data) {
         }).slice(0, 20);
         useList.forEach(function (r) {
             const isDay = engine === "DAY_V2";
-            const move = isDay ? pct(r.expected_net != null ? r.expected_net : r.expected_move) : pct(r.expected_edge != null ? r.expected_edge : r.claim_gross_mean);
+            const move = isDay ? pct(r.entry_expected_policy_net != null ? r.entry_expected_policy_net : r.expected_net) : pct(r.expected_edge != null ? r.expected_edge : r.claim_gross_mean);
+            const continuation = isDay ? pct(r.continuation_terminal_net) : "--";
             const tgt = isDay ? "×" + (r.objective_atr_mult || 1).toFixed(2) : pct(r.target_pct);
             const hold = isDay ? "surface" : (r.hold_min || 0).toFixed(1) + "m";
-            const nVal = isDay ? (r.n_trade_net != null && r.n_trade_net > 0 ? r.n_trade_net : (r.n || 0)) : (r.n || 0);
+            const nVal = isDay ? (r.n_entry_policy != null ? r.n_entry_policy : (r.n || 0)) : (r.n || 0);
             rows.push(
-                "<tr><td>" + escapeHtml(engine) + "</td><td>" + escapeHtml(r.symbol || "") + "</td><td>" + escapeHtml(r.setup || "") + "</td><td>" + escapeHtml(r.regime || "-") + "</td><td>" + move + "</td><td>" + (r.size_mult || 1).toFixed(3) + "</td><td>" + tgt + "</td><td>" + hold + "</td><td>" + (r.confidence || 0).toFixed(3) + "</td><td>" + Number(nVal).toFixed(1) + "</td></tr>"
+                "<tr><td>" + escapeHtml(engine) + "</td><td>" + escapeHtml(r.symbol || "") + "</td><td>" + escapeHtml(r.setup || "") + "</td><td>" + escapeHtml(r.regime || "-") + "</td><td>" + move + "</td><td>" + continuation + "</td><td>" + (r.size_mult || 1).toFixed(3) + "</td><td>" + tgt + "</td><td>" + hold + "</td><td>" + (r.confidence || 0).toFixed(3) + "</td><td>" + Number(nVal).toFixed(1) + "</td></tr>"
             );
         });
     });

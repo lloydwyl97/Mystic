@@ -5,9 +5,8 @@ funded first when the DAY sleeve cannot fund all of them. Ranking decides
 order only; it never removes a candidate.
 
 Order, highest first:
-  1. expected net edge after costs (``day_decision``): the candidate's
-     hierarchically pooled current-version evidence, realized closes and
-     lifecycle replays of unfilled qualified candidates. Cold, it is 0;
+  1. entry policy net (``ENTRY_POLICY_VALUE_V1``): the hierarchical mean of
+     resolved exact-policy planning nets. Cold, the prior is 0;
   2. executable net edge to the setup objective: (objective - ask) / ask minus
      the estimated round-trip cost, where objective is the same level the
      structure runner manages to (max(structural level, ask + k x 1h ATR));
@@ -104,7 +103,12 @@ def rank_day_candidates(candidates: list[dict[str, Any]], universe: list[str] | 
             structural_emphasis=emphasis,
         )
         cand["rank"]["expected_move"] = float(adaptive.get("expected_move") or 0.0)
-        cand["rank"]["expected_net"] = float(adaptive.get("expected_net") or 0.0)
+        if "entry_expected_policy_net" in adaptive:
+            policy_net = float(adaptive.get("entry_expected_policy_net") or 0.0)
+        else:
+            policy_net = float(adaptive.get("expected_net") or 0.0)
+        cand["rank"]["expected_net"] = policy_net
+        cand["rank"]["entry_expected_policy_net"] = policy_net
         cand["rank"]["uncertainty"] = float(adaptive.get("uncertainty") or 0.0)
         cand["rank"]["confidence"] = float(adaptive.get("confidence") or 0.0)
         cand["rank"]["size_mult"] = float(adaptive.get("size_mult") or 1.0)

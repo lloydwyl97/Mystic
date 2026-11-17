@@ -20,10 +20,11 @@ Realized closes update ``trade_*`` metrics. DAY candidates update
 catastrophic protection or the label censor) and the fixed-horizon
 ``markout_*`` diagnostics. SCALP claims update the claim calibration. Both are
 market opportunity. ``policy_gap`` is what Mystic's own exit policy realized on
-a filled opportunity minus that opportunity's market label; adding it turns
-market opportunity into expected realized result under the policy. DAY net
-expectancy sets bounded size and rank, the SCALP executable edge sets
-eligibility, rank and size, and both are in policy units.
+a filled opportunity minus that opportunity's market label. DAY entry rank and
+size read ``ENTRY_POLICY_VALUE_V1`` (the decayed mean of exact-policy
+planning nets), not the continuation terminal and not ``trade_net``. The
+continuation terminal prices an already-open hold. The SCALP executable edge
+sets SCALP eligibility, rank and size.
 """
 
 from __future__ import annotations
@@ -1146,12 +1147,12 @@ def day_size_mult(expected_net: float, risk: float) -> float:
 
 
 def day_entry_value(db_path: str, symbol: str, setup: str, regime: str, *, cost: float, now: float | None = None) -> dict[str, Any]:
-    """Learned terminal net of a DAY position at the moment it fills.
+    """Continuation terminal of a DAY position at the moment it would fill.
 
     The fresh state is net = -cost with no excursion, age 0. Its value is that net
     plus the installed continuation advantage, read with the same surface and
-    aggregator the live continuation check uses. With no installed surface or no
-    evidence the advantage is 0, so the value is -cost and does not clear costs.
+    aggregator the live continuation check uses. This is a hold value. It is not
+    the expected net of entering, and it does not authorize a buy.
     """
     from backend.services.continuation_surface import advantage_authority, horizons_for, installed_aggregator, metric_name, state_features, surface_advantage
 
@@ -1172,14 +1173,16 @@ def day_entry_value(db_path: str, symbol: str, setup: str, regime: str, *, cost:
 def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features: dict | None = None, now: float | None = None) -> dict[str, Any]:
     """What the next DAY candidate reads. Ranking, size, objective and runner only.
 
-    Expected net edge after costs is the learned terminal net of the just-filled
-    position (``day_entry_value``), the same quantity the first continuation check
-    compares. It is the rank score and sets the bounded size. Learned move
-    potential (MFE) sets the objective. Ranking never removes a candidate. The
-    realized-close posterior (``trade_net``) is recorded as a diagnostic.
+    ``entry_expected_policy_net`` is ENTRY_POLICY_VALUE_V1: the hierarchical
+    decayed mean of exact-policy planning nets, already net of the canonical
+    planning cost. It is the rank score and sets the bounded size. The
+    continuation terminal (``day_entry_value``) is recorded beside it and is
+    not that number. Learned move potential (MFE) sets the objective. Ranking
+    never removes a candidate. ``trade_net`` stays a diagnostic.
     ``features`` are recorded with the candidate; they do not change this number.
     """
     from backend.config.trading_economics import canonical_roundtrip_cost_pct
+    from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V1, entry_policy_value
 
     mfe = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mfe", now=now)
     mae = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mae", now=now)
@@ -1190,9 +1193,12 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
     _ = features
     cost = canonical_roundtrip_cost_pct()
     entry = day_entry_value(db_path, symbol, setup, regime, cost=cost, now=now)
-    expected = float(entry["value"])
-    size_mult = day_size_mult(expected, max(0.0, mae["mean"]) + cost)
-    abstain_flag, abstain_reason = _abstain(expected) if entry["informed"] else (False, "")
+    terminal = float(entry["value"])
+    policy = entry_policy_value(db_path, symbol, setup, regime, now=now)
+    expected = float(policy["mean"])
+    risk = float(policy["sd"]) if float(policy["sd"]) > 0.0 else cost
+    size_mult = day_size_mult(expected, risk)
+    abstain_flag, abstain_reason = _abstain(expected)
     # The objective distance only breaks ranking ties.
     economic = {
         "engine_id": DAY_ENGINE,
@@ -1202,24 +1208,29 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "state_tilt": 0.0,
         "state_model_n": 0.0,
         "learned_expected_gross_return": expected + cost,
-        "calibration_adjustment": expected + cost,
+        "calibration_adjustment": 0.0,
         "expected_gross": expected + cost,
         "expected_cost": cost,
         "learned_expected_net_return": expected,
-        "adaptive_correction": expected - net["prior"],
-        "uncertainty": net["sd"],
+        "adaptive_correction": expected - float(policy["prior"]),
+        "uncertainty": float(policy["sd"]),
         "downside": mae["mean"],
-        "confidence_weight": net["confidence"],
+        "confidence_weight": float(policy["confidence"]),
         "setup_expected_edge": net["levels"]["setup"],
         "correlation_adjustment": {"applied": False, "edge": 0.0, "size_mult": 1.0},
         "expected_net_edge": expected,
         "final_learned_net_edge": expected,
         "size_effect": size_mult - 1.0,
-        "levels": {lvl: round(v, 6) for lvl, v in net["levels"].items()},
-        "level_weights": {lvl: round(v, 3) for lvl, v in net["level_weights"].items()},
+        "levels": {lvl: round(float(v), 6) for lvl, v in net["levels"].items()},
+        "level_weights": {lvl: round(float(v), 3) for lvl, v in net["level_weights"].items()},
+        "entry_policy_levels": {lvl: round(float(v), 6) for lvl, v in policy["levels"].items()},
+        "entry_policy_level_weights": {lvl: round(float(v), 3) for lvl, v in policy["level_weights"].items()},
+        "trade_net_levels": {lvl: round(float(v), 6) for lvl, v in net["levels"].items()},
+        "trade_net_level_weights": {lvl: round(float(v), 3) for lvl, v in net["level_weights"].items()},
         "n_trade": round(net["n_trade"], 3),
         "n_lifecycle": round(net["n_lifecycle"], 3),
-        "policy_base": DAY_ENTRY_VALUE_BASE,
+        "policy_base": ENTRY_POLICY_VALUE_V1,
+        "entry_policy_version": ENTRY_POLICY_VALUE_V1,
         "market_alpha": net["market_alpha"],
         "policy_gap": net["policy_gap"],
         "lifecycle_policy_estimate": net["market_alpha"] + net["policy_gap"],
@@ -1228,6 +1239,12 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "policy_calibration": 0.0,
         "n_policy_calibration": 0.0,
         "policy_value": expected,
+        "entry_expected_policy_net": expected,
+        "entry_policy_parent": float(policy["parent"]),
+        "entry_policy_n": round(float(policy["n"]), 3),
+        "entry_policy_key_weight": round(float(policy["key_weight"]), 3),
+        "entry_policy_sd": float(policy["sd"]),
+        "continuation_terminal_net": terminal,
         "continuation_entry_net": entry["net"],
         "continuation_entry_advantage": entry["advantage"],
         "continuation_entry_informed": entry["informed"],
@@ -1247,15 +1264,18 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "expected_move": mfe["mean"],
         "expected_move_prior": mfe["prior"],
         "expected_net": expected,
-        "expected_net_parent": net["parent"],
-        "net_confidence": net["confidence"],
-        "confidence": net["confidence"],
+        "entry_expected_policy_net": expected,
+        "continuation_terminal_net": terminal,
+        "expected_net_parent": float(policy["parent"]),
+        "net_confidence": float(policy["confidence"]),
+        "confidence": float(policy["confidence"]),
         "abstain": abstain_flag,
         "abstain_reason": abstain_reason,
         "abstain_net_edge": expected,
-        "abstain_confidence": net["confidence"],
+        "abstain_confidence": float(policy["confidence"]),
         "abstain_live_veto": False,
-        "uncertainty": net["sd"],
+        "uncertainty": float(policy["sd"]),
+        "n_entry_policy": round(float(policy["n"]), 3),
         "economic": economic,
         "mfe": mfe["mean"],
         "mae": mae["mean"],
@@ -3444,9 +3464,15 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
     try:
         for engine_id, decide in ((DAY_ENGINE, day_decision), (SCALP_ENGINE, scalp_decision)):
             _state_rows(db_path, engine_id, tuple(_PRIORS[engine_id]))
+            versions = [current_economic_version(engine_id)]
+            if engine_id == DAY_ENGINE:
+                from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V1
+
+                versions.append(ENTRY_POLICY_VALUE_V1)
+            placeholders = ",".join("?" for _ in versions)
             keys = conn.execute(
-                "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND setup != ? ORDER BY symbol, setup, regime",
-                (engine_id, current_economic_version(engine_id), MICRO_WEIGHT_KEY[1]),
+                f"SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version IN ({placeholders}) AND setup != ? ORDER BY symbol, setup, regime",
+                (engine_id, *versions, MICRO_WEIGHT_KEY[1]),
             ).fetchall()
             rows = []
             for k in keys:
@@ -3470,6 +3496,10 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "regime": k["regime"],
                             "expected_move": round(view["expected_move"], 6),
                             "expected_net": round(view["expected_net"], 6),
+                            "entry_expected_policy_net": round(float(view["entry_expected_policy_net"]), 6),
+                            "continuation_terminal_net": round(float(view["continuation_terminal_net"]), 6),
+                            "entry_policy_version": view["economic"].get("entry_policy_version"),
+                            "n_entry_policy": view.get("n_entry_policy"),
                             "uncertainty": round(view["uncertainty"], 6),
                             "size_mult": round(view["size_mult"], 4),
                             "objective_atr_mult": round(view["objective_atr_mult"], 4),

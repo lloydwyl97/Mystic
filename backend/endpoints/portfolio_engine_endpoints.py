@@ -2502,7 +2502,8 @@ async def get_ai_signals_panel() -> dict[str, Any]:
                     eco = {}
                     with contextlib.suppress(Exception):
                         eco = _json.loads(v2_row["economic_json"] or "{}")
-                    exp_net = float(eco.get("expected_net_edge") or 0.0)
+                    exp_net = float(eco.get("entry_expected_policy_net") if eco.get("entry_expected_policy_net") is not None else eco.get("expected_net_edge") or 0.0)
+                    continuation_net = eco.get("continuation_terminal_net")
                     as_of_iso = datetime.fromtimestamp(float(v2_row["evaluated_at"]), tz=timezone.utc).isoformat()
                     per_symbol.append(
                         {
@@ -2517,6 +2518,9 @@ async def get_ai_signals_panel() -> dict[str, Any]:
                             "model_disagreement": eco.get("uncertainty"),
                             "cross_sectional_rank_delta": eco.get("executable_objective_edge"),
                             "setup_score": round(exp_net * 1e4, 2),
+                            "entry_expected_policy_net": exp_net,
+                            "continuation_terminal_net": continuation_net,
+                            "entry_policy_version": eco.get("entry_policy_version"),
                             "execution_rank_delta": eco.get("size_effect"),
                             "meta_trust_multiplier": eco.get("size_mult"),
                         }

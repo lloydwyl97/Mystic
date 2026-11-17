@@ -281,11 +281,12 @@ STARTUP = {"BTCUSDT": 84120.27, "ETHUSDT": 2695.07, "SOLUSDT": 122.255, "XRPUSDT
 
 
 def _seed_positive_net(db_path: str) -> None:
-    """Cold entry value is -cost and does not clear costs. These tests cover cash and fills."""
-    from tests.day_entry_value_support import teach_entry
+    """Cold policy value is 0 and does not clear the executable-net check. These tests cover cash and fills."""
+    from tests.day_entry_value_support import teach_policy
 
     for symbol in SYMBOLS:
-        teach_entry(db_path, symbol, "HTF_TREND_PULLBACK", "", 0.02)
+        teach_policy(db_path, symbol, "HTF_TREND_PULLBACK", "", 0.02, times=4)
+        teach_policy(db_path, symbol, "HTF_TREND_PULLBACK__MARKET", "", 0.02, times=4)
 
 
 @pytest.mark.asyncio

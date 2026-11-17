@@ -26,7 +26,7 @@ from backend.services.portfolio_engine_integration import PortfolioEngineIntegra
 from backend.services.scalp_v2.decision_log import classify_scalp_candidate
 from backend.services.scalp_v2.executable_edge import REJECT_THRESHOLD_PCT, scalp_executable_edge
 from backend.services.strategy_version import exit_policy_anchor
-from tests.day_entry_value_support import teach_entry
+from tests.day_entry_value_support import teach_policy
 
 DAY, SCALP = al.DAY_ENGINE, al.SCALP_ENGINE
 T0 = 1_791_200_000.0  # after both economic anchors
@@ -42,7 +42,7 @@ def _iso(epoch: float) -> str:
 
 def _life(db, value, *, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi", at=T0):
     """Entry-state continuation evidence: the learned value of holding a fresh DAY position."""
-    teach_entry(db, symbol, setup, regime, value, now=at)
+    teach_policy(db, symbol, setup, regime, value, now=at)
 
 
 def _day(db, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi", at=T0):
@@ -353,7 +353,7 @@ def test_legacy_and_other_version_state_never_move_decisions(tmp_path):
         )
         conn.execute("INSERT INTO adaptive_metric_state VALUES ('DAY_V2','BTCUSDT','RANGE_BOUNCE','r','trade_net',50,-0.05,0,?)", (_iso(T0),))
     cold = _day(db, "BTCUSDT", "RANGE_BOUNCE", "r")
-    cold_value = -cold["economic"]["expected_cost"]
+    cold_value = 0.0
     assert cold["expected_net"] == pytest.approx(cold_value)
     with sqlite3.connect(db) as conn:
         assert conn.execute(f"SELECT COUNT(*) FROM {al.LEGACY_STATE_TABLE}").fetchone()[0] == 1
