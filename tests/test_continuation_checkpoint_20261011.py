@@ -451,7 +451,7 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
         )
     bad_entry = al.day_decision(db, "SOLUSDT", "EXHAUSTION_MR__MARKET", "btcdown_volhi")
     assert bad_entry["continuation_terminal_net"] < 0.0
-    assert bad_entry["entry_expected_policy_net"] == pytest.approx(0.0)
+    assert bad_entry["entry_expected_policy_net"] == pytest.approx(-cost)
 
     # 3. Legitimate DAY candidate with strong 900s and multi-horizon advantage qualifies, holds, rolls over, and survives restart
     for h, adv in ((900, 0.0012), (1800, 0.0015), (3600, 0.0022), (7200, 0.0030), (14400, 0.0035), (21600, 0.0040), (43200, 0.0045)):
@@ -495,7 +495,7 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
     write_checkpoint(db)
     good_before = al.day_decision(db, "XRPUSDT", "BREAKOUT_CONTINUATION__MARKET", "btcdown_volhi")
     assert good_before["continuation_terminal_net"] > 0.0
-    assert good_before["entry_expected_policy_net"] == pytest.approx(0.0)
+    assert good_before["entry_expected_policy_net"] == pytest.approx(-cost)
     # Simulate restart + recovery
     al._invalidate_adaptive_caches(db)
     assert recover_continuation(db)["status"] == "ok"
@@ -629,7 +629,7 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
         )
     vwap_dec = al.day_decision(db_cal, "ETHUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", now=_NOW + 10)
     assert vwap_dec["continuation_terminal_net"] < 0.0
-    assert vwap_dec["entry_expected_policy_net"] == pytest.approx(0.0)
+    assert vwap_dec["entry_expected_policy_net"] == pytest.approx(-cost)
 
     # (b) A losing funded trade / negative realized observation causally lowers the next comparable prediction
     before_loss = al.day_decision(db, "XRPUSDT", "BREAKOUT_CONTINUATION__MARKET", "btcdown_volhi", now=_NOW + 30)["continuation_terminal_net"]
@@ -677,7 +677,7 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
     # Verify DAY state in db_sc is completely untouched by SCALP learning
     isolated = al.day_decision(db_sc, "SOLUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", now=_NOW + 30)
     assert isolated["continuation_terminal_net"] == pytest.approx(-cost)
-    assert isolated["entry_expected_policy_net"] == pytest.approx(0.0)
+    assert isolated["entry_expected_policy_net"] == pytest.approx(-cost)
 
 
 def test_scalp_symmetric_claim_damping_and_hold_policy_calibration_20261102(tmp_path):

@@ -269,14 +269,16 @@ def test_one_learnable_lifecycle_per_opportunity_and_filled_ones_excluded(tmp_pa
 def test_day_hierarchy_pools_key_related_then_setup(tmp_path):
     db = str(tmp_path / "h.db")
     for _ in range(6):
-        _life(db, -0.01, symbol="BTCUSDT", setup="RANGE_BOUNCE", regime="r1")
-    own = _day(db, "BTCUSDT", "RANGE_BOUNCE", "r1")
-    related = _day(db, "BTCUSDT", "RANGE_BOUNCE", "r2")
-    setup_only = _day(db, "ETHUSDT", "RANGE_BOUNCE", "r3")
-    other_setup = _day(db, "BTCUSDT", "HTF_TREND_PULLBACK", "r1")
+        _life(db, -0.01, symbol="BTCUSDT", setup="RANGE_BOUNCE", regime="btcdown_vollo")
+    own = _day(db, "BTCUSDT", "RANGE_BOUNCE", "btcdown_vollo")
+    related = _day(db, "BTCUSDT", "RANGE_BOUNCE", "btcdown_volhi")
+    setup_only = _day(db, "ETHUSDT", "RANGE_BOUNCE", "btcdown_volhi")
+    other_setup = _day(db, "ETHUSDT", "HTF_TREND_PULLBACK", "btcdown_volhi")
+    opposite_dir = _day(db, "BTCUSDT", "RANGE_BOUNCE", "btcup_vollo")
     assert own["expected_net"] < related["expected_net"] < setup_only["expected_net"] < 0.0
-    # Another setup shares only the engine-wide level.
+    # Another setup in the same directional regime shares only the regime intercept; opposite direction does not pool.
     assert other_setup["expected_net"] > setup_only["expected_net"]
+    assert opposite_dir["expected_net"] == pytest.approx(-canonical_roundtrip_cost_pct())
     assert set(own["economic"]["levels"]) == {"engine", "setup", "related", "key"}
 
 
@@ -353,7 +355,7 @@ def test_legacy_and_other_version_state_never_move_decisions(tmp_path):
         )
         conn.execute("INSERT INTO adaptive_metric_state VALUES ('DAY_V2','BTCUSDT','RANGE_BOUNCE','r','trade_net',50,-0.05,0,?)", (_iso(T0),))
     cold = _day(db, "BTCUSDT", "RANGE_BOUNCE", "r")
-    cold_value = 0.0
+    cold_value = -canonical_roundtrip_cost_pct()
     assert cold["expected_net"] == pytest.approx(cold_value)
     with sqlite3.connect(db) as conn:
         assert conn.execute(f"SELECT COUNT(*) FROM {al.LEGACY_STATE_TABLE}").fetchone()[0] == 1

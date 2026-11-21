@@ -15,6 +15,7 @@ from backend.services.adaptive_learning import (
     calibration_report,
     continuation_ratio,
     day_decision,
+    day_size_mult,
     learn_claim_label,
     learn_from_close,
     market_regime_tag,
@@ -56,7 +57,7 @@ def test_a_i_day_markout_updates_state_and_next_candidate_reads_it(tmp_path):
     assert diagnostic["n_forward"] >= 1
     # A fixed-horizon markout is a DAY diagnostic: it never moves expected net.
     # A cold DAY entry is worth the fresh position's net: minus the round-trip cost.
-    cold = 0.0
+    cold = -before["economic"]["expected_cost"]
     assert diagnostic["expected_net"] == before["expected_net"] == pytest.approx(cold)
     assert before["continuation_terminal_net"] == pytest.approx(-before["economic"]["expected_cost"])
     # The candidate's lifecycle under the live exit contract does.
@@ -224,9 +225,9 @@ def test_s_t_u_no_count_gate_no_legacy(tmp_path):
     db = str(tmp_path / "t.db")
     cold = day_decision(db, "SOLUSDT", "EXHAUSTION_MR", "bear")
     assert cold["confidence"] == 0.0
-    assert cold["expected_net"] == pytest.approx(0.0)
+    assert cold["expected_net"] == pytest.approx(-cold["economic"]["expected_cost"])
     assert cold["continuation_terminal_net"] == pytest.approx(-cold["economic"]["expected_cost"])
-    assert cold["size_mult"] == pytest.approx(1.0)
+    assert cold["size_mult"] == pytest.approx(day_size_mult(cold["expected_net"], cold["uncertainty"]))
     ranked = rank_day_candidates([_cand("SOLUSDT", cold), _cand("XRPUSDT")], ["SOLUSDT", "XRPUSDT"], 0.0006)
     assert len(ranked) == 2
     assert observe(db, engine=DAY, symbol="SOLUSDT", setup="EXHAUSTION_MR", regime="bear", metric="trade_mfe", value=-0.05, strategy_version="LEGACY_MIXED") is False

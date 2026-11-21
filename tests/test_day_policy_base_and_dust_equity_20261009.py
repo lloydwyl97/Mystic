@@ -26,11 +26,11 @@ def test_lifecycle_and_policy_gap_do_not_fund_a_day_entry(tmp_path):
         _obs(db, "policy_gap", 0.01)
         _obs(db, "policy_calibration", -0.003)
     decision = al.day_decision(db, *KEY)
-    assert decision["entry_expected_policy_net"] == pytest.approx(0.0)
+    assert decision["entry_expected_policy_net"] == pytest.approx(-decision["economic"]["expected_cost"])
     assert decision["continuation_terminal_net"] == pytest.approx(-decision["economic"]["expected_cost"])
     assert decision["economic"]["policy_gap"] > 0.0
     assert decision["economic"]["market_alpha"] > 0.0
-    assert decision["economic"]["policy_base"] == "ENTRY_POLICY_VALUE_V2"
+    assert decision["economic"]["policy_base"] == "ENTRY_POLICY_VALUE_V3"
 
 
 def test_trade_net_sets_the_base_and_its_own_calibration_adjusts_it(tmp_path):

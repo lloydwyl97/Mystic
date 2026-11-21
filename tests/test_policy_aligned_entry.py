@@ -119,14 +119,17 @@ def test_day_entry_target_is_realized_policy_net_not_the_lifecycle_path(tmp_path
 
     for _ in range(4):
         _day_obs(db, "trade_net", -0.0006)
+    from tests.day_entry_value_support import teach_entry
+
+    teach_entry(db, *DAY_KEY, 0.004)
     after = al.day_net_expectancy(db, *DAY_KEY)
     assert after["mean"] < 0.0
     assert abs(after["market_alpha"] - untouched["market_alpha"]) < 1e-12
     assert abs(after["policy_gap"] - untouched["policy_gap"]) < 1e-12
     decision = al.day_decision(db, *DAY_KEY)
     econ = decision["economic"]
-    assert econ["policy_base"] == "ENTRY_POLICY_VALUE_V2"
-    assert econ["policy_value"] == decision["expected_net"] == pytest.approx(0.0)
+    assert econ["policy_base"] == "ENTRY_POLICY_VALUE_V3"
+    assert econ["policy_value"] == decision["expected_net"] == pytest.approx(-econ["expected_cost"])
     assert abs(econ["policy_value"] - (econ["uncalibrated_policy_value"] + econ["policy_calibration"])) < 1e-12
     # The realized-close posterior and the continuation terminal are recorded beside the entry value, not as it.
     assert econ["trade_net_value"] == pytest.approx(after["mean"])

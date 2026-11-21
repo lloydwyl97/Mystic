@@ -5,8 +5,8 @@ funded first when the DAY sleeve cannot fund all of them. Ranking decides
 order only; it never removes a candidate.
 
 Order, highest first:
-  1. entry policy net (``ENTRY_POLICY_VALUE_V2``): the hierarchical mean of
-     resolved causal policy nets. Cold, the prior is 0;
+  1. entry policy net (``ENTRY_POLICY_VALUE_V3``): causal state-conditioned
+     regularized expected policy net. Cold, the prior is ``-roundtrip_cost``;
   2. executable net edge to the setup objective: (objective - ask) / ask minus
      the estimated round-trip cost, where objective is the same level the
      structure runner manages to (max(structural level, ask + k x 1h ATR));

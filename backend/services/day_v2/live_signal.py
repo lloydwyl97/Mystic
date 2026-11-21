@@ -619,14 +619,30 @@ def day_state_features(bars_15m: list[dict[str, Any]], bars_1h: list[dict[str, A
     low20 = min(lows[-20:])
     high20 = max(highs[-20:])
     span = high20 - low20
+    sma20_dist = (price - sma20) / price
+    vwap20_dist = sma20_dist
+    try:
+        vols20 = [max(0.0, float(b.get("volume") or 0.0)) for b in bars_15m[-20:]]
+        vol_sum = sum(vols20)
+        if vol_sum > 0.0:
+            tp_vol = sum(((highs[-20 + i] + lows[-20 + i] + closes[-20 + i]) / 3.0) * vols20[i] for i in range(20))
+            vwap20_dist = (price - (tp_vol / vol_sum)) / price
+    except (TypeError, ValueError):
+        vwap20_dist = sma20_dist
+    ret4_15m = (price - closes[-5]) / price if len(closes) >= 5 and closes[-5] > 0 else (price - closes[-2]) / price
+    atr15_pct = atr / price
+    vol_expansion = (atr15_pct / max(0.5 * atr_1h, 1e-5)) - 1.0 if atr_1h > 0.0 else 0.0
     name = str(setup or "").upper()
     return {
-        "atr15_pct": atr / price,
+        "atr15_pct": atr15_pct,
         "atr1h_pct": atr_1h,
+        "vol_expansion": vol_expansion,
         "rsi": rsi / 100.0,
         "bb_pct": bb,
-        "sma20_dist": (price - sma20) / price,
+        "sma20_dist": sma20_dist,
+        "vwap20_dist": vwap20_dist,
         "h1_ret": h1_ret,
+        "ret4_15m": ret4_15m,
         "bar_return": (price - closes[-2]) / price,
         "range_location": (price - low20) / span if span > 0 else 0.5,
         "setup_htf": 1.0 if name == SETUP_HTF_TREND_PULLBACK else 0.0,

@@ -297,7 +297,7 @@ def test_blank_regime_rows_never_enter_regime_specific_state(tmp_path):
     assert weights["key"] == 0.0 and weights["related"] > 0.0
     assert known["n_trade_net"] == 0.0
     assert known["economic"]["trade_net_value"] < 0.0
-    assert known["expected_net"] == pytest.approx(0.0)
+    assert known["expected_net"] == pytest.approx(-canonical_roundtrip_cost_pct())
     blank = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "", now=T0)
     assert blank["economic"]["level_weights"]["key"] == 0.0
     other = al.day_decision(db, "ETHUSDT", "HTF_TREND_PULLBACK", "", now=T0)["economic"]["level_weights"]

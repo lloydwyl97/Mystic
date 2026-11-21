@@ -19,6 +19,7 @@ from backend.services.day_v2.entry_policy_value import (
     ENTRY_POLICY_ENGINE_NET_V2,
     ENTRY_POLICY_NET_V2,
     ENTRY_POLICY_VALUE_V2,
+    ENTRY_POLICY_VALUE_V3,
     apply_resolved_entry_policy_labels,
     causal_replay,
     entry_funding_authorized,
@@ -63,10 +64,10 @@ def test_continuation_terminal_cannot_enter_the_policy_estimate(tmp_path):
     teach_entry(db, *KEY, 0.02, times=4, now=T0)
     decision = al.day_decision(db, *KEY, now=T0)
     assert decision["continuation_terminal_net"] > 0.0
-    assert decision["entry_expected_policy_net"] == pytest.approx(0.0)
+    assert decision["entry_expected_policy_net"] == pytest.approx(-canonical_roundtrip_cost_pct())
     assert decision["expected_net"] == decision["entry_expected_policy_net"]
     assert decision["economic"]["policy_value"] == decision["entry_expected_policy_net"]
-    assert decision["economic"]["policy_base"] == ENTRY_POLICY_VALUE_V2
+    assert decision["economic"]["policy_base"] == ENTRY_POLICY_VALUE_V3
 
 
 def test_continuation_terminal_cannot_release_capital():
@@ -98,13 +99,15 @@ def test_strict_and_market_keys_both_remain_eligible(tmp_path):
 
 def test_low_count_shrinks_and_does_not_reject(tmp_path):
     db = str(tmp_path / "t.db")
-    assert record_entry_policy_observation(db, symbol=KEY[0], setup=KEY[1], regime=KEY[2], value=0.01, now=T0)
+    teach_policy(db, *KEY, 0.01, times=1, now=T0)
     view = entry_policy_value(db, *KEY, now=T0)
+    view_v3 = entry_policy_value(db, *KEY, now=T0, version=ENTRY_POLICY_VALUE_V3)
     assert shrinkage_strength() > 1.0
     assert 0.0 < view["mean"] < 0.01
+    assert 0.0 < view_v3["mean"] < 0.01
     assert view["n"] > 0.0
     decision = al.day_decision(db, *KEY, now=T0)
-    assert decision["entry_expected_policy_net"] == pytest.approx(view["mean"])
+    assert decision["entry_expected_policy_net"] == pytest.approx(view_v3["mean"])
     assert "INSUFFICIENT" not in decision["abstain_reason"]
     source = inspect.getsource(al.day_decision)
     assert "n <" not in source and "MIN_TRADES" not in source

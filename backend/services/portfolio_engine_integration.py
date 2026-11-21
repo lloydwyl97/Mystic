@@ -1958,6 +1958,17 @@ class PortfolioEngineIntegration:
 
         if regime_tag is None:
             regime_tag = market_regime_tag(db_path, symbol) or ""
+        state_feats = day_state_features(bars_15m, bars_1h, signal.setup)
+        if state_feats:
+            state_feats["decision_timestamp"] = float(as_of)
+            try:
+                from backend.services.exact_policy_capture import executable_book
+
+                bid_px, book_ask_px = executable_book(norm)
+                if bid_px and book_ask_px and bid_px > 0.0 and book_ask_px >= bid_px:
+                    state_feats["spread_pct"] = (book_ask_px - bid_px) / ((book_ask_px + bid_px) / 2.0)
+            except Exception:
+                pass
         candidates.append(
             {
                 "symbol": symbol,
@@ -1971,7 +1982,7 @@ class PortfolioEngineIntegration:
                 "as_of": as_of,
                 "ask_at": float(ask_at if ask_at is not None else max(as_of, time.time())),
                 "regime_tag": regime_tag,
-                "state_features": day_state_features(bars_15m, bars_1h, signal.setup),
+                "state_features": state_feats,
             }
         )
 

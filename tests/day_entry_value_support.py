@@ -41,8 +41,12 @@ def fresh_state(cost: float = 0.00066) -> dict[str, float]:
 
 
 def teach_policy(db: str, symbol: str, setup: str, regime: str, value: float, *, times: int = 1, now: float | None = None, weight: float = 1.0) -> None:
-    """Fold ``times`` ENTRY_POLICY_VALUE_V2 labels. This is not continuation evidence."""
-    from backend.services.day_v2.entry_policy_value import record_entry_policy_observation
+    """Fold ``times`` policy labels into V2 and V3. This is not continuation evidence."""
+    from backend.services.day_v2.entry_policy_value import (
+        ENTRY_POLICY_VALUE_V2,
+        ENTRY_POLICY_VALUE_V3,
+        record_entry_policy_observation,
+    )
 
     moment = float(now if now is not None else time.time())
     for step in range(int(times)):
@@ -53,6 +57,17 @@ def teach_policy(db: str, symbol: str, setup: str, regime: str, value: float, *,
             regime=regime,
             value=float(value),
             weight=float(weight),
+            version=ENTRY_POLICY_VALUE_V2,
+            now=moment + step,
+        )
+        assert record_entry_policy_observation(
+            db,
+            symbol=symbol,
+            setup=setup,
+            regime=regime,
+            value=float(value),
+            weight=float(weight),
+            version=ENTRY_POLICY_VALUE_V3,
             now=moment + step,
         )
 

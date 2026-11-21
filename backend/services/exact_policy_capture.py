@@ -68,6 +68,13 @@ _EPISODE_COLUMNS = (
     ("entry_policy_v2_specific_weight", "REAL"),
     ("entry_policy_v2_engine_weight", "REAL"),
     ("entry_policy_v2_overlap_group", "TEXT"),
+    ("entry_policy_v3_learned", "INTEGER NOT NULL DEFAULT 0"),
+    ("entry_policy_v3_target", "REAL"),
+    ("entry_policy_v3_target_type", "TEXT"),
+    ("entry_policy_v3_weight", "REAL"),
+    ("entry_policy_v3_cluster_id", "TEXT"),
+    ("entry_policy_v3_population", "TEXT"),
+    ("entry_policy_v3_dir_regime", "TEXT"),
 )
 _CHECK_COLUMNS = (
     ("bid", "REAL"),

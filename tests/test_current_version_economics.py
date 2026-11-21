@@ -80,7 +80,7 @@ def test_one_day_outcome_already_moves_size_with_no_count_floor(tmp_path):
     db = str(tmp_path / "t.db")
     assert not hasattr(al, "ABSTAIN_CONFIDENCE_FLOOR")
     cold = _day(db)
-    assert cold["expected_net"] == pytest.approx(0.0) and cold["abstain"] is False
+    assert cold["expected_net"] == pytest.approx(-cold["economic"]["expected_cost"]) and cold["abstain"] is False
     _teach(db, -0.004)
     one = _day(db)
     assert one["n_entry_policy"] > 0.0
@@ -200,7 +200,7 @@ def test_trade_net_seed_replays_only_current_post_anchor_closes_once(tmp_path):
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT n FROM adaptive_metric_state WHERE metric='trade_net'").fetchone()[0] == 1.0
     learned = _day(db)
-    assert learned["entry_expected_policy_net"] == pytest.approx(0.0)
+    assert learned["entry_expected_policy_net"] == pytest.approx(-learned["economic"]["expected_cost"])
     assert learned["economic"]["trade_net_value"] < 0.0
 
 
@@ -391,7 +391,8 @@ def test_legacy_versions_never_reach_current_state_or_reports(tmp_path):
     assert not _day_obs(db, "trade_net", -0.05, version="legacy")
     assert not _claim(db, 0.001, -0.003, version="legacy")
     assert al.scalp_decision(db, *SCALP_KEY)["n_claim"] == 0.0
-    assert _day(db)["expected_net"] == pytest.approx(0.0)
+    cold_day = _day(db)
+    assert cold_day["expected_net"] == pytest.approx(-cold_day["economic"]["expected_cost"])
     _record_day(db, "BTCUSDT", "BREAKOUT_CONTINUATION", al.CANDIDATE_QUALIFIED)
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE adaptive_candidate_markouts SET strategy_version='legacy'")

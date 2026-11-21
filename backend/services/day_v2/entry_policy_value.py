@@ -54,6 +54,21 @@ from backend.services.adaptive_learning import (
     _level_of,
     _norm_symbol,
 )
+from backend.services.day_v2.entry_policy_value_v3 import (
+    ENTRY_POLICY_NET_V3,
+    ENTRY_POLICY_V3_FEATURE_VERSION,
+    ENTRY_POLICY_VALUE_V3,
+    POPULATION_DETECTOR_FIRED,
+    POPULATION_MARKET_FALLBACK,
+    apply_resolved_entry_policy_v3_labels,
+    causal_replay_v3,
+    entry_policy_value_v3,
+    invalidate_v3_cache,
+    rebuild_entry_policy_value_v3,
+    record_entry_policy_v3_observation,
+    v3_feature_contract,
+    v3_prior_net,
+)
 from backend.services.policy_episode import canon_symbol
 
 logger = logging.getLogger(__name__)
@@ -145,6 +160,7 @@ def _moments(
 
 def _invalidate() -> None:
     _CACHE.clear()
+    invalidate_v3_cache()
 
 
 def _rows_v1(db_path: str) -> list[sqlite3.Row]:
@@ -321,10 +337,20 @@ def entry_policy_value(
     setup: str,
     regime: str,
     *,
+    features: Mapping[str, Any] | None = None,
     now: float | None = None,
     version: str = ENTRY_POLICY_VALUE_V2,
 ) -> dict[str, Any]:
-    """Shrunk hierarchical posterior of causal policy labels. Prior 0. No sample-count veto."""
+    """Shrunk causal policy estimator (V1, V2, or V3). No sample-count veto."""
+    if version == ENTRY_POLICY_VALUE_V3:
+        return entry_policy_value_v3(
+            db_path,
+            symbol,
+            setup,
+            regime,
+            features=features,
+            now=now,
+        )
     if version == ENTRY_POLICY_VALUE_V1:
         rows_v1 = _rows_v1(db_path)
         if not rows_v1:
@@ -418,9 +444,30 @@ def record_entry_policy_observation(
     engine_weight: float | None = None,
     version: str = ENTRY_POLICY_VALUE_V2,
     now: float | None = None,
+    decided_at: float | None = None,
+    features: Mapping[str, Any] | None = None,
+    cluster_id: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> bool:
-    """Fold one causal policy label into ENTRY_POLICY_VALUE_V2 (or V1 if requested). Does not touch hold_adv."""
+    """Fold one causal policy label into ENTRY_POLICY_VALUE_V2 (or V1/V3 if requested). Does not touch hold_adv."""
+    if version == ENTRY_POLICY_VALUE_V3:
+        if value is None or not math.isfinite(float(value)):
+            return False
+        w_v3 = float(specific_weight if specific_weight is not None else weight)
+        if not (math.isfinite(w_v3) and w_v3 > 0.0):
+            return False
+        return record_entry_policy_v3_observation(
+            db_path,
+            symbol=symbol,
+            setup=setup,
+            regime=regime,
+            value=float(value),
+            weight=w_v3,
+            now=now,
+            decided_at=decided_at,
+            features=features,
+            cluster_id=cluster_id,
+        )
     if value is None or not math.isfinite(float(value)):
         return False
     w_spec = float(specific_weight if specific_weight is not None else weight)
@@ -1017,6 +1064,14 @@ def apply_resolved_entry_policy_labels(
         return 0
     finally:
         conn.close()
+    v3_cutoff = float(available_before) - 1e-6 if available_before is not None else moment
+    with sqlite3.connect(db_path, timeout=30.0) as _chk_conn:
+        _has_pe = _chk_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_episodes'").fetchone()
+    if _has_pe is not None and available_before is None:
+        try:
+            apply_resolved_entry_policy_v3_labels(db_path, now=v3_cutoff)
+        except sqlite3.Error:
+            logger.warning("ENTRY_POLICY_V3_APPLY_FAILED", exc_info=True)
     if applied:
         logger.info("ENTRY_POLICY_LABELS_APPLIED n=%s version=%s", applied, ENTRY_POLICY_VALUE_V2)
     return applied
@@ -1217,8 +1272,11 @@ def causal_replay(
     episodes: list[dict[str, Any]],
     *,
     version: str = ENTRY_POLICY_VALUE_V2,
+    ohlcv_index: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Score every episode at its decision time from labels available strictly earlier."""
+    if version == ENTRY_POLICY_VALUE_V3:
+        return causal_replay_v3(episodes, ohlcv_index=ohlcv_index)
     if version == ENTRY_POLICY_VALUE_V1:
         labels_v1 = []
         for episode in episodes:

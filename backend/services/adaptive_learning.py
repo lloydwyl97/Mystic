@@ -255,11 +255,11 @@ ABSTAIN_ENABLED = (os.getenv("ADAPTIVE_ABSTENTION_ENABLED", "true") or "true").s
 ABSTAIN_EDGE_MARGIN = float(os.getenv("ADAPTIVE_ABSTENTION_EDGE_MARGIN", "0.0005") or "0.0005")
 
 
-def _abstain(net_edge: float) -> tuple[bool, str]:
-    """Flag a learned net expectancy at or below the margin. Returns (flag, reason)."""
+def _abstain(net_edge: float, *, prior: float = 0.0) -> tuple[bool, str]:
+    """Flag a learned net expectancy at or below the margin below its prior. Returns (flag, reason)."""
     if not ABSTAIN_ENABLED:
         return False, ""
-    if net_edge <= -ABSTAIN_EDGE_MARGIN:
+    if (float(net_edge) - float(prior)) <= -ABSTAIN_EDGE_MARGIN:
         return True, f"LEARNED_NEGATIVE_EDGE net={net_edge:.5f}"
     return False, ""
 
@@ -429,6 +429,12 @@ _REPORT_CACHE: dict[tuple[str, str, float], tuple[float, dict[str, Any]]] = {}
 def _invalidate_adaptive_caches(db_path: str | None = None) -> None:
     _STATE_ROWS_CACHE.clear()
     _REPORT_CACHE.clear()
+    try:
+        from backend.services.day_v2.entry_policy_value_v3 import invalidate_v3_cache
+
+        invalidate_v3_cache()
+    except Exception:
+        pass
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -1173,16 +1179,15 @@ def day_entry_value(db_path: str, symbol: str, setup: str, regime: str, *, cost:
 def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features: dict | None = None, now: float | None = None) -> dict[str, Any]:
     """What the next DAY candidate reads. Ranking, size, objective and runner only.
 
-    ``entry_expected_policy_net`` is ENTRY_POLICY_VALUE_V2: the hierarchical
-    decayed mean of causal deployed-policy nets, already net of execution or
-    canonical planning cost. It is the rank score and sets the bounded size. The
-    continuation terminal (``day_entry_value``) is recorded beside it and is
-    not that number. Learned move potential (MFE) sets the objective. Ranking
-    never removes a candidate. ``trade_net`` stays a diagnostic.
-    ``features`` are recorded with the candidate; they do not change this number.
+    ``entry_expected_policy_net`` is ENTRY_POLICY_VALUE_V3: the causal,
+    state-conditioned, continuous regularized expected policy net, already net
+    of execution or canonical planning cost. It is the rank score and sets the
+    bounded size. The continuation terminal (``day_entry_value``) is recorded
+    beside it and is not that number. Learned move potential (MFE) sets the
+    objective. Ranking never removes a candidate. ``trade_net`` stays a diagnostic.
     """
     from backend.config.trading_economics import canonical_roundtrip_cost_pct
-    from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V2, entry_policy_value
+    from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V3, entry_policy_value
 
     mfe = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mfe", now=now)
     mae = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mae", now=now)
@@ -1190,23 +1195,30 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
     continuation = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_continuation", now=now)
     forward = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "markout_forward", now=now)
     net = day_net_expectancy(db_path, symbol, setup, regime, now=now)
-    _ = features
     cost = canonical_roundtrip_cost_pct()
     entry = day_entry_value(db_path, symbol, setup, regime, cost=cost, now=now)
     terminal = float(entry["value"])
-    policy = entry_policy_value(db_path, symbol, setup, regime, now=now)
+    policy = entry_policy_value(
+        db_path,
+        symbol,
+        setup,
+        regime,
+        features=features,
+        now=now,
+        version=ENTRY_POLICY_VALUE_V3,
+    )
     expected = float(policy["mean"])
     risk = float(policy["sd"]) if float(policy["sd"]) > 0.0 else cost
     size_mult = day_size_mult(expected, risk)
-    abstain_flag, abstain_reason = _abstain(expected)
+    abstain_flag, abstain_reason = _abstain(expected, prior=float(policy["prior"]))
     # The objective distance only breaks ranking ties.
     economic = {
         "engine_id": DAY_ENGINE,
         "economic_version": current_economic_version(DAY_ENGINE),
         "raw_expected_move": 0.0,
         "hierarchical_net": net["mean"],
-        "state_tilt": 0.0,
-        "state_model_n": 0.0,
+        "state_tilt": float(policy.get("state_tilt", 0.0)),
+        "state_model_n": round(float(policy.get("effective_sample_size", policy["n"])), 3),
         "learned_expected_gross_return": expected + cost,
         "calibration_adjustment": 0.0,
         "expected_gross": expected + cost,
@@ -1229,8 +1241,14 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "trade_net_level_weights": {lvl: round(float(v), 3) for lvl, v in net["level_weights"].items()},
         "n_trade": round(net["n_trade"], 3),
         "n_lifecycle": round(net["n_lifecycle"], 3),
-        "policy_base": ENTRY_POLICY_VALUE_V2,
-        "entry_policy_version": ENTRY_POLICY_VALUE_V2,
+        "policy_base": ENTRY_POLICY_VALUE_V3,
+        "entry_policy_version": ENTRY_POLICY_VALUE_V3,
+        "entry_policy_feature_version": policy.get("feature_version", ""),
+        "entry_policy_model_digest": policy.get("model_digest", ""),
+        "entry_policy_population": policy.get("population", ""),
+        "entry_policy_directional_regime": policy.get("directional_regime", ""),
+        "entry_policy_nominal_weight": round(float(policy.get("nominal_weight", policy["n"])), 3),
+        "entry_policy_effective_sample_size": round(float(policy.get("effective_sample_size", policy["n"])), 3),
         "market_alpha": net["market_alpha"],
         "policy_gap": net["policy_gap"],
         "lifecycle_policy_estimate": net["market_alpha"] + net["policy_gap"],
@@ -3471,14 +3489,30 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
             _state_rows(db_path, engine_id, tuple(_PRIORS[engine_id]))
             versions = [current_economic_version(engine_id)]
             if engine_id == DAY_ENGINE:
-                from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V1, ENTRY_POLICY_VALUE_V2
+                from backend.services.day_v2.entry_policy_value import (
+                    ENTRY_POLICY_VALUE_V1,
+                    ENTRY_POLICY_VALUE_V2,
+                    ENTRY_POLICY_VALUE_V3,
+                )
 
-                versions.extend((ENTRY_POLICY_VALUE_V2, ENTRY_POLICY_VALUE_V1))
+                versions.extend((ENTRY_POLICY_VALUE_V3, ENTRY_POLICY_VALUE_V2, ENTRY_POLICY_VALUE_V1))
             placeholders = ",".join("?" for _ in versions)
-            keys = conn.execute(
-                f"SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version IN ({placeholders}) AND setup != ? ORDER BY symbol, setup, regime",
-                (engine_id, *versions, MICRO_WEIGHT_KEY[1]),
-            ).fetchall()
+            key_tuples: set[tuple[str, str, str]] = {
+                (str(r["symbol"]), str(r["setup"]), str(r["regime"]))
+                for r in conn.execute(
+                    f"SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version IN ({placeholders}) AND setup != ?",
+                    (engine_id, *versions, MICRO_WEIGHT_KEY[1]),
+                ).fetchall()
+            }
+            if engine_id == DAY_ENGINE:
+                has_v3_obs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entry_policy_v3_observations'").fetchone()
+                if has_v3_obs is not None:
+                    for vr in conn.execute(
+                        "SELECT DISTINCT symbol, setup, regime FROM entry_policy_v3_observations WHERE engine_id=? AND setup != ?",
+                        (DAY_ENGINE, MICRO_WEIGHT_KEY[1]),
+                    ).fetchall():
+                        key_tuples.add((str(vr[0]), str(vr[1]), str(vr[2])))
+            keys = [{"symbol": sy, "setup": st, "regime": rg} for sy, st, rg in sorted(key_tuples)]
             rows = []
             for k in keys:
                 if _is_forensic_key(engine_id, k["symbol"], k["setup"], k["regime"]):
