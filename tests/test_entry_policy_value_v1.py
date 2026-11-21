@@ -16,7 +16,9 @@ from backend.config.trading_economics import canonical_roundtrip_cost_pct
 from backend.services.adaptive_learning import executable_bid_net
 from backend.services.day_v2.day_policy_decision import decide_day_continuation
 from backend.services.day_v2.entry_policy_value import (
-    ENTRY_POLICY_VALUE_V1,
+    ENTRY_POLICY_ENGINE_NET_V2,
+    ENTRY_POLICY_NET_V2,
+    ENTRY_POLICY_VALUE_V2,
     apply_resolved_entry_policy_labels,
     causal_replay,
     entry_funding_authorized,
@@ -64,7 +66,7 @@ def test_continuation_terminal_cannot_enter_the_policy_estimate(tmp_path):
     assert decision["entry_expected_policy_net"] == pytest.approx(0.0)
     assert decision["expected_net"] == decision["entry_expected_policy_net"]
     assert decision["economic"]["policy_value"] == decision["entry_expected_policy_net"]
-    assert decision["economic"]["policy_base"] == ENTRY_POLICY_VALUE_V1
+    assert decision["economic"]["policy_base"] == ENTRY_POLICY_VALUE_V2
 
 
 def test_continuation_terminal_cannot_release_capital():
@@ -184,7 +186,10 @@ def test_policy_labels_are_causal_and_cost_is_applied_once(tmp_path):
     assert apply_resolved_entry_policy_labels(db, now=T0 + 100.0) == 1
     learned = entry_policy_value(db, "BTCUSDT", "RANGE_BOUNCE", "btcup_vollo", now=T0 + 100.0)
     with sqlite3.connect(db) as check:
-        stored = check.execute("SELECT ewma FROM adaptive_metric_state WHERE metric='entry_policy_net_v1'").fetchone()[0]
+        stored = check.execute(
+            "SELECT ewma FROM adaptive_metric_state WHERE metric=?",
+            (ENTRY_POLICY_NET_V2,),
+        ).fetchone()[0]
     assert stored == pytest.approx(label)
     assert 0.0 < learned["mean"] < stored
     assert learned["mean"] != pytest.approx(stored - cost)
@@ -223,8 +228,10 @@ def test_same_bar_setups_share_one_path_weight(tmp_path):
     conn.close()
     assert apply_resolved_entry_policy_labels(db, now=T0 + 10.0) == 2
     with sqlite3.connect(db) as check:
-        weights = [row[0] for row in check.execute("SELECT n FROM adaptive_metric_state WHERE metric='entry_policy_net_v1'")]
-    assert weights == pytest.approx([0.5, 0.5])
+        eng_weights = [row[0] for row in check.execute("SELECT n FROM adaptive_metric_state WHERE metric=?", (ENTRY_POLICY_ENGINE_NET_V2,))]
+        spec_weights = [row[0] for row in check.execute("SELECT n FROM adaptive_metric_state WHERE metric=?", (ENTRY_POLICY_NET_V2,))]
+    assert eng_weights == pytest.approx([0.5, 0.5])
+    assert spec_weights == pytest.approx([1.0, 1.0])
 
 
 def test_universe_and_slot_caps_stay():

@@ -1173,16 +1173,16 @@ def day_entry_value(db_path: str, symbol: str, setup: str, regime: str, *, cost:
 def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features: dict | None = None, now: float | None = None) -> dict[str, Any]:
     """What the next DAY candidate reads. Ranking, size, objective and runner only.
 
-    ``entry_expected_policy_net`` is ENTRY_POLICY_VALUE_V1: the hierarchical
-    decayed mean of exact-policy planning nets, already net of the canonical
-    planning cost. It is the rank score and sets the bounded size. The
+    ``entry_expected_policy_net`` is ENTRY_POLICY_VALUE_V2: the hierarchical
+    decayed mean of causal deployed-policy nets, already net of execution or
+    canonical planning cost. It is the rank score and sets the bounded size. The
     continuation terminal (``day_entry_value``) is recorded beside it and is
     not that number. Learned move potential (MFE) sets the objective. Ranking
     never removes a candidate. ``trade_net`` stays a diagnostic.
     ``features`` are recorded with the candidate; they do not change this number.
     """
     from backend.config.trading_economics import canonical_roundtrip_cost_pct
-    from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V1, entry_policy_value
+    from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V2, entry_policy_value
 
     mfe = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mfe", now=now)
     mae = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mae", now=now)
@@ -1229,8 +1229,8 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "trade_net_level_weights": {lvl: round(float(v), 3) for lvl, v in net["level_weights"].items()},
         "n_trade": round(net["n_trade"], 3),
         "n_lifecycle": round(net["n_lifecycle"], 3),
-        "policy_base": ENTRY_POLICY_VALUE_V1,
-        "entry_policy_version": ENTRY_POLICY_VALUE_V1,
+        "policy_base": ENTRY_POLICY_VALUE_V2,
+        "entry_policy_version": ENTRY_POLICY_VALUE_V2,
         "market_alpha": net["market_alpha"],
         "policy_gap": net["policy_gap"],
         "lifecycle_policy_estimate": net["market_alpha"] + net["policy_gap"],
@@ -1243,7 +1243,12 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "entry_policy_parent": float(policy["parent"]),
         "entry_policy_n": round(float(policy["n"]), 3),
         "entry_policy_key_weight": round(float(policy["key_weight"]), 3),
+        "entry_policy_engine_weight": round(float(policy.get("engine_weight", policy["level_weights"]["engine"])), 3),
         "entry_policy_sd": float(policy["sd"]),
+        "entry_policy_engine_sd": float(policy.get("engine_sd", 0.0)),
+        "entry_policy_setup_sd": float(policy.get("setup_sd", 0.0)),
+        "entry_policy_related_sd": float(policy.get("related_sd", 0.0)),
+        "entry_policy_key_sd": float(policy.get("key_sd", 0.0)),
         "continuation_terminal_net": terminal,
         "continuation_entry_net": entry["net"],
         "continuation_entry_advantage": entry["advantage"],
@@ -3466,9 +3471,9 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
             _state_rows(db_path, engine_id, tuple(_PRIORS[engine_id]))
             versions = [current_economic_version(engine_id)]
             if engine_id == DAY_ENGINE:
-                from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V1
+                from backend.services.day_v2.entry_policy_value import ENTRY_POLICY_VALUE_V1, ENTRY_POLICY_VALUE_V2
 
-                versions.append(ENTRY_POLICY_VALUE_V1)
+                versions.extend((ENTRY_POLICY_VALUE_V2, ENTRY_POLICY_VALUE_V1))
             placeholders = ",".join("?" for _ in versions)
             keys = conn.execute(
                 f"SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version IN ({placeholders}) AND setup != ? ORDER BY symbol, setup, regime",

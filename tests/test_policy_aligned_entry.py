@@ -125,7 +125,7 @@ def test_day_entry_target_is_realized_policy_net_not_the_lifecycle_path(tmp_path
     assert abs(after["policy_gap"] - untouched["policy_gap"]) < 1e-12
     decision = al.day_decision(db, *DAY_KEY)
     econ = decision["economic"]
-    assert econ["policy_base"] == "ENTRY_POLICY_VALUE_V1"
+    assert econ["policy_base"] == "ENTRY_POLICY_VALUE_V2"
     assert econ["policy_value"] == decision["expected_net"] == pytest.approx(0.0)
     assert abs(econ["policy_value"] - (econ["uncalibrated_policy_value"] + econ["policy_calibration"])) < 1e-12
     # The realized-close posterior and the continuation terminal are recorded beside the entry value, not as it.

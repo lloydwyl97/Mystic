@@ -38,7 +38,7 @@ def test_cold_entry_value_is_minus_cost_and_does_not_abstain(tmp_path):
     assert d["entry_expected_policy_net"] == pytest.approx(0.0)
     assert d["expected_net"] == d["entry_expected_policy_net"]
     assert d["abstain"] is False
-    assert d["economic"]["policy_base"] == "ENTRY_POLICY_VALUE_V1"
+    assert d["economic"]["policy_base"] == "ENTRY_POLICY_VALUE_V2"
     assert d["economic"]["continuation_entry_informed"] is False
 
 
@@ -161,9 +161,11 @@ def test_fresh_entry_has_zero_excursion_tilt_while_open_position_uses_ridge(tmp_
             cs.record_advantage(db, engine="DAY_V2", symbol="ETHUSDT", setup="RANGE_BOUNCE", regime="other_reg", horizon=h, features=aged, advantage=-0.03, weight=1.0, now=T0 + step)
     teach_entry(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", 0.004, times=2, now=T0 + 20)
     fresh = cs.state_features(entry=1.0, mark=1.0, net=-cost, mfe=0.0, mae=0.0, high_water=1.0, prev_net=None, age_sec=0.0)
+    fresh_eps = cs.state_features(entry=1.0, mark=1.0, net=-cost, mfe=0.0, mae=0.0, high_water=1.0, prev_net=None, age_sec=1e-3)
     trace_fresh = cs.surface_trace(db, "DAY_V2", "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", fresh, T0 + 20, how="blended")
-    assert trace_fresh is not None
-    assert all(item["ridge"] == 0.0 for item in trace_fresh["horizons"])
+    trace_eps = cs.surface_trace(db, "DAY_V2", "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", fresh_eps, T0 + 20.001, how="blended")
+    assert trace_fresh is not None and trace_eps is not None
+    assert abs(float(trace_fresh["advantage"]) - float(trace_eps["advantage"])) < 1e-6
     d = al.day_decision(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", now=T0 + 20)
     assert d["continuation_terminal_net"] > 0.0
     assert d["entry_expected_policy_net"] == pytest.approx(0.0)

@@ -62,6 +62,12 @@ _EPISODE_COLUMNS = (
     ("policy_net_version", "TEXT"),
     ("label_taker_fee", "REAL"),
     ("entry_policy_learned", "INTEGER NOT NULL DEFAULT 0"),
+    ("entry_policy_v2_learned", "INTEGER NOT NULL DEFAULT 0"),
+    ("entry_policy_v2_target", "REAL"),
+    ("entry_policy_v2_target_type", "TEXT"),
+    ("entry_policy_v2_specific_weight", "REAL"),
+    ("entry_policy_v2_engine_weight", "REAL"),
+    ("entry_policy_v2_overlap_group", "TEXT"),
 )
 _CHECK_COLUMNS = (
     ("bid", "REAL"),

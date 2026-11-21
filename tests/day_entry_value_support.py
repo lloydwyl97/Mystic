@@ -41,7 +41,7 @@ def fresh_state(cost: float = 0.00066) -> dict[str, float]:
 
 
 def teach_policy(db: str, symbol: str, setup: str, regime: str, value: float, *, times: int = 1, now: float | None = None, weight: float = 1.0) -> None:
-    """Fold ``times`` ENTRY_POLICY_VALUE_V1 labels. This is not continuation evidence."""
+    """Fold ``times`` ENTRY_POLICY_VALUE_V2 labels. This is not continuation evidence."""
     from backend.services.day_v2.entry_policy_value import record_entry_policy_observation
 
     moment = float(now if now is not None else time.time())
