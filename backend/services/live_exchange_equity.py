@@ -20,6 +20,7 @@ from backend.services.live_account_basis import (
     load_operational_json,
     persist_operational_json,
 )
+from backend.utils.symbols import normalize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -246,8 +247,36 @@ def load_protected_preexisting_dust(db_path: str, symbol: str) -> Decimal:
 def clear_protected_preexisting_dust(db_path: str, symbol: str) -> None:
     raw = load_operational_json(db_path, PROTECTED_DUST_KEY)
     coins = raw.get("coins") if isinstance(raw.get("coins"), dict) else {}
+    if str(symbol) not in coins:
+        return
     coins.pop(str(symbol), None)
     persist_operational_json(db_path, PROTECTED_DUST_KEY, {"coins": coins})
+
+
+def clear_dust_snapshot_symbol(db_path: str, symbol: str) -> None:
+    """Remove vanished symbol dust entries from operational snapshot when venue balance is zero."""
+    norm = normalize_symbol(symbol)
+    raw = load_operational_json(db_path, CURRENT_DUST_SNAPSHOT_KEY)
+    existing = raw.get("coins")
+    if not isinstance(existing, list) or not existing:
+        return
+    kept: list[dict[str, Any]] = []
+    changed = False
+    for row in existing:
+        if not isinstance(row, dict):
+            continue
+        rsym = str(row.get("symbol") or "")
+        tail = rsym.split("::", 1)[-1] if "::" in rsym else rsym
+        if normalize_symbol(tail) == norm:
+            changed = True
+            continue
+        kept.append(row)
+    if changed:
+        persist_operational_json(
+            db_path,
+            CURRENT_DUST_SNAPSHOT_KEY,
+            {"coins": kept, "source": "live_exchange_retain"},
+        )
 
 
 def persist_current_dust_snapshot(db_path: str, coins: list[dict[str, Any]]) -> None:

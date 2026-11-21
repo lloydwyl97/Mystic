@@ -154,6 +154,135 @@ def held_quantity(db_path_or_conn: str | sqlite3.Connection, symbol: str) -> flo
     return float(sum(float(r["quantity"] or 0.0) for r in held_lots(db_path_or_conn, symbol)))
 
 
+def attribute_unclaimed_strategy_dust(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    max_quantity: float,
+) -> list[dict[str, Any]]:
+    """Claim fill-proven strategy dust not yet tracked in open lots or engine_strategy_dust.
+
+    Prevents reconciliation from collapsing SCALP_V2 or DAY_V2 sub-step residuals
+    into LEGACY_DAY_LIVE / dust_exchange:* if a lot closed out of open_positions
+    while leaving fill-proven base-asset dust on the venue.
+    """
+    from decimal import Decimal
+
+    from backend.services.engine_lot_ownership import STRATEGY_ENGINES, fill_owned_quantity
+
+    ensure_schema(conn)
+    sym = _norm(symbol)
+    budget = Decimal(str(max(0.0, float(max_quantity or 0.0))))
+    if budget <= Decimal("0"):
+        return []
+
+    tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "live_exchange_fills" not in tables:
+        return []
+
+    open_tids: set[str] = set()
+    if "portfolio_engine_positions" in tables:
+        open_tids = {str(r[0] or "") for r in conn.execute("SELECT trade_id FROM portfolio_engine_positions WHERE symbol=?", (sym,)).fetchall() if r[0]}
+    known_dust_tids = {str(r[0] or "") for r in conn.execute(f"SELECT source_trade_id FROM {DUST_TABLE} WHERE symbol=?", (sym,)).fetchall() if r[0]}
+    retired_event_tids = {str(r[0] or "") for r in conn.execute(f"SELECT source_trade_id FROM {EVENT_TABLE} WHERE symbol=?", (sym,)).fetchall() if r[0]}
+
+    cand_rows = conn.execute(
+        """
+        SELECT mystic_trade_id, MAX(avg_fill_price), MIN(id)
+        FROM live_exchange_fills
+        WHERE UPPER(side)='BUY' AND (symbol=? OR REPLACE(UPPER(symbol), '/', '')=?)
+          AND mystic_trade_id IS NOT NULL AND mystic_trade_id != ''
+        GROUP BY mystic_trade_id
+        ORDER BY MIN(id) DESC
+        """,
+        (sym, sym.replace("/", "")),
+    ).fetchall()
+
+    claimed: list[dict[str, Any]] = []
+    for raw_tid, avg_px, _min_id in cand_rows:
+        if budget <= Decimal("1e-12"):
+            break
+        tid = str(raw_tid or "").strip()
+        if not tid or tid in open_tids or tid in known_dust_tids or tid in retired_event_tids:
+            continue
+
+        owned = fill_owned_quantity(conn, tid, sym)
+        if owned is None or owned <= Decimal("1e-12"):
+            continue
+
+        eng = ""
+        entry_px = float(avg_px or 0.0)
+        entry_time = None
+        if "paper_trades" in tables:
+            pt_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
+            sel_eng = "engine_id" if "engine_id" in pt_cols else "''"
+            sel_strat = "strategy_id" if "strategy_id" in pt_cols else "''"
+            pt = conn.execute(
+                f"SELECT {sel_eng}, {sel_strat}, price, timestamp FROM paper_trades WHERE trade_id=? AND UPPER(side)='BUY' LIMIT 1",
+                (tid,),
+            ).fetchone()
+            if pt is not None:
+                raw_eng = str(pt[0] or "").strip().upper()
+                raw_strat = str(pt[1] or "").strip().lower()
+                if raw_eng in STRATEGY_ENGINES:
+                    eng = raw_eng
+                elif "scalp" in raw_strat:
+                    eng = "SCALP_V2"
+                if float(pt[2] or 0.0) > 0:
+                    entry_px = float(pt[2])
+                if pt[3]:
+                    try:
+                        entry_time = datetime.fromisoformat(str(pt[3]).replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        entry_time = None
+        if not eng:
+            if tid.lower().startswith("scalp_v2_"):
+                eng = "SCALP_V2"
+            elif tid.startswith("mystic_"):
+                eng = "DAY_V2"
+        if eng not in STRATEGY_ENGINES:
+            continue
+
+        claim_dec = min(owned, budget)
+        if claim_dec <= Decimal("1e-12"):
+            continue
+        claim_qty = float(claim_dec)
+        prov = {
+            "entry_time": entry_time,
+            "reconciled_from": "live_exchange_fills",
+            "fill_owned_qty": format(owned.normalize(), "f"),
+        }
+        cur = conn.execute(
+            f"""
+            INSERT OR IGNORE INTO {DUST_TABLE}
+            (engine_id, symbol, source_trade_id, quantity, quantity_exact, entry_price, provenance_json, status, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                eng,
+                sym,
+                tid,
+                claim_qty,
+                format(claim_dec.normalize(), "f"),
+                entry_px,
+                json.dumps(prov, default=str),
+                STATUS_HELD,
+                _now(),
+            ),
+        )
+        if cur.rowcount:
+            budget -= claim_dec
+            claimed.append(
+                {
+                    "engine_id": eng,
+                    "symbol": sym,
+                    "source_trade_id": tid,
+                    "quantity": claim_qty,
+                }
+            )
+    return claimed
+
+
 def held_inventory_equity(
     db_path: str,
     prices: dict[str, float] | None,

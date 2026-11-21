@@ -3482,13 +3482,44 @@ class PortfolioEngine:
             if _sym:
                 _qty = float(getattr(pos, "quantity", 0) or 0)
                 strategy_qty[_sym] = strategy_qty.get(_sym, 0.0) + self._ownership_capped_qty(pos, _qty)
-        from backend.services.engine_strategy_dust import held_lots
+        from backend.services.engine_strategy_dust import attribute_unclaimed_strategy_dust, held_lots
+        from backend.services.live_exchange_equity import clear_dust_snapshot_symbol, clear_protected_preexisting_dust
+
+        qty_epsilon = 1e-10
+        with contextlib.suppress(Exception):
+            for _usym in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"):
+                if _usym in fenced:
+                    continue
+                _ubase = _usym.split("/", 1)[0]
+                if float(total_balances.get(_ubase, 0) or 0) <= qty_epsilon:
+                    clear_protected_preexisting_dust(str(self.db_path), _usym)
+                    clear_dust_snapshot_symbol(str(self.db_path), _usym)
 
         held_by_symbol: dict[str, float] = {}
         with contextlib.suppress(Exception):
             for _h in held_lots(self.db_path):
                 _hs = normalize_symbol(str(_h["symbol"]))
                 held_by_symbol[_hs] = held_by_symbol.get(_hs, 0.0) + float(_h["quantity"] or 0.0)
+        with contextlib.suppress(Exception), connect_managed(self.db_path) as _aconn:
+            _claimed_any = False
+            for _asset, _tot in total_balances.items():
+                if str(_asset or "").upper() in ("USDT", "USD", "BUSD", "USDC"):
+                    continue
+                _tval = float(_tot or 0)
+                if _tval <= qty_epsilon:
+                    continue
+                _csym = normalize_symbol(f"{_asset}/USDT")
+                if not self._symbol_in_fixed_universe(_csym) or _csym in fenced:
+                    continue
+                _unaccounted = _tval - strategy_qty.get(_csym, 0.0) - held_by_symbol.get(_csym, 0.0)
+                if _unaccounted <= qty_epsilon:
+                    continue
+                for _cl in attribute_unclaimed_strategy_dust(_aconn, symbol=_csym, max_quantity=_unaccounted):
+                    _claimed_any = True
+                    held_by_symbol[_csym] = held_by_symbol.get(_csym, 0.0) + float(_cl["quantity"] or 0.0)
+            if _claimed_any:
+                _aconn.commit()
+                claimed_strategy_dust = True
         for _hs, _hq in held_by_symbol.items():
             strategy_qty[_hs] = strategy_qty.get(_hs, 0.0) + _hq
         with connect_managed(self.db_path) as conn:
@@ -3496,8 +3527,7 @@ class PortfolioEngine:
             conn.commit()
         for sym, old_qty, new_qty in shrunk:
             logger.info("PROTECTED_EXTERNAL_INVENTORY_SHRUNK symbol=%s old_qty=%s new_qty=%s", sym, old_qty, new_qty)
-        qty_epsilon = 1e-10
-        imported_any = False
+        imported_any = bool(locals().get("claimed_strategy_dust"))
         for asset, total_qty in total_balances.items():
             if str(asset or "").upper() in ("USDT", "USD", "BUSD", "USDC"):
                 continue
@@ -6489,17 +6519,32 @@ class PortfolioEngine:
             return prior
         if (sold <= 0.0 and fee_base <= 0.0) or prior <= 0.0:
             return prior
-        remaining = float(Decimal(str(prior)) - Decimal(str(min(sold, prior))) - Decimal(str(fee_base)))
-        remaining = max(remaining, 0.0)
-        snapped = remaining
-        if qty_step > 0.0 and remaining > 0.0:
-            snapped = float(self._floor_to_step(remaining, qty_step))
-        position.quantity = snapped if snapped > 0.0 else remaining
+        prior_exact_raw = getattr(position, "quantity_exact", None)
+        prior_dec = Decimal(str(prior))
+        if prior_exact_raw:
+            try:
+                cand_dec = Decimal(str(prior_exact_raw))
+                if abs(float(cand_dec) - prior) <= 1e-9:
+                    prior_dec = cand_dec
+            except Exception:
+                prior_dec = Decimal(str(prior))
+        sold_dec = min(Decimal(str(sold)), prior_dec)
+        remaining_dec = prior_dec - sold_dec - Decimal(str(fee_base))
+        if remaining_dec <= Decimal("1e-12"):
+            remaining_dec = Decimal("0")
+        remaining = float(remaining_dec)
+        # Preserve exact net custody across intermediate partial fills so a
+        # sub-step fraction (e.g. 9.6e-6 BTC after a 2-bps base buy fee) is
+        # never floored away on partial fill #1 and lost from strategy dust
+        # provenance on the final fill.
+        position.quantity = remaining
+        position.quantity_exact = format(remaining_dec.normalize(), "f") if remaining_dec > 0 else "0"
         if dust_writeoff:
             position._confirmed_sell_qty_applied = sold
             return float(position.quantity or 0.0)
         if position.quantity <= 0.0:
             position.quantity = 0.0
+            position.quantity_exact = "0"
             position._confirmed_sell_qty_applied = sold
             return 0.0
         is_dust = (min_qty > 0.0 and position.quantity + 1e-15 < min_qty) or (min_notional > 0.0 and fill_price > 0.0 and (position.quantity * fill_price) + 1e-15 < min_notional)
@@ -7051,13 +7096,20 @@ class PortfolioEngine:
         if getattr(self, "_inject_crash_after_buy_commit", False):
             raise RuntimeError("INJECTED_CRASH_AFTER_BUY_COMMIT")
 
-    async def _delete_position_from_sqlite(self, symbol: str, engine_id: str = "") -> None:
+    async def _delete_position_from_sqlite(self, symbol: str, engine_id: str = "", *, trade_id: str = "") -> None:
         """Delete position from SQLite when closed.
 
-        engine_id="" keeps legacy symbol-wide semantics (cleanup callers).
+        engine_id="" keeps legacy symbol-wide semantics (cleanup callers) unless
+        ``trade_id`` scopes the delete to a specific retired dust row.
         An explicit engine_id scopes the DELETE to that engine's lot so a
         sibling engine's same-symbol lot is never touched.
         """
+        norm_sym = normalize_symbol(symbol)
+        tid = str(trade_id or "").strip()
+        day_v2_open = any(
+            str(getattr(p, "engine_id", "") or "") == "DAY_V2" and normalize_symbol(str(getattr(p, "symbol", "") or "")) == norm_sym and float(getattr(p, "quantity", 0) or 0) > 0
+            for p in self.open_positions.values()
+        )
 
         def _sync_delete():
             def _op():
@@ -7065,17 +7117,32 @@ class PortfolioEngine:
                     conn.execute("BEGIN IMMEDIATE")
                     _ensure_position_engine_identity(conn)
                     engine = str(engine_id or "")
-                    if not engine:
-                        conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (symbol,))
+                    if tid and (tid.startswith("dust_exchange:") or engine in ("", "LEGACY_DAY_LIVE")):
+                        cur = conn.execute(
+                            "DELETE FROM portfolio_engine_positions WHERE symbol = ? AND trade_id = ?",
+                            (norm_sym, tid),
+                        )
+                        if cur.rowcount == 0 and not day_v2_open and engine in ("", "LEGACY_DAY_LIVE"):
+                            conn.execute(
+                                "DELETE FROM portfolio_engine_positions WHERE symbol = ? AND COALESCE(engine_id,'LEGACY_DAY_LIVE') IN ('LEGACY_DAY_LIVE','')",
+                                (norm_sym,),
+                            )
+                    elif not engine:
+                        conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (norm_sym,))
+                    elif engine == "LEGACY_DAY_LIVE" and day_v2_open:
+                        conn.execute(
+                            "DELETE FROM portfolio_engine_positions WHERE symbol = ? AND COALESCE(engine_id,'LEGACY_DAY_LIVE') IN ('LEGACY_DAY_LIVE','')",
+                            (norm_sym,),
+                        )
                     elif engine in DAY_SIDE_ENGINES:
                         conn.execute(
                             "DELETE FROM portfolio_engine_positions WHERE symbol = ? AND COALESCE(engine_id,'LEGACY_DAY_LIVE') IN ('DAY_V2','LEGACY_DAY_LIVE','LEGACY_EXIT_ONLY')",
-                            (symbol,),
+                            (norm_sym,),
                         )
                     else:
                         conn.execute(
                             "DELETE FROM portfolio_engine_positions WHERE symbol = ? AND engine_id = ?",
-                            (symbol, engine),
+                            (norm_sym, engine),
                         )
                     conn.commit()
 
@@ -7565,11 +7632,14 @@ class PortfolioEngine:
         exit_reporting: dict[str, Any] | None = None,
         actual_net_pct: float | None = None,
         event_key: str | None = None,
+        sold_quantity: float | None = None,
     ) -> None:
         """
-        Unified learning sink for non-AI close events (HUMAN_MANUAL_SELL,
-        DUST_WRITEOFF). Routes through ``trade_learning_writer`` so paper
-        and live both write the same record shape with ``mode`` tagged.
+        Unified learning sink for close events. Routes through
+        ``trade_learning_writer`` so paper and live both write the same record
+        shape with ``mode`` tagged. ``sold_quantity`` carries the confirmed sold
+        size so post-sell mutated ``position.quantity`` (residual dust or zero)
+        is never recorded as the trade's sold quantity.
         Best-effort: never raises into the engine.
         """
         try:
@@ -7581,7 +7651,19 @@ class PortfolioEngine:
             )
 
             entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
-            qty = float(getattr(position, "quantity", 0.0) or 0.0)
+            _cprov_qty = 0.0
+            _cprov_obj = getattr(position, "_close_provenance", None)
+            if isinstance(_cprov_obj, dict) and _cprov_obj.get("sell_qty") is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    _cprov_qty = float(_cprov_obj["sell_qty"] or 0.0)
+            if sold_quantity is not None and float(sold_quantity) > 0.0:
+                qty = float(sold_quantity)
+            elif str(close_reason or "").upper() != "DUST_WRITEOFF" and _cprov_qty > 0.0:
+                qty = _cprov_qty
+            elif str(close_reason or "").upper() == "DUST_WRITEOFF" and float(dust_qty or 0.0) > 0.0:
+                qty = float(dust_qty)
+            else:
+                qty = float(getattr(position, "quantity", 0.0) or 0.0)
             from backend.services.adaptive_learning import close_learning_net_pct
 
             net_pct = close_learning_net_pct(fill_net_pct=actual_net_pct)
@@ -8368,16 +8450,20 @@ class PortfolioEngine:
             )
             return
         if pos_status == "DUST_PENDING":
+            if await self._retire_vanished_dust_via_venue_conversion(symbol, position, source=source):
+                return
             qty_before = float(position.quantity or 0.0)
+            position._retired_dust_qty = qty_before
+            position.quantity = 0.0
+            position.dust_qty_canonical = 0.0
+            position.quantity_exact = "0"
             await self._remove_dust_position_canonical_cleanup(symbol, position)
-            still_held = any(v is position for v in self.open_positions.values()) and float(position.quantity or 0.0) > 0
-            identity_qty = float(position.quantity or 0.0) if still_held else qty_before
-            if identity_qty <= 0:
+            if qty_before <= 0:
                 return
             await self._record_dust_writeoff_once(
                 symbol,
                 position,
-                quantity=identity_qty,
+                quantity=qty_before,
                 source=source,
                 cooldown_until=cooldown_until,
             )
@@ -8520,6 +8606,9 @@ class PortfolioEngine:
                 conn.commit()
 
         await asyncio.to_thread(_write)
+        position.quantity = 0.0
+        position.dust_qty_canonical = 0.0
+        position.quantity_exact = "0"
         async with self._deletion_lock:
             key = next((k for k, v in self.open_positions.items() if v is position), None)
             if key is not None:
@@ -8538,6 +8627,78 @@ class PortfolioEngine:
             event_class,
             (match or {}).get("tran_id", ""),
             (match or {}).get("operate_time_utc", ""),
+        )
+        return True
+
+    async def _retire_vanished_dust_via_venue_conversion(self, symbol: str, position: OpenPosition, *, source: str) -> bool:
+        """Retire any vanished DUST_PENDING row when Binance Small Balance Conversion proves conversion.
+
+        Classifies retirement as EXTERNAL_BALANCE_CONVERSION (never DUST_WRITEOFF,
+        never bad_trade=true, no strategy-loss learning row, no cooldown) and zeroes
+        quantity + dust_qty_canonical before canonical cleanup removes the row.
+        """
+        from backend.services.engine_strategy_dust import (
+            EVENT_CONVERSION,
+            ensure_schema,
+            match_dust_conversion,
+            record_external_balance_event,
+            zero_lot_remaining,
+        )
+
+        rows = await self._venue_dust_conversions()
+        if not rows:
+            return False
+        sym = normalize_symbol(symbol)
+        api = _to_api_symbol(sym)
+        asset = api[:-4] if api.endswith("USDT") else api
+        since = float(getattr(position, "entry_time", 0.0) or 0.0)
+        match = match_dust_conversion(rows, asset=asset, after_epoch=since)
+        if match is None:
+            return False
+
+        trade_id = str(getattr(position, "trade_id", "") or "")
+        engine_id = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
+        qty = float(getattr(position, "quantity", 0.0) or getattr(position, "dust_qty_canonical", 0.0) or 0.0)
+
+        def _write() -> None:
+            with connect_managed(self.db_path) as conn:
+                ensure_schema(conn)
+                record_external_balance_event(
+                    conn,
+                    symbol=sym,
+                    quantity=qty,
+                    event_class=EVENT_CONVERSION,
+                    source=f"dust_vanish:{source}",
+                    engine_id=engine_id,
+                    source_trade_id=trade_id or f"dust_exchange:{api}",
+                    venue_ref=str(match.get("tran_id") or ""),
+                    venue_time_utc=str(match.get("operate_time_utc") or ""),
+                    evidence=match,
+                )
+                if trade_id:
+                    zero_lot_remaining(conn, trade_id)
+                conn.commit()
+
+        await asyncio.to_thread(_write)
+        position._retired_dust_qty = qty
+        position.quantity = 0.0
+        position.dust_qty_canonical = 0.0
+        position.quantity_exact = "0"
+        await self._remove_dust_position_canonical_cleanup(sym, position)
+        with contextlib.suppress(Exception):
+            from backend.services.live_exchange_equity import clear_dust_snapshot_symbol, clear_protected_preexisting_dust
+
+            if not self._symbol_lots(sym):
+                clear_protected_preexisting_dust(str(self.db_path), sym)
+                clear_dust_snapshot_symbol(str(self.db_path), sym)
+        logger.warning(
+            "EXTERNAL_BALANCE_CONVERSION_RETIRED symbol=%s engine=%s trade_id=%s qty=%.12g venue_ref=%s venue_time=%s — no DUST_WRITEOFF, no learning, no cooldown",
+            sym,
+            engine_id,
+            trade_id,
+            qty,
+            match.get("tran_id", ""),
+            match.get("operate_time_utc", ""),
         )
         return True
 
@@ -8566,6 +8727,7 @@ class PortfolioEngine:
             return
         api = _to_api_symbol(sym)
         asset = api[:-4] if api.endswith("USDT") else api
+        retired_any = False
         for h in held:
             try:
                 since = float(json.loads(h.get("provenance_json") or "{}").get("entry_time") or 0.0)
@@ -8593,6 +8755,7 @@ class PortfolioEngine:
                     conn.commit()
 
             await asyncio.to_thread(_write)
+            retired_any = True
             logger.warning(
                 "HELD_ENGINE_DUST_RETIRED symbol=%s engine=%s source_trade=%s qty=%.12g class=%s venue_ref=%s",
                 sym,
@@ -8602,6 +8765,11 @@ class PortfolioEngine:
                 EVENT_CONVERSION,
                 match.get("tran_id"),
             )
+        if retired_any:
+            await self._recompute_positions_values()
+            self._compute_total_open_risk()
+            if hasattr(self, "_persist_ledger_to_sqlite"):
+                await self._persist_ledger_to_sqlite()
 
     def _held_engine_dust_qty(self, symbol: str) -> float:
         from backend.services.engine_strategy_dust import held_quantity
@@ -8688,6 +8856,7 @@ class PortfolioEngine:
                 realized_profit=realized_profit,
                 cooldown_until=cooldown_until,
                 fill_found=bool(fill.get("found")),
+                sold_quantity=float(fill_qty) if fill.get("found") and fill_qty and float(fill_qty) > 0 else None,
             )
 
         if self._trading_paused and "accounting_disagreement" in str(self._pause_reason or ""):
@@ -8847,7 +9016,7 @@ class PortfolioEngine:
                     if persist is not None:
                         await persist(position)
                     return
-                dust_qty = position.quantity
+                dust_qty = float(getattr(position, "_retired_dust_qty", 0.0) or position.quantity or 0.0)
                 dust_entry = position.entry_price
                 dust_notional = dust_qty * dust_entry if dust_qty > 0 and dust_entry > 0 else 0.0
                 hold_seconds = int(time.time() - position.entry_time) if position.entry_time else 0
@@ -8855,7 +9024,15 @@ class PortfolioEngine:
                 del self.open_positions[_pos_key]
                 await self._recompute_positions_values()
                 self._compute_total_open_risk()
-                await self._delete_position_from_sqlite(symbol, str(getattr(position, "engine_id", "") or ""))
+                _del_tid = str(getattr(position, "trade_id", "") or "")
+                _del_eng = str(getattr(position, "engine_id", "") or "")
+                if _del_tid.startswith("dust_exchange:"):
+                    try:
+                        await self._delete_position_from_sqlite(symbol, _del_eng, trade_id=_del_tid)
+                    except TypeError:
+                        await self._delete_position_from_sqlite(symbol, _del_eng)
+                else:
+                    await self._delete_position_from_sqlite(symbol, _del_eng)
 
                 # Dust leftover is inventory, not a completed live strategy close.
                 try:
@@ -16623,15 +16800,25 @@ class PortfolioEngine:
                         from backend.services.live_exchange_equity import load_protected_preexisting_dust
                         from backend.services.live_fill_economics import plan_sell_quantity
 
-                        protected = float(getattr(position, "protected_dust_qty", 0) or 0)
-                        if protected <= 0:
-                            protected = float(load_protected_preexisting_dust(self.db_path, normalized_symbol))
-                        await self._ensure_symbol_constraints(symbol)
-                        constraints = self._symbol_constraints.get(symbol) or {}
-                        qty_step = float(constraints.get("qty_step") or 0)
                         _net_active = float(position.quantity)
                         if _fill_owned_sell is not None:
                             _net_active = min(_net_active, _fill_owned_sell)
+                        protected = float(getattr(position, "protected_dust_qty", 0) or 0)
+                        if protected <= 0:
+                            protected = float(load_protected_preexisting_dust(self.db_path, normalized_symbol))
+                            if protected > 0:
+                                # Pre-existing dust cannot exceed actual non-lot balance on the venue
+                                # (e.g. after Binance Small Balance Conversion zeroed prior dust).
+                                _all_active_on_sym = sum(
+                                    float(getattr(_p, "quantity", 0) or 0)
+                                    for _p in self._symbol_lots(normalized_symbol)
+                                    if _p is not position and str(getattr(_p, "status", "") or "").upper() != "DUST_PENDING"
+                                )
+                                _max_venue_surplus = max(0.0, float(Decimal(str(free_balance)) - Decimal(str(_net_active)) - Decimal(str(_all_active_on_sym))))
+                                protected = min(protected, _max_venue_surplus)
+                        await self._ensure_symbol_constraints(symbol)
+                        constraints = self._symbol_constraints.get(symbol) or {}
+                        qty_step = float(constraints.get("qty_step") or 0)
                         planned = plan_sell_quantity(
                             net_active_qty=_net_active,
                             exchange_free_qty=free_balance,
@@ -17639,6 +17826,7 @@ class PortfolioEngine:
                 exit_reporting=exit_reporting,
                 actual_net_pct=float(pnl_pct_net),
                 event_key=f"live-close:{oid}" if oid else None,
+                sold_quantity=float(quantity) if not dust_writeoff else None,
             )
             if oid:
                 from backend.services.strategy_order_intent import close_sell_order_ids, complete_intent
@@ -26356,6 +26544,17 @@ class PortfolioEngine:
                 if is_dust:
                     position.dust_qty_canonical = canonical_qty
                     if canonical_qty <= 0:
+                        from backend.services.protected_external_inventory import is_strategy_engine
+
+                        if is_strategy_engine(str(getattr(position, "engine_id", "") or "")):
+                            await self._retire_phantom_strategy_dust(symbol, position, source="dust_reconciliation")
+                            continue
+                        if await self._retire_vanished_dust_via_venue_conversion(symbol, position, source="dust_reconciliation"):
+                            continue
+                        position._retired_dust_qty = float(position.quantity or 0.0)
+                        position.quantity = 0.0
+                        position.dust_qty_canonical = 0.0
+                        position.quantity_exact = "0"
                         await self._remove_dust_position_canonical_cleanup(symbol, position)
                         if key not in self.open_positions:
                             logger.warning("DUST_PENDING_EXIT: %s balance=0 removed from engine", key)

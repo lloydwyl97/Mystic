@@ -1,4 +1,4 @@
-"""Unchanged exchange dust is one close, not a writeoff on every reconcile."""
+"""Vanished exchange dust retires cleanly once; retained venue dust stays DUST_PENDING without writeoffs."""
 
 from __future__ import annotations
 
@@ -83,13 +83,13 @@ def _null_pnl(db: str) -> None:
     assert bad_learning == 0
 
 
-async def _passes(eng: PortfolioEngine, n: int) -> None:
-    balances = {"ETH": 0.0, "SOL": 0.0, "XRP": 0.0, "USDT": 992.62}
+async def _passes(eng: PortfolioEngine, n: int, balances: dict[str, float] | None = None) -> None:
+    snap = balances or {"ETH": 0.0, "SOL": 0.0, "XRP": 0.0, "USDT": 992.62}
     for _ in range(n):
-        await eng.run_live_reconcile(balances, free_balances=dict(balances))
+        await eng.run_live_reconcile(snap, free_balances=dict(snap))
 
 
-async def test_unchanged_dust_is_written_off_once_and_kept(tmp_path: Path):
+async def test_vanished_unattributed_dust_is_retired_once_and_removed(tmp_path: Path):
     eng = _engine(tmp_path)
     eth = _lot("ETH/USDT", ETH_QTY, ETH_PX, trade_id="eth-dust", entry_time=1_793_957_646.809)
     sol = _lot("SOL/USDT", SOL_QTY, SOL_PX, trade_id="sol-dust", entry_time=1_793_965_059.818)
@@ -99,36 +99,35 @@ async def test_unchanged_dust_is_written_off_once_and_kept(tmp_path: Path):
     await _passes(eng, 1)
     assert _counts(eng.db_path) == (2, 2)
     _null_pnl(eng.db_path)
+    assert eth.quantity == 0.0
+    assert eth.dust_qty_canonical == 0.0
+    assert sol.quantity == 0.0
+    assert sol.dust_qty_canonical == 0.0
+    assert eng.open_positions == {}
+    assert eng._positions_value == pytest.approx(0.0)
+    assert eng._total_equity == pytest.approx(eng.cash_balance)
 
     await _passes(eng, 4)
     assert _counts(eng.db_path) == (2, 2)
+    assert eng._positions_value == pytest.approx(0.0)
+
+
+async def test_retained_dust_still_on_exchange_stays_dust_pending_without_writeoff(tmp_path: Path):
+    eng = _engine(tmp_path)
+    eth = _lot("ETH/USDT", ETH_QTY, ETH_PX, trade_id="eth-dust", entry_time=1_793_957_646.809)
+    sol = _lot("SOL/USDT", SOL_QTY, SOL_PX, trade_id="sol-dust", entry_time=1_793_965_059.818)
+    eng.open_positions[make_position_key(LEGACY, "ETH/USDT")] = eth
+    eng.open_positions[make_position_key(LEGACY, "SOL/USDT")] = sol
+
+    await _passes(eng, 3, {"ETH": ETH_QTY, "SOL": SOL_QTY, "USDT": 992.62})
+    assert _counts(eng.db_path) == (0, 0)
     assert eth.status == "DUST_PENDING"
     assert sol.status == "DUST_PENDING"
-    assert eth.quantity == pytest.approx(ETH_QTY)
-    assert sol.quantity == pytest.approx(SOL_QTY)
     assert consumes_strategy_slot(eth) is False
     assert consumes_strategy_slot(sol) is False
     assert eng._engine_held_count("DAY_V2") == 0
     assert eng._positions_value == pytest.approx(ETH_QTY * ETH_PX + SOL_QTY * SOL_PX)
     assert eng._total_equity == pytest.approx(eng.cash_balance + eng._positions_value)
-
-
-async def test_quantity_change_is_a_new_event_and_then_stable(tmp_path: Path):
-    eng = _engine(tmp_path)
-    sol = _lot("SOL/USDT", SOL_QTY, SOL_PX, trade_id="sol-dust", entry_time=1_793_965_059.818)
-    eng.open_positions[make_position_key(LEGACY, "SOL/USDT")] = sol
-    await _passes(eng, 3)
-    assert _counts(eng.db_path) == (1, 1)
-
-    sol.quantity = SOL_QTY / 2
-    sol.dust_qty_canonical = sol.quantity
-    await _passes(eng, 1)
-    assert _counts(eng.db_path) == (2, 2)
-    await _passes(eng, 3)
-    assert _counts(eng.db_path) == (2, 2)
-    _null_pnl(eng.db_path)
-    assert sol.quantity == pytest.approx(SOL_QTY / 2)
-    assert consumes_strategy_slot(sol) is False
 
 
 async def test_other_symbol_and_later_trade_are_not_suppressed(tmp_path: Path):
@@ -139,16 +138,15 @@ async def test_other_symbol_and_later_trade_are_not_suppressed(tmp_path: Path):
     eng.open_positions[make_position_key(LEGACY, "XRP/USDT")] = xrp
     await _passes(eng, 2)
     assert _counts(eng.db_path) == (2, 2)
+    assert eng.open_positions == {}
 
-    del eng.open_positions[make_position_key(LEGACY, "ETH/USDT")]
     nxt = _lot("ETH/USDT", 2.5e-07, 3100.0, trade_id="eth-dust-next", entry_time=1_794_200_000.0)
     eng.open_positions[make_position_key(LEGACY, "ETH/USDT")] = nxt
     await _passes(eng, 1)
     assert _counts(eng.db_path) == (3, 3)
     await _passes(eng, 3)
     assert _counts(eng.db_path) == (3, 3)
-    assert nxt.status == "DUST_PENDING"
-    assert consumes_strategy_slot(nxt) is False
+    assert eng.open_positions == {}
 
 
 async def test_legacy_rows_without_event_key_are_not_duplicated(tmp_path: Path):
@@ -179,8 +177,8 @@ async def test_legacy_rows_without_event_key_are_not_duplicated(tmp_path: Path):
     eng.open_positions[make_position_key(LEGACY, "ETH/USDT")] = eth
     await _passes(eng, 4)
     assert _counts(eng.db_path) == (1, 1)
-    assert eth.quantity == pytest.approx(ETH_QTY)
-    assert consumes_strategy_slot(eth) is False
+    assert eth.quantity == 0.0
+    assert eng.open_positions == {}
 
 
 async def test_gone_residual_is_not_written_off_again(tmp_path: Path):
@@ -190,10 +188,8 @@ async def test_gone_residual_is_not_written_off_again(tmp_path: Path):
     eng.open_positions[key] = sol
     await _passes(eng, 2)
     assert _counts(eng.db_path) == (1, 1)
-
-    sol.quantity = 0.0
-    await eng._remove_dust_position_canonical_cleanup("SOL/USDT", sol)
     assert key not in eng.open_positions
+
     await eng._handle_vanished_exchange_position("SOL/USDT", sol, source="periodic_reconcile")
     await _passes(eng, 3)
     assert _counts(eng.db_path) == (1, 1)
