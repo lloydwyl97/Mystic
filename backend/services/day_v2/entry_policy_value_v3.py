@@ -35,7 +35,9 @@ Core contract:
 from __future__ import annotations
 
 import bisect
+import copy
 import hashlib
+import heapq
 import json
 import logging
 import math
@@ -1350,53 +1352,364 @@ def apply_resolved_entry_policy_v3_labels(
                     _finite_float(srow[4]),
                 )
 
-        # Causal tactical-contract target alignment for pre-tactical DETECTOR_FIRED counterfactuals:
-        # When DAY_V2's installed aggregator is 'tactical', unfunded DETECTOR_FIRED counterfactuals
-        # recorded prior to the tactical cutover were terminated early under legacy 'blended'.
-        # Re-evaluating them on causal 1m OHLCV bars under 'tactical' (strictly <= cutoff, never
-        # mutating policy_episodes or funded fills) aligns V3 training labels with the live exit policy.
-        tactical_cutover_ts: float | None = None
-        bars_1m_by_sym: dict[str, tuple[list[float], list[tuple[float, float, float, float, float]]]] = {}
-        tactical_post_cache: dict[tuple[str, str, str, int], list[tuple[int, float, float]]] = {}
-        tactical_ridge: dict[str, Any] = {}
-        if "continuation_learning_meta" in tables:
-            from backend.services.adaptive_learning import current_economic_version
+        # Strictly causal tactical-contract target alignment for pre-tactical DETECTOR_FIRED counterfactuals:
+        # Unfunded DETECTOR_FIRED counterfactuals recorded prior to the tactical cutover were terminated
+        # early under legacy 'blended'. We reconstruct their tactical trajectory on causal 1m OHLCV bars
+        # stepping ContinuationMemory forward monotonically using ONLY continuation labels available at or
+        # before each 1m bar close (label_time <= bar_close_ts <= cutoff). No future/hindsight continuation
+        # state is ever read before its label_time, and policy_episodes / funded fills are never mutated.
+        pretactical_outcomes: dict[int, tuple[str, float, float]] = {}
+        if "continuation_learning_meta" in tables and "feature_ohlcv" in tables:
+            from backend.services.adaptive_learning import (
+                _decay_factor,
+                _lattice,
+                current_economic_version,
+            )
+            from backend.services.adaptive_learning import (
+                _norm_symbol as _al_norm_sym,
+            )
             from backend.services.continuation_surface import (
                 ADVANTAGE_VERSION,
                 DAY_TACTICAL_MAX_HORIZON_SEC,
+                HOLD_ADVANTAGE_METRICS,
                 _aggregate_informed,
                 _blank_ridge,
-                _load_ridge,
+                _model_key,
                 _ridge_dot,
+                _update_ridge,
                 horizons_for,
                 metric_name,
                 state_features,
             )
+            from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
+            from backend.services.exact_policy_capture import realized_policy_net
 
+            eco_ver = current_economic_version(DAY_ENGINE)
             m_row = conn.execute(
                 "SELECT learning_version, source, updated_at FROM continuation_learning_meta WHERE engine_id=? AND economic_version=?",
-                (DAY_ENGINE, current_economic_version(DAY_ENGINE)),
+                (DAY_ENGINE, eco_ver),
             ).fetchone()
             if m_row is not None and str(m_row[0] or "") == ADVANTAGE_VERSION and str(m_row[1] or "") == "horizon_hold_advantage:tactical":
                 tactical_cutover_ts = _parse_ts(m_row[2])
-                pre_tact_det = [
-                    float(r["decided_at"])
-                    for r in pending_rows
-                    if classify_population(str(r["setup"] or "")) == POPULATION_DETECTOR_FIRED
-                    and plan[int(r["id"])].get("target_type") != LABEL_REAL_FUNDED_EXECUTION
-                    and (tactical_cutover_ts is None or float(r["decided_at"]) < tactical_cutover_ts)
-                ]
-                if pre_tact_det and "feature_ohlcv" in tables:
-                    from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
+                pre_tact_cands: list[dict[str, Any]] = []
+                for r in pending_rows:
+                    rid_c = int(r["id"])
+                    if plan[rid_c].get("target_type") == LABEL_REAL_FUNDED_EXECUTION:
+                        continue
+                    stp_c = str(r["setup"] or "").strip().upper()
+                    if classify_population(stp_c) != POPULATION_DETECTOR_FIRED:
+                        continue
+                    dec_c = float(r["decided_at"])
+                    if tactical_cutover_ts is not None and dec_c >= tactical_cutover_ts:
+                        continue
+                    _sr_c, spr_c, ask_c, fee_c = snap_by_id.get(rid_c, ("{}", None, None, None))
+                    if ask_c is None or ask_c <= 0.0:
+                        continue
+                    pre_tact_cands.append(
+                        {
+                            "rid": rid_c,
+                            "sym": _norm_symbol(str(r["symbol"] or "")),
+                            "stp_full": stp_c,
+                            "reg": str(r["regime"] or "").strip().lower(),
+                            "dec_t": dec_c,
+                            "ep_ask": float(ask_c),
+                            "spr": float(spr_c) if (spr_c is not None and spr_c >= 0.0) else 0.0001,
+                            "fee": float(fee_c) if (fee_c is not None and fee_c >= 0.0) else 0.00033,
+                        }
+                    )
 
-                    min_det_t = min(pre_tact_det)
-                    max_det_end = min(cutoff, max(pre_tact_det) + float(DAY_TACTICAL_MAX_HORIZON_SEC) + 120.0)
+                if pre_tact_cands:
+                    min_det_t = min(c["dec_t"] for c in pre_tact_cands)
+                    max_det_t = max(c["dec_t"] for c in pre_tact_cands)
+                    max_det_end = min(cutoff, max_det_t + float(DAY_TACTICAL_MAX_HORIZON_SEC) + 120.0)
+                    bars_1m_by_sym: dict[str, tuple[list[float], list[tuple[float, float, float, float, float]]]] = {}
                     for sym_u in SYMBOLS:
                         rb = ohlcv_bars_1m(db_path, sym_u, min_det_t - 60.0, max_det_end)
                         if rb:
                             bars_1m_by_sym[sym_u] = ([b[0] + 60.0 for b in rb], rb)
+
                     if bars_1m_by_sym:
-                        tactical_ridge = _load_ridge(db_path, DAY_ENGINE)
+                        # Build strictly causal continuation event stream (ev_ts <= cutoff)
+                        causal_events: list[tuple[float, str, Any]] = []
+                        if "continuation_advantage_log" in tables:
+                            log_rows = conn.execute(
+                                """
+                                SELECT label_time, horizon, symbol, setup, regime, features_json, advantage, weight
+                                FROM continuation_advantage_log
+                                WHERE engine_id=?
+                                  AND feature_version=?
+                                  AND label_time IS NOT NULL
+                                  AND advantage IS NOT NULL
+                                  AND weight IS NOT NULL
+                                  AND label_time <= ?
+                                  AND (setup NOT LIKE '%__MARKET' OR features_json NOT LIKE '%"age_min":0.0%')
+                                ORDER BY label_time ASC
+                                """,
+                                (DAY_ENGINE, ADVANTAGE_VERSION, cutoff),
+                            ).fetchall()
+                            for lr in log_rows:
+                                lbl_t = _finite_float(lr[0])
+                                adv_v = _finite_float(lr[6])
+                                w_v = _finite_float(lr[7])
+                                if lbl_t is None or adv_v is None or w_v is None or w_v <= 0.0:
+                                    continue
+                                causal_events.append(
+                                    (
+                                        lbl_t,
+                                        "log",
+                                        (
+                                            int(lr[1]),
+                                            str(lr[2] or ""),
+                                            str(lr[3] or ""),
+                                            str(lr[4] or ""),
+                                            str(lr[5] or ""),
+                                            adv_v,
+                                            w_v,
+                                        ),
+                                    )
+                                )
+
+                        if not causal_events and "adaptive_metric_state" in tables:
+                            # Fallback for synthetic unit-test DBs without continuation_advantage_log:
+                            # include ONLY rows whose updated_at <= cutoff, ordered causally by updated_at.
+                            for mr in conn.execute(
+                                """
+                                SELECT symbol, setup, regime, metric, n, ewma, m2, updated_at
+                                FROM adaptive_metric_state
+                                WHERE engine_id=? AND economic_version=? AND metric LIKE 'hold_adv_%'
+                                """,
+                                (DAY_ENGINE, eco_ver),
+                            ).fetchall():
+                                ts_m = _parse_ts(mr[7])
+                                if ts_m is not None and ts_m <= cutoff and not str(mr[1] or "").upper().endswith("__MARKET"):
+                                    causal_events.append(
+                                        (
+                                            ts_m,
+                                            "snap_metric",
+                                            {
+                                                "symbol": _al_norm_sym(mr[0]),
+                                                "setup": str(mr[1] or "").upper(),
+                                                "regime": str(mr[2] or "").lower(),
+                                                "metric": str(mr[3] or ""),
+                                                "n": float(mr[4] or 0.0),
+                                                "ewma": float(mr[5] or 0.0),
+                                                "m2": float(mr[6] or 0.0),
+                                                "updated_at": str(mr[7] or ""),
+                                            },
+                                        )
+                                    )
+                            if "adaptive_linear_model" in tables:
+                                lrow = conn.execute(
+                                    "SELECT payload FROM adaptive_linear_model WHERE engine_id=? AND model=?",
+                                    (DAY_ENGINE, _model_key(DAY_ENGINE)),
+                                ).fetchone()
+                                if lrow and lrow[0]:
+                                    try:
+                                        lpay = json.loads(lrow[0])
+                                    except (TypeError, ValueError):
+                                        lpay = {}
+                                    for hk, hst in ((lpay.get("horizons") or {}) if isinstance(lpay, dict) else {}).items():
+                                        if isinstance(hst, dict):
+                                            ts_r = _parse_ts(hst.get("updated_at"))
+                                            if ts_r is not None and ts_r <= cutoff:
+                                                causal_events.append((ts_r, "snap_ridge", (int(hk), copy.deepcopy(hst))))
+                            causal_events.sort(key=lambda it: it[0])
+
+                        if causal_events:
+                            first_det_ev_ts: float | None = None
+                            for ev_t, ev_kind, ev_pay in causal_events:
+                                if ev_kind == "snap_metric" or (ev_kind == "log" and not str(ev_pay[2]).strip().upper().endswith("__MARKET")):
+                                    first_det_ev_ts = ev_t
+                                    break
+
+                            mem_rows: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = defaultdict(dict)
+                            mem_ridge: dict[int, dict[str, Any]] = {}
+                            ev_idx = 0
+                            n_evs = len(causal_events)
+                            day_hzs = horizons_for(DAY_ENGINE)
+                            post_cache: dict[tuple[str, str, str, int, int], list[tuple[int, float, float]]] = {}
+
+                            ep_states: dict[int, dict[str, Any]] = {}
+                            bar_heap: list[tuple[float, int]] = []
+                            for c in pre_tact_cands:
+                                sym_c = c["sym"]
+                                if sym_c not in bars_1m_by_sym:
+                                    continue
+                                cts_1m, rb_1m = bars_1m_by_sym[sym_c]
+                                i0 = bisect.bisect_right(cts_1m, c["dec_t"])
+                                if i0 >= len(rb_1m) or cts_1m[i0] > c["dec_t"] + 300.0:
+                                    # If cutoff precedes even the first 1m bar close and surface already exists, mark unresolved at cutoff
+                                    if cutoff < c["dec_t"] + 65.0 and first_det_ev_ts is not None and first_det_ev_ts <= cutoff:
+                                        pretactical_outcomes[c["rid"]] = ("UNRESOLVED_AT_CUTOFF", 0.0, cutoff)
+                                    continue
+                                ct_first = cts_1m[i0]
+                                if ct_first > cutoff:
+                                    if first_det_ev_ts is not None and first_det_ev_ts <= cutoff < c["dec_t"] + float(DAY_TACTICAL_MAX_HORIZON_SEC):
+                                        pretactical_outcomes[c["rid"]] = ("UNRESOLVED_AT_CUTOFF", 0.0, cutoff)
+                                    continue
+                                ep_states[c["rid"]] = {
+                                    "cand": c,
+                                    "rb_1m": rb_1m,
+                                    "idx": i0,
+                                    "hw": c["ep_ask"],
+                                    "mfe_t": 0.0,
+                                    "mae_t": 0.0,
+                                    "prev_n": realized_policy_net(c["ep_ask"], c["ep_ask"] * (1.0 - c["spr"]), c["fee"]),
+                                    "sim_net": None,
+                                    "sim_exit_ts": None,
+                                    "saw_informed": False,
+                                    "exited": False,
+                                }
+                                heapq.heappush(bar_heap, (ct_first, c["rid"]))
+
+                            while bar_heap:
+                                ct_b, rid_s = heapq.heappop(bar_heap)
+                                while ev_idx < n_evs and causal_events[ev_idx][0] <= ct_b:
+                                    ev_t, ev_kind, ev_pay = causal_events[ev_idx]
+                                    ev_idx += 1
+                                    if ev_kind == "log":
+                                        hz_i, sym_l, stp_l, reg_l, fjson_l, adv_v, w_v = ev_pay
+                                        stp_lu = stp_l.strip().upper()
+                                        m_l = metric_name(hz_i)
+                                        if m_l in HOLD_ADVANTAGE_METRICS and not stp_lu.endswith("__MARKET"):
+                                            k_l = (_al_norm_sym(sym_l), stp_lu, reg_l.strip().lower())
+                                            prev_r = mem_rows[m_l].get(k_l)
+                                            if prev_r is None or float(prev_r["n"]) <= 0.0:
+                                                n_new, mean_new, m2_new = w_v, adv_v, 0.0
+                                            else:
+                                                dec_f = _decay_factor(str(prev_r["updated_at"] or ""), ev_t, DAY_ENGINE)
+                                                n_new = float(prev_r["n"]) * dec_f + w_v
+                                                alpha_l = w_v / n_new
+                                                delta_l = adv_v - float(prev_r["ewma"])
+                                                mean_new = float(prev_r["ewma"]) + alpha_l * delta_l
+                                                m2_new = max(0.0, float(prev_r.get("m2") or 0.0)) * dec_f + w_v * delta_l * (adv_v - mean_new)
+                                            mem_rows[m_l][k_l] = {
+                                                "symbol": k_l[0],
+                                                "setup": k_l[1],
+                                                "regime": k_l[2],
+                                                "metric": m_l,
+                                                "n": n_new,
+                                                "ewma": mean_new,
+                                                "m2": max(0.0, m2_new),
+                                                "updated_at": datetime.fromtimestamp(ev_t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                            }
+                                        if fjson_l and '"age_min":0.0' not in fjson_l:
+                                            try:
+                                                fdict_l = json.loads(fjson_l)
+                                            except (TypeError, ValueError):
+                                                fdict_l = None
+                                            if isinstance(fdict_l, dict):
+                                                rst = mem_ridge.setdefault(hz_i, _blank_ridge())
+                                                _update_ridge(rst, fdict_l, adv_v, w_v, ev_t, DAY_ENGINE)
+                                    elif ev_kind == "snap_metric":
+                                        m_s = ev_pay["metric"]
+                                        k_s = (ev_pay["symbol"], ev_pay["setup"], ev_pay["regime"])
+                                        mem_rows[m_s][k_s] = ev_pay
+                                    elif ev_kind == "snap_ridge":
+                                        mem_ridge[ev_pay[0]] = ev_pay[1]
+
+                                st_ep = ep_states[rid_s]
+                                c_ep = st_ep["cand"]
+                                rb_ep = st_ep["rb_1m"]
+                                k_bar = st_ep["idx"]
+                                _ot_b, _bo, bh_b, bl_b, bc_b = rb_ep[k_bar]
+                                age_s = ct_b - c_ep["dec_t"]
+                                ep_ask_v = c_ep["ep_ask"]
+                                spr_v = c_ep["spr"]
+                                fee_v = c_ep["fee"]
+                                bid_hi = bh_b * (1.0 - spr_v * 0.5)
+                                bid_lo = bl_b * (1.0 - spr_v * 0.5)
+                                bid_c = bc_b * (1.0 - spr_v * 0.5)
+                                st_ep["hw"] = max(st_ep["hw"], bh_b)
+                                net_c = realized_policy_net(ep_ask_v, bid_c, fee_v)
+                                st_ep["mfe_t"] = max(st_ep["mfe_t"], realized_policy_net(ep_ask_v, bid_hi, fee_v))
+                                st_ep["mae_t"] = max(st_ep["mae_t"], 0.0, -realized_policy_net(ep_ask_v, bid_lo, fee_v))
+
+                                pck = (c_ep["sym"], c_ep["stp_full"], c_ep["reg"], int(ct_b // 60.0), ev_idx)
+                                if pck not in post_cache:
+                                    hp_list: list[tuple[int, float, float]] = []
+                                    for hz_q in day_hzs:
+                                        mn_q = metric_name(hz_q)
+                                        r_dict = mem_rows.get(mn_q)
+                                        if not r_dict:
+                                            continue
+                                        lat_q = _lattice(
+                                            list(r_dict.values()),
+                                            engine_id=DAY_ENGINE,
+                                            symbol=c_ep["sym"],
+                                            setup=c_ep["stp_full"],
+                                            regime=c_ep["reg"],
+                                            weights={mn_q: 1.0},
+                                            prior=0.0,
+                                            now=ct_b,
+                                            include_engine=True,
+                                        )
+                                        ev_w_q = float(lat_q.get("level_weights", {}).get("engine") or 0.0)
+                                        if ev_w_q > 0.0:
+                                            hp_list.append((int(hz_q), float(lat_q["mean"]), ev_w_q))
+                                    post_cache[pck] = hp_list
+                                    if len(post_cache) > 4096:
+                                        post_cache.clear()
+                                        post_cache[pck] = hp_list
+                                h_posts_ep = post_cache[pck]
+
+                                if h_posts_ep:
+                                    st_ep["saw_informed"] = True
+                                    sf_t = state_features(
+                                        entry=ep_ask_v,
+                                        mark=bid_c,
+                                        net=net_c,
+                                        mfe=st_ep["mfe_t"],
+                                        mae=st_ep["mae_t"],
+                                        high_water=st_ep["hw"],
+                                        prev_net=st_ep["prev_n"],
+                                        age_sec=age_s,
+                                    )
+                                    informed_t: list[dict[str, Any]] = []
+                                    for hz_i, p_mean, ev_w_i in h_posts_ep:
+                                        rf = max(0.0, 1.0 - age_s / float(hz_i)) if hz_i > 0 else 1.0
+                                        p_adj = p_mean * rf if p_mean > 0.0 else p_mean
+                                        rd = _ridge_dot(mem_ridge.get(hz_i) or _blank_ridge(), sf_t, ct_b, DAY_ENGINE)
+                                        informed_t.append(
+                                            {
+                                                "horizon": hz_i,
+                                                "posterior": p_adj,
+                                                "ridge": rd,
+                                                "evidence": ev_w_i,
+                                                "rem_fade": max(0.10, rf),
+                                                "value": p_adj + rd,
+                                            }
+                                        )
+                                    adv_t = _aggregate_informed(
+                                        informed_t,
+                                        engine_id=DAY_ENGINE,
+                                        setup=c_ep["stp_full"],
+                                        features=sf_t,
+                                        age_sec=age_s,
+                                        how="tactical",
+                                    )
+                                    st_ep["sim_net"] = net_c
+                                    st_ep["sim_exit_ts"] = ct_b
+                                    if adv_t < 0.0 or age_s >= float(DAY_TACTICAL_MAX_HORIZON_SEC):
+                                        st_ep["exited"] = True
+                                st_ep["prev_n"] = net_c
+
+                                if not st_ep["exited"]:
+                                    nxt_i = k_bar + 1
+                                    if nxt_i < len(rb_ep):
+                                        nxt_ct = rb_ep[nxt_i][0] + 60.0
+                                        if nxt_ct <= cutoff and (nxt_ct - c_ep["dec_t"]) <= float(DAY_TACTICAL_MAX_HORIZON_SEC) + 120.0:
+                                            st_ep["idx"] = nxt_i
+                                            heapq.heappush(bar_heap, (nxt_ct, rid_s))
+
+                            for rid_f, st_f in ep_states.items():
+                                if not st_f["saw_informed"]:
+                                    continue
+                                dec_f_t = st_f["cand"]["dec_t"]
+                                if not st_f["exited"] and cutoff < dec_f_t + float(DAY_TACTICAL_MAX_HORIZON_SEC):
+                                    pretactical_outcomes[rid_f] = ("UNRESOLVED_AT_CUTOFF", 0.0, cutoff)
+                                elif st_f["sim_net"] is not None and st_f["sim_exit_ts"] is not None and st_f["sim_exit_ts"] <= cutoff:
+                                    pretactical_outcomes[rid_f] = ("RESOLVED", float(st_f["sim_net"]), float(st_f["sim_exit_ts"]))
 
         touched_cells: set[tuple[str, str]] = set()
         applied = 0
@@ -1421,101 +1734,13 @@ def apply_resolved_entry_policy_v3_labels(
                 w_fit = 1.0 if is_real else (float(p["specific_weight"]) / float(n_sib))
                 target_val = _finite_float(p.get("target"))
 
-                snap_raw, ep_spread, ep_ask, ep_fee = snap_by_id.get(rid, ("{}", None, None, None))
-                if (
-                    not is_real
-                    and pop == POPULATION_DETECTOR_FIRED
-                    and bars_1m_by_sym
-                    and sym in bars_1m_by_sym
-                    and (tactical_cutover_ts is None or dec_t < tactical_cutover_ts)
-                    and ep_ask is not None
-                    and ep_ask > 0.0
-                ):
-                    from backend.services.adaptive_learning import estimate as _al_estimate
-                    from backend.services.exact_policy_capture import realized_policy_net
-
-                    cts_1m, rb_1m = bars_1m_by_sym[sym]
-                    i0 = bisect.bisect_right(cts_1m, dec_t)
-                    if i0 < len(rb_1m) and cts_1m[i0] <= dec_t + 300.0:
-                        hour_bucket = int(dec_t // 3600.0)
-                        ckey_p = (sym, stp_full, reg, hour_bucket)
-                        if ckey_p not in tactical_post_cache:
-                            h_posts: list[tuple[int, float, float]] = []
-                            for hz in horizons_for(DAY_ENGINE):
-                                vw = _al_estimate(db_path, DAY_ENGINE, sym, stp_full, reg, metric_name(hz), now=dec_t, include_engine=True)
-                                ev_w = float(vw.get("level_weights", {}).get("engine") or 0.0)
-                                if ev_w > 0.0:
-                                    h_posts.append((int(hz), float(vw["mean"]), ev_w))
-                            tactical_post_cache[ckey_p] = h_posts
-                        h_posts = tactical_post_cache[ckey_p]
-                        if h_posts:
-                            spr_use = ep_spread if (ep_spread is not None and ep_spread >= 0.0) else 0.0001
-                            fee_use = ep_fee if (ep_fee is not None and ep_fee >= 0.0) else 0.00033
-                            hw = ep_ask
-                            mfe_t = 0.0
-                            mae_t = 0.0
-                            prev_n = realized_policy_net(ep_ask, ep_ask * (1.0 - spr_use), fee_use)
-                            sim_net: float | None = None
-                            sim_exit_ts: float | None = None
-                            exited_by_policy = False
-                            for k_bar in range(i0, len(rb_1m)):
-                                ot_b, _bo, bh_b, bl_b, bc_b = rb_1m[k_bar]
-                                ct_b = ot_b + 60.0
-                                if ct_b > cutoff:
-                                    break
-                                age_s = ct_b - dec_t
-                                bid_hi = bh_b * (1.0 - spr_use * 0.5)
-                                bid_lo = bl_b * (1.0 - spr_use * 0.5)
-                                bid_c = bc_b * (1.0 - spr_use * 0.5)
-                                hw = max(hw, bh_b)
-                                net_c = realized_policy_net(ep_ask, bid_c, fee_use)
-                                mfe_t = max(mfe_t, realized_policy_net(ep_ask, bid_hi, fee_use))
-                                mae_t = max(mae_t, 0.0, -realized_policy_net(ep_ask, bid_lo, fee_use))
-                                sf_t = state_features(
-                                    entry=ep_ask,
-                                    mark=bid_c,
-                                    net=net_c,
-                                    mfe=mfe_t,
-                                    mae=mae_t,
-                                    high_water=hw,
-                                    prev_net=prev_n,
-                                    age_sec=age_s,
-                                )
-                                informed_t: list[dict[str, Any]] = []
-                                for hz, post_mean, ev_w in h_posts:
-                                    rf = max(0.0, 1.0 - age_s / float(hz)) if hz > 0 else 1.0
-                                    p_adj = post_mean * rf if post_mean > 0.0 else post_mean
-                                    rd = _ridge_dot(tactical_ridge.get(str(hz)) or _blank_ridge(), sf_t, ct_b, DAY_ENGINE)
-                                    informed_t.append(
-                                        {
-                                            "horizon": hz,
-                                            "posterior": p_adj,
-                                            "ridge": rd,
-                                            "evidence": ev_w,
-                                            "rem_fade": max(0.10, rf),
-                                            "value": p_adj + rd,
-                                        }
-                                    )
-                                adv_t = _aggregate_informed(
-                                    informed_t,
-                                    engine_id=DAY_ENGINE,
-                                    setup=stp_full,
-                                    features=sf_t,
-                                    age_sec=age_s,
-                                    how="tactical",
-                                )
-                                prev_n = net_c
-                                sim_net = net_c
-                                sim_exit_ts = ct_b
-                                if adv_t < 0.0 or age_s >= float(DAY_TACTICAL_MAX_HORIZON_SEC):
-                                    exited_by_policy = True
-                                    break
-                            if not exited_by_policy and cutoff < dec_t + float(DAY_TACTICAL_MAX_HORIZON_SEC):
-                                # Strictly causal: tactical trajectory has not yet closed by cutoff.
-                                continue
-                            if sim_net is not None and sim_exit_ts is not None and sim_exit_ts <= cutoff:
-                                target_val = float(sim_net)
-                                avail_t = max(avail_t, float(sim_exit_ts))
+                snap_raw, ep_spread, _ep_ask, _ep_fee = snap_by_id.get(rid, ("{}", None, None, None))
+                pt_out = pretactical_outcomes.get(rid)
+                if pt_out is not None:
+                    if pt_out[0] == "UNRESOLVED_AT_CUTOFF":
+                        continue
+                    target_val = pt_out[1]
+                    avail_t = max(avail_t, pt_out[2])
 
                 if p.get("fold") and w_fit > 0.0 and target_val is not None:
                     try:

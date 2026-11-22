@@ -413,3 +413,167 @@ def test_scalp_zero_claim_negative_market_edge_gate_and_same_setup_calibration(t
     defaults = pe._get_default_symbol_constraints()
     assert defaults["BTC/USDT"]["qty_step"] == pytest.approx(0.00001)
     assert defaults["BTCUSDT"]["qty_step"] == pytest.approx(0.00001)
+
+
+def test_v3_pretactical_reconstruction_blocks_future_hindsight_state(tmp_path):
+    """Future continuation_advantage_log labels (label_time > bar_close_ts) must never leak into earlier episode reconstruction, and funded episodes remain immutable."""
+    import json
+    import sqlite3 as _sq
+    import time
+
+    from backend.services import adaptive_learning as al
+    from backend.services.continuation_surface import ADVANTAGE_VERSION
+    from backend.services.day_v2.entry_policy_value_v3 import rebuild_entry_policy_value_v3
+    from backend.services.exact_policy_capture import CAPTURE, ensure_capture_schema
+
+    def _build_base_db(db_file: str, *, inject_future_poison: bool) -> float:
+        dec_t = T0 + 3600.0
+        conn = _sq.connect(db_file)
+        ensure_capture_schema(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS continuation_learning_meta (
+                engine_id TEXT NOT NULL,
+                economic_version TEXT NOT NULL,
+                learning_version TEXT NOT NULL,
+                source TEXT NOT NULL,
+                code_sha TEXT NOT NULL,
+                installed_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                label_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (engine_id, economic_version)
+            )
+            """
+        )
+        cutover_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dec_t + 80000.0))
+        conn.execute(
+            "INSERT OR REPLACE INTO continuation_learning_meta VALUES (?, ?, ?, ?, '7c4e990', ?, ?, 100)",
+            ("DAY_V2", al.current_economic_version("DAY_V2"), ADVANTAGE_VERSION, "horizon_hold_advantage:tactical", cutover_iso, cutover_iso),
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS continuation_advantage_log (
+                engine_id TEXT, trade_id TEXT, snapshot_time REAL, horizon INTEGER,
+                symbol TEXT, setup TEXT, regime TEXT, features_json TEXT,
+                advantage REAL, weight REAL, label_time REAL, feature_version TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feature_ohlcv (
+                symbol TEXT NOT NULL, interval TEXT NOT NULL, ts TEXT NOT NULL,
+                open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, volume REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS policy_episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_id INTEGER UNIQUE, kind TEXT, engine_id TEXT, symbol TEXT,
+                setup TEXT, regime TEXT, decided_at REAL, entry_ask REAL, entry_bid REAL,
+                entry_spread REAL, roundtrip_cost REAL, snapshot_json TEXT, status TEXT,
+                exit_bid REAL, exit_at REAL, label_available_at REAL, exit_reason TEXT,
+                gross REAL, net REAL, planning_net REAL, label_taker_fee REAL,
+                capture_version TEXT, train_eligible INTEGER DEFAULT 1, funded INTEGER DEFAULT 0,
+                entry_policy_learned INTEGER DEFAULT 0, entry_policy_v2_learned INTEGER DEFAULT 0,
+                entry_policy_v3_learned INTEGER DEFAULT 0
+            )
+            """
+        )
+        # Causal past continuation labels (label_time <= dec_t): positive tactical hold advantage (+8..+15 bps)
+        f_e0 = {"net": -0.00066, "mfe": 0.0, "mae": 0.0, "giveback": 0.0, "dist_high": 0.0, "slope": 0.0, "age_min": 0.0}
+        f_p1 = {"net": 0.0008, "mfe": 0.0014, "mae": 0.0001, "giveback": 0.0, "dist_high": 0.0, "slope": 0.0003, "age_min": 3.0}
+        f_p2 = {"net": -0.0009, "mfe": 0.0002, "mae": 0.0012, "giveback": 0.0002, "dist_high": 0.0010, "slope": -0.0003, "age_min": 12.0}
+        for h, adv in ((900, 0.0008), (1800, 0.0015), (3600, 0.0012), (7200, 0.0005), (14400, -0.0025)):
+            conn.execute(
+                """
+                INSERT INTO continuation_advantage_log
+                (engine_id, trade_id, snapshot_time, horizon, symbol, setup, regime, features_json, advantage, weight, label_time, feature_version)
+                VALUES ('DAY_V2', 'past_e0', ?, ?, 'BTCUSDT', 'BREAKOUT_CONTINUATION', 'btcup_vollo', ?, ?, 12.0, ?, ?)
+                """,
+                (T0, h, json.dumps(f_e0), adv, T0 + 1800.0, ADVANTAGE_VERSION),
+            )
+            conn.execute(
+                """
+                INSERT INTO continuation_advantage_log
+                (engine_id, trade_id, snapshot_time, horizon, symbol, setup, regime, features_json, advantage, weight, label_time, feature_version)
+                VALUES ('DAY_V2', 'past_p1', ?, ?, 'BTCUSDT', 'BREAKOUT_CONTINUATION', 'btcup_vollo', ?, ?, 4.0, ?, ?)
+                """,
+                (T0 + 60.0, h, json.dumps(f_p1), adv, T0 + 1860.0, ADVANTAGE_VERSION),
+            )
+            conn.execute(
+                """
+                INSERT INTO continuation_advantage_log
+                (engine_id, trade_id, snapshot_time, horizon, symbol, setup, regime, features_json, advantage, weight, label_time, feature_version)
+                VALUES ('DAY_V2', 'past_p2', ?, ?, 'BTCUSDT', 'BREAKOUT_CONTINUATION', 'btcup_vollo', ?, -0.0005, 4.0, ?, ?)
+                """,
+                (T0 + 120.0, h, json.dumps(f_p2), T0 + 1920.0, ADVANTAGE_VERSION),
+            )
+        if inject_future_poison:
+            # Future hindsight continuation labels (label_time = dec_t + 50000s, AFTER trajectory finished): massive -500 bps
+            for h in (900, 1800, 3600, 7200):
+                conn.execute(
+                    """
+                    INSERT INTO continuation_advantage_log
+                    (engine_id, trade_id, snapshot_time, horizon, symbol, setup, regime, features_json, advantage, weight, label_time, feature_version)
+                    VALUES ('DAY_V2', 'future_poison', ?, ?, 'BTCUSDT', 'BREAKOUT_CONTINUATION', 'btcup_vollo', ?, -0.0500, 200.0, ?, ?)
+                    """,
+                    (dec_t + 40000.0, h, json.dumps(f_e0), dec_t + 50000.0, ADVANTAGE_VERSION),
+                )
+        # 1m bars rising +50 bps over 10m, then rolling over so winner rollover guard locks profit around m=17 (+25 bps net)
+        for m in range(30):
+            bar_open_t = dec_t + m * 60.0
+            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(bar_open_t))
+            px = 100.0 + min(m, 10) * 0.05 - max(0, m - 10) * 0.025
+            conn.execute(
+                "INSERT INTO feature_ohlcv (symbol, interval, ts, open, high, low, close, volume) VALUES (?, '1m', ?, ?, ?, ?, ?, 10.0)",
+                ("BTCUSDT", ts_str, px, px + 0.01, px - 0.01, px),
+            )
+        # Update cutover timestamp in continuation_learning_meta so dec_t < tactical_cutover_ts
+        conn.execute(
+            "UPDATE continuation_learning_meta SET updated_at=? WHERE engine_id='DAY_V2'",
+            (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dec_t + 80000.0)),),
+        )
+        # Unfunded pre-cutover DETECTOR_FIRED episode
+        conn.execute(
+            """
+            INSERT INTO policy_episodes (
+                candidate_id, kind, engine_id, symbol, setup, regime, decided_at, entry_ask, entry_bid,
+                entry_spread, roundtrip_cost, snapshot_json, status, exit_bid, exit_at, label_available_at,
+                exit_reason, gross, net, planning_net, label_taker_fee, capture_version, train_eligible, funded
+            ) VALUES (201, 'COUNTERFACTUAL_POLICY_OUTCOME', 'DAY_V2', 'BTCUSDT', 'BREAKOUT_CONTINUATION', 'btcup_vollo',
+                      ?, 100.0, 99.99, 0.0001, 0.00066, '{}', 'CLOSED', 99.95, ?, ?, 'LEARNED_CONTINUATION_EXIT',
+                      -0.0005, -0.00116, -0.00116, 0.00033, ?, 1, 0)
+            """,
+            (dec_t, dec_t + 90.0, dec_t + 90.0, CAPTURE),
+        )
+        # Funded historical episode in a separate 15m bar (must remain 100% immutable!)
+        conn.execute(
+            """
+            INSERT INTO policy_episodes (
+                candidate_id, kind, engine_id, symbol, setup, regime, decided_at, entry_ask, entry_bid,
+                entry_spread, roundtrip_cost, snapshot_json, status, exit_bid, exit_at, label_available_at,
+                exit_reason, gross, net, planning_net, label_taker_fee, capture_version, train_eligible, funded
+            ) VALUES (202, 'FUNDED_POLICY_OUTCOME', 'DAY_V2', 'BTCUSDT', 'BREAKOUT_CONTINUATION', 'btcup_vollo',
+                      ?, 100.0, 99.99, 0.0001, 0.00066, '{}', 'CLOSED', 100.25, ?, ?, 'LEARNED_CONTINUATION_EXIT',
+                      0.0025, 0.00184, 0.00184, 0.00033, ?, 1, 1)
+            """,
+            (dec_t + 1800.0, dec_t + 2400.0, dec_t + 2400.0, CAPTURE),
+        )
+        conn.commit()
+        conn.close()
+        # Rebuild at cutoff = dec_t + 90000s (when future_poison is ALREADY in DB <= cutoff, yet > episode exit!)
+        rebuild_entry_policy_value_v3(db_file, now=dec_t + 90000.0)
+        rc = _sq.connect(db_file)
+        t201 = rc.execute("SELECT target FROM entry_policy_v3_observations WHERE episode_id=(SELECT id FROM policy_episodes WHERE candidate_id=201)").fetchone()[0]
+        t202 = rc.execute("SELECT target FROM entry_policy_v3_observations WHERE episode_id=(SELECT id FROM policy_episodes WHERE candidate_id=202)").fetchone()[0]
+        rc.close()
+        assert t202 == pytest.approx(0.00184, abs=1e-12)
+        return float(t201)
+
+    clean_target = _build_base_db(str(tmp_path / "clean.db"), inject_future_poison=False)
+    poisoned_target = _build_base_db(str(tmp_path / "poisoned.db"), inject_future_poison=True)
+    assert clean_target > 0.0
+    assert poisoned_target == pytest.approx(clean_target, abs=1e-12)
