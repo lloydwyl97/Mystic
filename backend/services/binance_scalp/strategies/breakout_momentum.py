@@ -46,12 +46,15 @@ class BreakoutMomentumStrategy:
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_CONFIRMED")
 
         move_from_low = (cur - min(b["low"] for b in recent)) / cur if cur > 0 else 0
-        if move_from_low > 0.006:
+        atr_1m_pct = sum((float(b["high"]) - float(b["low"])) for b in recent) / (len(recent) * cur) if (recent and cur > 0) else 0.0015
+        vol_boost = min(1.85, max(1.0, 0.85 + 0.22 * vol_expansion))
+        max_chase = max(0.012, min(0.025, 3.5 * max(range_pct, atr_1m_pct) * vol_boost))
+        if move_from_low > max_chase:
             return reject_signal(ctx, self.name, "MOVE_EXHAUSTED_CHASE")
 
-        structural = min(range_pct * 0.55, 0.005)
+        structural = min(max(range_pct * 0.75, atr_1m_pct * 1.60) * vol_boost, 0.0180)
 
-        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.65, cap_pct=0.006)
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.85 * vol_boost, cap_pct=0.0180)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)

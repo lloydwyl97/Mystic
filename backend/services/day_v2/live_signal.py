@@ -193,22 +193,16 @@ def _bb_pct(closes: list[float], n: int = 20, k: float = 2.0) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def _detect_setup(
+def _detect_all_setups(
     *,
     bars_15m: list[dict[str, Any]],
     bars_1h: list[dict[str, Any]],
     bars_4h: list[dict[str, Any]],
     idx: int,
-) -> tuple[str, float, float, str, bool] | None:
-    """Evaluate setup families at the closed bar at position idx.
-
-    Returns (setup_name, structural_anchor, target_price, regime, h1_bullish)
-    or None.
-
-    Uses ONLY bars[0..idx]. Caller must not pass future bars.
-    """
+) -> list[tuple[str, float, float, str, bool]]:
+    """Evaluate all matching setup families at closed bar idx (causal: bars[0..idx] only)."""
     if idx < 30:
-        return None
+        return []
 
     b0 = bars_15m[idx]  # the just-closed signal bar
     b1 = bars_15m[idx - 1]
@@ -230,7 +224,7 @@ def _detect_setup(
     prior_high = prior_structure_high(highs_15m)
 
     if rsi is None or atr is None or bb is None or sma20 is None:
-        return None
+        return []
 
     # 4H regime: last 4H bar relative to 10-bar SMA
     regime = "neutral"
@@ -257,28 +251,34 @@ def _detect_setup(
 
     b1c = float(b1["close"])
     b2c = float(b2["close"])
+    matched: list[tuple[str, float, float, str, bool]] = []
 
     # 1. HTF_TREND_PULLBACK
     # Bull 4H + 1H bullish + first green bar + near SMA20 + RSI recovering
     if regime == "bull" and h1_bullish and c0 > b1c and c0 < sma20 * 1.005 and 30 < rsi < 55 and SETUP_HTF_TREND_PULLBACK in ENABLED_SETUPS:
         anchor = c0 - 1.5 * atr
         target = c0 + 2.5 * atr
-        return (SETUP_HTF_TREND_PULLBACK, anchor, target, regime, h1_bullish)
+        matched.append((SETUP_HTF_TREND_PULLBACK, anchor, target, regime, h1_bullish))
 
     # 2. RANGE_BOUNCE
     # Near-range-low + low BB + oversold RSI + first green bar
     if regime in ("neutral", "bear") and low20 is not None and c0 > b1c and c0 < low20 * 1.005 and bb < 0.30 and rsi < 45 and SETUP_RANGE_BOUNCE in ENABLED_SETUPS:
         anchor = low20 * 0.995
         target = c0 + 2.0 * atr
-        return (SETUP_RANGE_BOUNCE, anchor, target, regime, h1_bullish)
+        matched.append((SETUP_RANGE_BOUNCE, anchor, target, regime, h1_bullish))
 
     # 3. BREAKOUT_CONTINUATION
     # Decisive close above the high of the 20 closed bars BEFORE the signal bar,
-    # two consecutive up bars. The signal bar is excluded from the level it breaks.
-    if regime in ("bull", "neutral") and prior_high is not None and c0 > prior_high * BREAKOUT_BUFFER and rsi < 72 and c0 > b1c > b2c and SETUP_BREAKOUT_CONTINUATION in ENABLED_SETUPS:
+    # two consecutive up bars OR a >=1.0x ATR expansion breakout candle; allows
+    # rebound breakouts out of bear 4H when 1H structure has already turned bullish,
+    # and bounds structural extension above prior_high rather than penalizing low-loss consolidation RSI.
+    breakout_regime_ok = regime in ("bull", "neutral") or h1_bullish
+    breakout_impulse_ok = c0 > b1c and (b1c > b2c or (c0 - b1c) >= 1.0 * atr)
+    max_breakout_ext = (prior_high * max(1.035, 1.0 + 4.0 * (atr / max(prior_high, 1e-9)))) if prior_high is not None else 0.0
+    if breakout_regime_ok and prior_high is not None and (prior_high * BREAKOUT_BUFFER) < c0 <= max_breakout_ext and breakout_impulse_ok and SETUP_BREAKOUT_CONTINUATION in ENABLED_SETUPS:
         anchor = prior_high * 0.995
-        target = c0 + 2.0 * atr
-        return (SETUP_BREAKOUT_CONTINUATION, anchor, target, regime, h1_bullish)
+        target = c0 + 2.5 * atr
+        matched.append((SETUP_BREAKOUT_CONTINUATION, anchor, target, regime, h1_bullish))
 
     # 4. VWAP_REVERSION
     # Oversold bounce after a decline, target SMA20
@@ -286,7 +286,7 @@ def _detect_setup(
         anchor = l0 * 0.998
         target = sma20
         if target > c0 * 1.003:
-            return (SETUP_VWAP_REVERSION, anchor, target, regime, h1_bullish)
+            matched.append((SETUP_VWAP_REVERSION, anchor, target, regime, h1_bullish))
 
     # 5. EXHAUSTION_MR — long mean reversion after a downside momentum spike.
     # The prior bar closed >= 2% below the bar before it with RSI already weak
@@ -297,9 +297,29 @@ def _detect_setup(
         anchor = l0 * 0.997
         target = sma20
         if target > c0 * 1.002:
-            return (SETUP_EXHAUSTION_MR, anchor, target, regime, h1_bullish)
+            matched.append((SETUP_EXHAUSTION_MR, anchor, target, regime, h1_bullish))
 
-    return None
+    return matched
+
+
+def _detect_setup(
+    *,
+    bars_15m: list[dict[str, Any]],
+    bars_1h: list[dict[str, Any]],
+    bars_4h: list[dict[str, Any]],
+    idx: int,
+) -> tuple[str, float, float, str, bool] | None:
+    """Evaluate setup families at the closed bar at position idx.
+
+    Returns (setup_name, structural_anchor, target_price, regime, h1_bullish)
+    or None.
+
+    Uses ONLY bars[0..idx]. Caller must not pass future bars.
+     Note: EXHAUSTION_MR is a long mean reversion after a downside momentum spike:
+    b1c < b2c * (1.0 - EXHAUSTION_SPIKE_PCT) and c0 > b1c.
+    """
+    hits = _detect_all_setups(bars_15m=bars_15m, bars_1h=bars_1h, bars_4h=bars_4h, idx=idx)
+    return hits[0] if hits else None
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +369,31 @@ def evaluate_entry_signal(
 
     setup_name, anchor, target, regime, h1_bullish = result
     return _pack_signal(symbol, setup_name, regime, anchor, target, atr, int(_signal_bar_ts(bars_15m[idx])), h1_bullish, bars_15m, bars_1h, bars_4h)
+
+
+def evaluate_all_entry_signals(
+    symbol: str,
+    bars_15m: list[dict[str, Any]],
+    bars_1h: list[dict[str, Any]],
+    bars_4h: list[dict[str, Any]],
+) -> list[DayV2Signal]:
+    """Return every setup family whose detector fired on the last closed 15m bar."""
+    if len(bars_15m) < 32:
+        return []
+    try:
+        idx = len(bars_15m) - 1
+        window_start = max(0, idx - 50)
+        highs = [float(b["high"]) for b in bars_15m[window_start : idx + 1]]
+        lows = [float(b["low"]) for b in bars_15m[window_start : idx + 1]]
+        closes = [float(b["close"]) for b in bars_15m[window_start : idx + 1]]
+    except (KeyError, TypeError, ValueError):
+        return []
+    atr = _atr(highs, lows, closes, 14)
+    if not atr or atr <= 0:
+        return []
+    hits = _detect_all_setups(bars_15m=bars_15m, bars_1h=bars_1h, bars_4h=bars_4h, idx=idx)
+    bar_ts = int(_signal_bar_ts(bars_15m[idx]))
+    return [_pack_signal(symbol, setup_name, regime, anchor, target, atr, bar_ts, h1_bullish, bars_15m, bars_1h, bars_4h) for setup_name, anchor, target, regime, h1_bullish in hits]
 
 
 def _pack_signal(
@@ -530,11 +575,14 @@ def explain_no_signal(
             "unmet": [
                 item
                 for item, ok in (
-                    ("regime_not_bull_or_neutral", regime in ("bull", "neutral")),
+                    ("regime_not_bull_neutral_or_1h_bullish", regime in ("bull", "neutral") or h1_bullish),
                     ("no_prior_high20", prior_high is not None),
                     ("close_not_above_prior_20bar_high", prior_high is not None and c0 > prior_high * BREAKOUT_BUFFER),
-                    ("rsi_not_below_72", rsi < 72),
-                    ("not_two_up_bars", c0 > b1c > b2c),
+                    (
+                        "breakout_overextended",
+                        prior_high is not None and c0 <= prior_high * max(1.035, 1.0 + 4.0 * (atr / max(prior_high, 1e-9))),
+                    ),
+                    ("not_breakout_impulse", c0 > b1c and (b1c > b2c or (c0 - b1c) >= 1.0 * atr)),
                 )
                 if not ok
             ],

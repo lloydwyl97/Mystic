@@ -38,6 +38,8 @@ def decide_day_continuation(
     runner_activation_mult: float = 1.0,
     runner_trail_mult: float = 1.0,
     runner_tighten_mult: float = 1.0,
+    live_obi: float = 0.0,
+    live_flow: float = 0.0,
     now: float | None = None,
 ) -> dict[str, Any]:
     """HOLD or EXIT for one DAY position state. ``mark`` is the executable bid."""
@@ -55,6 +57,10 @@ def decide_day_continuation(
         prev_net=prev_net,
         age_sec=max(0.0, float(age_sec)),
     )
+    if live_obi != 0.0:
+        features["live_obi"] = float(live_obi)
+    if live_flow != 0.0:
+        features["live_flow"] = float(live_flow)
     from backend.services.adaptive_learning import continuation_terminal
     from backend.services.continuation_surface import ADVANTAGE_VERSION, advantage_authority, installed_aggregator, surface_trace
 

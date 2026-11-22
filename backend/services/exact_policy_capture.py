@@ -836,10 +836,18 @@ def live_day_decision(db_path: str, position: Any, current_price: float, roundtr
     if not isinstance(adapt, dict):
         adapt = {}
     learned = str(adapt.get("setup") or getattr(position, "entry_thesis", "") or "")
+    cur_net = ((mark - entry) / entry - float(roundtrip_cost)) if entry > 0 else 0.0
+    from backend.services.continuation_surface import read_live_exit_micro, rolling_position_prev_net
+
+    roll_prev = rolling_position_prev_net(position, cur_net, moment)
     prev = _heartbeat_prev_net(db_path, str(getattr(position, "trade_id", "") or ""))
+    if prev is None:
+        prev = roll_prev
+    sym_str = str(getattr(position, "symbol", "") or "")
+    live_micro = read_live_exit_micro(sym_str, now_ts=moment)
     decision = decide_day_continuation(
         db_path,
-        symbol=str(getattr(position, "symbol", "") or ""),
+        symbol=sym_str,
         setup=learned,
         exit_setup=str(getattr(position, "entry_thesis", "") or learned),
         regime=str(adapt.get("regime") or ""),
@@ -861,6 +869,8 @@ def live_day_decision(db_path: str, position: Any, current_price: float, roundtr
         runner_activation_mult=_float(adapt.get("runner_activation_mult"), 1.0),
         runner_trail_mult=_float(adapt.get("runner_trail_mult"), 1.0),
         runner_tighten_mult=_float(adapt.get("runner_tighten_mult"), 1.0),
+        live_obi=float(live_micro.get("live_obi") or 0.0),
+        live_flow=float(live_micro.get("live_flow") or 0.0),
         now=moment,
     )
     try:

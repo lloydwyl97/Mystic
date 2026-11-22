@@ -1752,18 +1752,22 @@ class PortfolioEngineIntegration:
                     bars_1h = await _asyncio.to_thread(_load, "1h", 20)
                     bars_4h = await _asyncio.to_thread(_load, "4h", 15)
 
+                    from backend.services.day_v2.live_signal import context_entry_signals, evaluate_all_entry_signals
+
                     fired = evaluate_entry_signal(symbol, bars_15m, bars_1h, bars_4h)
+                    fired_all = evaluate_all_entry_signals(symbol, bars_15m, bars_1h, bars_4h) if fired is not None else []
+                    fired_setups = {str(s.setup) for s in fired_all if s is not None}
                     if fired is not None:
+                        fired_setups.add(str(fired.setup))
                         with contextlib.suppress(Exception):
                             from backend.services.full_state_research import annotate_setup
 
                             annotate_setup(db_path, "DAY_V2", symbol, as_of, str(fired.setup))
-                    from backend.services.day_v2.live_signal import context_entry_signals
 
                     contexts = context_entry_signals(symbol, bars_15m, bars_1h, bars_4h)
                     signals: list[Any] = []
                     seen: set[str] = set()
-                    for signal in ([fired] if fired is not None else []) + contexts:
+                    for signal in ([fired] if fired is not None else []) + list(fired_all) + contexts:
                         if signal is None or signal.setup in seen:
                             continue
                         seen.add(signal.setup)
@@ -1827,7 +1831,7 @@ class PortfolioEngineIntegration:
                             as_of=as_of,
                             bars_15m=bars_15m,
                             bars_1h=bars_1h,
-                            detector_fired=signal is fired,
+                            detector_fired=signal is fired or str(signal.setup) in fired_setups,
                             ask_at=ask_at,
                             regime_tag=regime_tag,
                         )
@@ -3158,8 +3162,64 @@ class PortfolioEngineIntegration:
             for p in list(self.engine.open_positions.values())
         )
 
+    def _poll_active_day_winner_rollover(self) -> bool:
+        """Ratchet active DAY_V2 high-water marks every 2s from local book and wake exit pass on rollover/catastrophic."""
+        if not self.engine:
+            return False
+        day_lots = [
+            p
+            for p in list(self.engine.open_positions.values())
+            if str(getattr(p, "engine_id", "") or "") == "DAY_V2" and getattr(p, "status", "ACTIVE") != "DUST_PENDING" and float(getattr(p, "quantity", 0.0) or 0.0) > 0
+        ]
+        if not day_lots:
+            return False
+        try:
+            from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST
+            from backend.services.continuation_surface import day_progressive_rollover_frac
+            from backend.services.day_v2.live_exit_evaluator import catastrophic_threshold_price
+            from backend.services.exact_policy_capture import executable_book
+
+            now_mono = time.monotonic()
+            wake_cd = getattr(self, "_day_fast_wake_until", None)
+            if not isinstance(wake_cd, dict):
+                wake_cd = {}
+                self._day_fast_wake_until = wake_cd
+            for pos in day_lots:
+                sym = str(getattr(pos, "symbol", "") or "")
+                entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+                if not sym or entry <= 0.0:
+                    continue
+                bid, _ask = executable_book(sym)
+                if not bid or float(bid) <= 0.0:
+                    continue
+                b = float(bid)
+                prev_hw = float(getattr(pos, "highest_price", 0.0) or entry)
+                hw = max(prev_hw, b, entry)
+                if hw > prev_hw:
+                    pos.highest_price = hw
+                prev_lo = float(getattr(pos, "lowest_price", 0.0) or b)
+                if prev_lo <= 0.0 or b < prev_lo:
+                    pos.lowest_price = b
+                if now_mono < float(wake_cd.get(sym, 0.0)):
+                    continue
+                atr_e = float(getattr(pos, "atr_at_entry", 0.0) or 0.0)
+                anch = float(getattr(pos, "thesis_invalid_level", 0.0) or 0.0)
+                if atr_e > 0.0 and b <= catastrophic_threshold_price(entry, atr_e, anch):
+                    wake_cd[sym] = now_mono + 4.0
+                    return True
+                mfe = max(0.0, (hw - entry) / entry)
+                gross = (b - entry) / entry
+                net = gross - float(ESTIMATED_ROUNDTRIP_COST)
+                gb = max(0.0, mfe - max(gross, 0.0))
+                if mfe >= 0.0028 and net > 0.0 and gb >= day_progressive_rollover_frac(mfe) * mfe:
+                    wake_cd[sym] = now_mono + 4.0
+                    return True
+        except Exception:
+            logger.debug("DAY_FAST_ROLLOVER_POLL_SKIPPED", exc_info=True)
+        return False
+
     async def _scalp_fast_exit_wait(self, wait_sec: float) -> None:
-        """Wait out the full-pass interval, checking active SCALP lots on the SCALP cadence."""
+        """Wait out the full-pass interval, checking active SCALP lots and DAY winner rollovers on the 2s cadence."""
         from backend.services.scalp_v2.exit_evaluator import SCALP_V2_EXIT_MONITOR_INTERVAL_SEC
 
         fast = max(0.5, float(SCALP_V2_EXIT_MONITOR_INTERVAL_SEC))
@@ -3190,6 +3250,8 @@ class PortfolioEngineIntegration:
                 return
             if self._has_active_scalp_lot():
                 await self._monitor_positions_once(refresh_market_data=False, engine_ids=frozenset({"SCALP_V2"}))
+            if self._poll_active_day_winner_rollover():
+                return
 
     async def _position_monitor_loop(self) -> None:
         """Monitor positions and execute exits"""

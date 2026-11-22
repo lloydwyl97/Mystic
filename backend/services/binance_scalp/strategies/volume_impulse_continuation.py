@@ -41,9 +41,13 @@ class VolumeImpulseContinuationStrategy:
         if not (impulse and price_up):
             return reject_signal(ctx, self.name, "NO_VOLUME_IMPULSE")
 
-        structural = 0.0026
+        vol_ratio = vol_recent / max(vol_prior, 1e-12)
+        cur = max(ctx.snap.mid, 1e-9)
+        impulse_span = (max(float(b["high"]) for b in bars[-2:]) - min(float(b["low"]) for b in bars[-3:])) / cur
+        vol_boost = min(1.80, max(1.0, 0.80 + 0.20 * vol_ratio))
+        structural = min(max(0.0028, impulse_span * 0.85 * vol_boost), 0.0160)
 
-        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.70, cap_pct=0.006)
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.80 * vol_boost, cap_pct=0.0160)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,
@@ -53,7 +57,6 @@ class VolumeImpulseContinuationStrategy:
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
-        vol_ratio = vol_recent / max(vol_prior, 1e-12)
         mom = ctx.mom
         score = 2.40 + min(0.8, vol_ratio * 0.15) + max(0.0, mom.mid_change_15s) * 3000.0
         return pass_signal(

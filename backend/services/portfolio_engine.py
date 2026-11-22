@@ -2414,23 +2414,30 @@ def _previous_heartbeat_net(db_path: str | None, trade_id: str | None) -> float 
 
 def _continuation_features(position: Any, *, entry_price: float, mark: float, net: float, db_path: str | None = None) -> dict[str, float]:
     """Position state for the continuation surface. Missing fields stay at 0 and are not a gate."""
-    from backend.services.continuation_surface import state_features
+    from backend.services.continuation_surface import read_live_exit_micro, rolling_position_prev_net, state_features
 
+    now_ts = time.time()
     highest = float(getattr(position, "highest_price", 0.0) or entry_price)
     lowest = float(getattr(position, "lowest_price", 0.0) or mark)
     entry_time = float(getattr(position, "entry_time", 0.0) or 0.0)
     gross_mfe = ((highest - entry_price) / entry_price) if entry_price and highest else 0.0
     gross_mae = ((entry_price - lowest) / entry_price) if entry_price and lowest else 0.0
-    return state_features(
+    roll_prev = rolling_position_prev_net(position, net, now_ts)
+    hb_prev = _previous_heartbeat_net(db_path, getattr(position, "trade_id", None))
+    out = state_features(
         entry=entry_price,
         mark=mark,
         net=net,
         mfe=max(0.0, gross_mfe),
         mae=max(0.0, gross_mae),
         high_water=max(highest, mark, entry_price),
-        prev_net=_previous_heartbeat_net(db_path, getattr(position, "trade_id", None)),
-        age_sec=max(0.0, time.time() - entry_time) if entry_time else 0.0,
+        prev_net=hb_prev if hb_prev is not None else roll_prev,
+        age_sec=max(0.0, now_ts - entry_time) if entry_time else 0.0,
     )
+    sym = str(getattr(position, "symbol", "") or "")
+    if sym:
+        out.update(read_live_exit_micro(sym, now_ts=now_ts))
+    return out
 
 
 def _hold_unrealized_marks(db_path: str, trade_id: str) -> list[float]:

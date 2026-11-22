@@ -594,6 +594,23 @@ def authority(db_path: str) -> bool:
     return load_model(db_path) is not None
 
 
+def scalp_progressive_rollover_frac(mfe: float) -> float:
+    """Progressive MFE giveback allowance for SCALP_V2 winners.
+
+    - 28..60 bps MFE: 0.40 (matches deployed 28 bps / 0.40 behavior).
+    - 60..180 bps MFE: tightens linearly 0.40 -> 0.24 so big breakouts keep most of the move.
+    - 180..400+ bps MFE: tightens linearly 0.24 -> 0.18 to lock windfall spikes fast.
+    """
+    m = max(0.0, float(mfe or 0.0))
+    if m <= 0.0060:
+        return 0.40
+    if m <= 0.0180:
+        return 0.40 - 0.16 * ((m - 0.0060) / 0.0120)
+    if m <= 0.0400:
+        return 0.24 - 0.06 * ((m - 0.0180) / 0.0220)
+    return 0.18
+
+
 def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry: dict | None, *, model: ValueModel | None = None) -> dict[str, Any] | None:
     """Expected advantage of keeping ``state`` at each informed horizon, and the best of them.
 
@@ -610,13 +627,24 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
         return {"advantage": 0.0, "horizon": None, "horizons": {}, "version": VALUE_VERSION}
     mfe_v = max(0.0, _finite((state or {}).get("mfe")))
     gb_v = max(0.0, _finite((state or {}).get("giveback")))
+    net_v = _finite((state or {}).get("net"))
+    live_obi = _finite((state or {}).get("live_obi"))
+    live_flow = _finite((state or {}).get("live_flow"))
     micro_drag = min(0.0, _finite(ent.get("micro")))
     cal_sum = _finite(ent.get("calibrated")) + _finite(ent.get("adaptive")) + micro_drag
     uncal_gross = _finite(ent.get("uncalibrated_gross"))
     key_pol_cal = _finite(ent.get("key_policy_calibration"))
     hold_cal_sum = uncal_gross + _finite(ent.get("uncalibrated_slope_term")) + key_pol_cal + micro_drag if uncal_gross != 0.0 else cal_sum
+    ro_frac = scalp_progressive_rollover_frac(mfe_v)
+    seller_reversal = mfe_v >= 0.0035 and net_v > 0.0 and live_obi <= -0.30 and live_flow <= -0.30
+    if seller_reversal:
+        ro_frac *= 0.80
     fade = max(0.0, 1.0 - age / 10.0)
-    ro_drag = (hold_cal_sum + 0.0010) if (age > 0.0 and mfe_v >= 0.0028 and gb_v >= 0.40 * mfe_v) else 0.0
+    if age > 0.0 and mfe_v >= 0.0028 and net_v > 0.0 and gb_v < 0.65 * ro_frac * mfe_v and not seller_reversal:
+        # Active climbing breakout runner: extend continuation horizon past the 10m cliff until price pulls back.
+        runner_fade_floor = 0.55 if (live_obi > 0.20 and live_flow > 0.20 and gb_v < 0.35 * ro_frac * mfe_v) else 0.40
+        fade = max(fade, runner_fade_floor * max(0.0, 1.0 - age / 45.0))
+    ro_drag = (max(0.0, hold_cal_sum) + 0.0012) if (age > 0.0 and mfe_v >= 0.0028 and gb_v >= ro_frac * mfe_v) else 0.0
     claim_rem = (cal_sum if age <= 0.0 else hold_cal_sum) * fade - ro_drag
     out: dict[int, float] = {}
     for h, v in per.items():

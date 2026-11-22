@@ -577,3 +577,132 @@ def test_v3_pretactical_reconstruction_blocks_future_hindsight_state(tmp_path):
     poisoned_target = _build_base_db(str(tmp_path / "poisoned.db"), inject_future_poison=True)
     assert clean_target > 0.0
     assert poisoned_target == pytest.approx(clean_target, abs=1e-12)
+
+
+def test_breakout_detection_and_progressive_runner_profit_lock(monkeypatch):
+    """Verify big-outbreak visibility (DAY rebound/high-RSI + SCALP >60bps wave) and progressive hold-until-fall profit-taking."""
+    import asyncio
+    import time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from backend.services.binance_scalp.config import get_scalp_config
+    from backend.services.binance_scalp.economics import ScalpEconomics
+    from backend.services.binance_scalp.market_reader import MarketSnapshot
+    from backend.services.binance_scalp.strategies.base import StrategyMarketContext
+    from backend.services.binance_scalp.strategies.breakout_momentum import BreakoutMomentumStrategy
+    from backend.services.continuation_surface import (
+        _aggregate_informed,
+        _apply_winner_rollover_guard,
+        day_progressive_rollover_frac,
+        rolling_position_prev_net,
+    )
+    from backend.services.day_v2.live_signal import SETUP_BREAKOUT_CONTINUATION, evaluate_all_entry_signals
+    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
+    from backend.services.scalp_v2 import continuation_value as cv
+
+    # 1. DAY_V2 sees rebound breakout out of bear 4H when 1H turned bullish and 15m RSI > 72
+    ts0 = 1_795_000_000
+    bars_15m = [{"ts_epoch": ts0 + i * 900, "open": 100.0 + (i % 3) * 0.05, "high": 100.25, "low": 99.90, "close": 100.05 + (i % 2) * 0.05, "volume": 100.0} for i in range(45)]
+    # Strong breakout impulse pushing RSI > 72
+    bars_15m.append({"ts_epoch": ts0 + 45 * 900, "open": 100.10, "high": 100.55, "low": 100.08, "close": 100.50, "volume": 250.0})
+    bars_15m.append({"ts_epoch": ts0 + 46 * 900, "open": 100.50, "high": 101.85, "low": 100.48, "close": 101.80, "volume": 500.0})
+    bars_1h = [{"ts_epoch": ts0 + i * 3600, "open": 99.0 + i * 0.25, "high": 99.5 + i * 0.25, "low": 98.8 + i * 0.25, "close": 99.2 + i * 0.25, "volume": 800.0} for i in range(12)]
+    bars_4h = [{"ts_epoch": ts0 - (12 - i) * 14400, "open": 105.0, "high": 105.5, "low": 96.0, "close": 105.0 if i < 11 else 98.0, "volume": 2000.0} for i in range(12)]
+    sigs = evaluate_all_entry_signals("BTCUSDT", bars_15m, bars_1h, bars_4h)
+    assert any(s.setup == SETUP_BREAKOUT_CONTINUATION for s in sigs)
+
+    # 2. SCALP_V2 BreakoutMomentumStrategy no longer rejects a +95 bps high-volume breakout as MOVE_EXHAUSTED_CHASE
+    bars_1m = [{"open": 100.0, "high": 100.35, "low": 99.95, "close": 100.20, "volume": 10.0} for _ in range(5)] + [
+        {"open": 100.20, "high": 100.60, "low": 100.18, "close": 100.55, "volume": 35.0},
+        {"open": 100.55, "high": 100.85, "low": 100.50, "close": 100.80, "volume": 45.0},
+        {"open": 100.80, "high": 100.92, "low": 100.75, "close": 100.90, "volume": 55.0},
+    ]
+    snap = MarketSnapshot(
+        symbol="BTC/USDT",
+        symbol_bus="BTCUSDT",
+        best_bid=100.915,
+        best_ask=100.925,
+        mid=100.92,
+        spread_pct=0.0001,
+        bids=[[100.915, 50.0]],
+        asks=[[100.925, 50.0]],
+        redis_spread_pct=0.0001,
+        order_book_imbalance=0.35,
+        book_source="ws",
+        orderbook_age_sec=0.2,
+    )
+    econ = ScalpEconomics.from_env()
+    cfg = get_scalp_config()
+    mom = SimpleNamespace(
+        mid_change_5s=0.0008,
+        mid_change_15s=0.0018,
+        mid_change_30s=0.0035,
+        mid_change_60s=0.0060,
+        bid_change_15s=0.0017,
+        ask_change_15s=0.0018,
+        velocity_bps_per_s=1.2,
+        microprice_pressure=0.0002,
+    )
+    ctx = StrategyMarketContext(symbol="BTC/USDT", snap=snap, bars_1m=bars_1m, mom=mom, notional_usd=125.0, econ=econ, config=cfg)
+    bm_sig = BreakoutMomentumStrategy().evaluate(ctx)
+    assert bm_sig.passed is True
+    assert bm_sig.expected_move_pct > 0.006
+
+    # 3. Progressive rollover curve holds climbing +400 bps breakout, then locks profit on an ~18.7% pullback (without waiting for 35% = 140 bps loss of profit)
+    assert day_progressive_rollover_frac(0.0040) == pytest.approx(0.38)
+    assert day_progressive_rollover_frac(0.0400) < 0.20
+    # Climbing at +400 bps MFE, +360 bps net, positive slope -> HOLD even at 2.5h age!
+    informed = [{"horizon": 7200, "value": 0.0010, "evidence": 15.0, "rem_fade": 0.10}]
+    climb_feats = {"net": 0.0360, "mfe": 0.0400, "mae": 0.0005, "giveback": 0.0030, "dist_high": 0.0030, "slope": 0.0012, "age_min": 150.0}
+    assert _aggregate_informed(informed, engine_id="DAY_V2", setup="BREAKOUT_CONTINUATION", features=climb_feats, age_sec=9000.0, how="tactical") > 0.0
+    # Starts falling: +400 bps MFE pulls back 80 bps (20% > 18.67% progressive threshold) with negative slope -> TAKE PROFIT IMMEDIATELY!
+    fall_feats = {"net": 0.0314, "mfe": 0.0400, "mae": 0.0005, "giveback": 0.0080, "dist_high": 0.0080, "slope": -0.0020, "age_min": 152.0}
+    assert _apply_winner_rollover_guard(0.0020, fall_feats) < 0.0
+
+    # 4. SCALP_V2 extends active climbing runner past the old 10m cliff, then exits when progressive rollover triggers
+    assert cv.scalp_progressive_rollover_frac(0.0040) == pytest.approx(0.40)
+    assert cv.scalp_progressive_rollover_frac(0.0250) < 0.23
+    vm = cv.ValueModel()
+    # Seed mildly negative base horizon bias (-1 bps) with strong positive entry claim (+15 bps)
+    z0 = cv.vector({"net": 0.001, "mfe": 0.001, "mae": 0.0, "giveback": 0.0, "age_min": 2.0}, {"cost": 0.0006}, "BTCUSDT", "BREAKOUT_MOMENTUM", "btcup_vollo")
+    vm.fold([(300, z0, -0.0001, 20.0, 1000.0)], 1000.0)
+    ent_run = {"calibrated": 0.0015, "adaptive": 0.0, "micro": 0.0, "cost": 0.0006}
+    # At age=15m while climbing near highs (+220 bps MFE, only 15 bps giveback) -> still positive advantage (not killed at 10m cliff!)
+    v_climb = cv.value("", "BTCUSDT", "BREAKOUT_MOMENTUM", "btcup_vollo", {"net": 0.0199, "mfe": 0.0220, "mae": 0.0, "giveback": 0.0015, "age_min": 15.0}, ent_run, model=vm)
+    assert v_climb is not None and v_climb["advantage"] > 0.0
+    # Once it starts falling (+220 bps MFE, 55 bps giveback = 25% > progressive ~22.9%) -> negative advantage -> SELL!
+    v_fall = cv.value("", "BTCUSDT", "BREAKOUT_MOMENTUM", "btcup_vollo", {"net": 0.0159, "mfe": 0.0220, "mae": 0.0, "giveback": 0.0055, "age_min": 16.0}, ent_run, model=vm)
+    assert v_fall is not None and v_fall["advantage"] < 0.0
+
+    # 5. Rolling prev_net gives live positive slope while climbing & negative slope when falling before 5m heartbeats exist
+    dummy_pos = SimpleNamespace()
+    assert rolling_position_prev_net(dummy_pos, 0.0010, 1000.0) is None
+    prev1 = rolling_position_prev_net(dummy_pos, 0.0035, 1008.0)
+    assert prev1 == pytest.approx(0.0010)
+    assert (0.0035 - prev1) > 0.0  # positive slope while climbing!
+
+    # 6. Fast 2s DAY_V2 winner high-water ratchet & immediate rollover wake inside _scalp_fast_exit_wait
+    day_pos = SimpleNamespace(
+        engine_id="DAY_V2",
+        status="ACTIVE",
+        symbol="BTC/USDT",
+        quantity=0.002,
+        entry_price=100.0,
+        highest_price=100.0,
+        lowest_price=100.0,
+        atr_at_entry=0.8,
+        thesis_invalid_level=98.5,
+    )
+    book_seq = iter([(103.0, 103.02), (102.10, 102.12)])  # spikes +300 bps, then pulls back 90 bps (30% > 21.3% ro_frac) -> wakes immediately!
+    monkeypatch.setattr("backend.services.exact_policy_capture.executable_book", lambda _s: next(book_seq, (102.10, 102.12)))
+    monkeypatch.setattr("backend.services.scalp_v2.exit_evaluator.SCALP_V2_EXIT_MONITOR_INTERVAL_SEC", 0.5)
+    integ = object.__new__(PortfolioEngineIntegration)
+    integ.is_running = True
+    integ.engine = SimpleNamespace(open_positions={"d": day_pos})
+    integ._monitor_positions_once = AsyncMock(return_value=[])
+    t_start = time.monotonic()
+    asyncio.run(integ._scalp_fast_exit_wait(10.0))
+    elapsed = time.monotonic() - t_start
+    assert day_pos.highest_price == pytest.approx(103.0)
+    assert elapsed < 3.0  # Woke in ~1.0s instead of sleeping the full 10s/45s!

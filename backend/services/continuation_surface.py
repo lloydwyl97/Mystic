@@ -86,6 +86,101 @@ def state_features(
     }
 
 
+def rolling_position_prev_net(position: Any, current_net: float, now_ts: float | None = None) -> float | None:
+    """In-memory short-horizon prior net so slope is live before 5m heartbeats accumulate."""
+    if position is None or not math.isfinite(current_net):
+        return None
+    moment = float(now_ts if now_ts is not None else time.time())
+    anchor_net = getattr(position, "_exit_anchor_net", None)
+    anchor_ts = getattr(position, "_exit_anchor_ts", None)
+    recent_net = getattr(position, "_exit_recent_net", None)
+    recent_ts = getattr(position, "_exit_recent_ts", None)
+    try:
+        if anchor_net is None or anchor_ts is None:
+            position._exit_anchor_net = float(current_net)
+            position._exit_anchor_ts = moment
+            position._exit_recent_net = float(current_net)
+            position._exit_recent_ts = moment
+            return None
+        prev_val = float(anchor_net)
+        if recent_ts is not None and recent_net is not None and (moment - float(anchor_ts)) >= 12.0:
+            if (moment - float(recent_ts)) >= 6.0:
+                position._exit_anchor_net = float(recent_net)
+                position._exit_anchor_ts = float(recent_ts)
+                position._exit_recent_net = float(current_net)
+                position._exit_recent_ts = moment
+        elif recent_ts is None or (moment - float(recent_ts)) >= 4.0:
+            position._exit_recent_net = float(current_net)
+            position._exit_recent_ts = moment
+        return prev_val
+    except Exception:
+        return None
+
+
+_LIVE_MICRO_REDIS: Any = None
+_LIVE_MICRO_FAIL_UNTIL: float = 0.0
+
+
+def read_live_exit_micro(symbol: str, *, now_ts: float | None = None) -> dict[str, float]:
+    """Zero-REST local Redis read of top-5 orderbook imbalance and 15s aggressive flow."""
+    global _LIVE_MICRO_REDIS, _LIVE_MICRO_FAIL_UNTIL
+    moment = float(now_ts if now_ts is not None else time.time())
+    if moment < _LIVE_MICRO_FAIL_UNTIL:
+        return {}
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return {}
+    try:
+        import redis
+
+        if _LIVE_MICRO_REDIS is None:
+            _LIVE_MICRO_REDIS = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True, socket_connect_timeout=0.15, socket_timeout=0.15)
+        rd = _LIVE_MICRO_REDIS
+        out: dict[str, float] = {}
+        # 1. Top-5 orderbook imbalance from fresh WS or depth cache
+        for k_book, max_age in ((f"scalp:ws_depth:{sym}", 5.0), (f"scalp:depth_cache:{sym}", 8.0)):
+            raw_b = rd.get(k_book)
+            if not raw_b:
+                continue
+            pay = json.loads(raw_b)
+            ts_b = float(pay.get("ts") or pay.get("fetched_at") or 0.0)
+            if ts_b > 1e12:
+                ts_b /= 1000.0
+            if ts_b <= 0.0 or (moment - ts_b) > max_age:
+                continue
+            bids = (pay.get("bids") or [])[:5]
+            asks = (pay.get("asks") or [])[:5]
+            bq = sum(float(x[1]) for x in bids if len(x) >= 2)
+            aq = sum(float(x[1]) for x in asks if len(x) >= 2)
+            if (bq + aq) > 0.0:
+                out["live_obi"] = (bq - aq) / (bq + aq)
+                break
+        # 2. 15s signed aggressive trade flow from scalp:tape:{SYM}
+        entries = rd.xrevrange(f"scalp:tape:{sym}", count=40)
+        if entries:
+            buy_q = 0.0
+            sell_q = 0.0
+            cutoff_ms = (moment - 15.0) * 1000.0
+            for _eid, fields in entries:
+                tms = float(fields.get("T") or fields.get("ts_ms") or 0.0)
+                if 0.0 < tms < cutoff_ms:
+                    break
+                qty = float(fields.get("q") or fields.get("qty") or 0.0)
+                px = float(fields.get("p") or fields.get("price") or 0.0)
+                q_usd = qty * px if px > 0 else qty
+                ibm = str(fields.get("m") if "m" in fields else fields.get("is_buyer_maker", "")).lower()
+                if ibm in ("true", "1"):
+                    sell_q += q_usd
+                elif ibm in ("false", "0"):
+                    buy_q += q_usd
+            if (buy_q + sell_q) > 0.0:
+                out["live_flow"] = (buy_q - sell_q) / (buy_q + sell_q)
+        return out
+    except Exception:
+        _LIVE_MICRO_FAIL_UNTIL = moment + 5.0
+        return {}
+
+
 def _blank_ridge() -> dict[str, Any]:
     width = len(FEATURE_NAMES)
     return {
@@ -140,6 +235,24 @@ def _update_ridge(stats: dict[str, Any], features: dict[str, float] | None, targ
     stats["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
 
 
+def day_progressive_rollover_frac(mfe: float) -> float:
+    """Progressive MFE giveback allowance for DAY_V2 winners.
+
+    - Below 28 bps MFE: 0.38 (rollover guard inactive until 28 bps).
+    - 28..80 bps MFE: 0.38 so developing breakouts survive normal 1m pullbacks.
+    - 80..200 bps MFE: tightens linearly 0.38 -> 0.24 as trend matures.
+    - 200..500+ bps MFE: tightens linearly 0.24 -> 0.16 to lock windfall gains fast.
+    """
+    m = max(0.0, float(mfe or 0.0))
+    if m <= 0.0080:
+        return 0.38
+    if m <= 0.0200:
+        return 0.38 - 0.14 * ((m - 0.0080) / 0.0120)
+    if m <= 0.0500:
+        return 0.24 - 0.08 * ((m - 0.0200) / 0.0300)
+    return 0.16
+
+
 def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: float, engine: str) -> float:
     _decay_ridge(stats, now, engine)
     if float(stats.get("n") or 0.0) <= 0 or features is None:
@@ -150,9 +263,10 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
     mae_v = max(0.0, float(raw_ft.get("mae") or 0.0))
     gb_v = max(0.0, float(raw_ft.get("giveback") or 0.0))
     net_v = float(raw_ft.get("net") or 0.0)
+    ro_frac = day_progressive_rollover_frac(mfe_v)
     curr_mae = min(mae_v, max(0.0, -net_v - 0.00066)) if mae_v > 0.0 else max(0.0, -net_v - 0.00066)
     raw_ft["mae"] = curr_mae if (age_m >= 12.0 and mfe_v < 0.0004) else (0.40 * curr_mae)
-    if mfe_v >= 0.0020 and gb_v >= 0.25 * mfe_v:
+    if mfe_v >= 0.0028 and gb_v >= ro_frac * mfe_v:
         raw_ft["mae"] = max(raw_ft["mae"], 2.5 * gb_v)
     vec = feature_vector(raw_ft)
     z = np.asarray(_standardize(stats, vec), dtype=float)
@@ -163,7 +277,7 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
         beta = np.linalg.solve(xtx, xty)
     except np.linalg.LinAlgError:
         return 0.0
-    if mfe_v >= 0.0020 and gb_v >= 0.25 * mfe_v and float(beta[0]) < 0.0:
+    if mfe_v >= 0.0028 and gb_v >= ro_frac * mfe_v and float(beta[0]) < 0.0:
         peak_vec = list(vec)
         peak_vec[0] = max(net_v, mfe_v - 0.00066)
         z[0] = float(_standardize(stats, peak_vec)[0])
@@ -394,7 +508,14 @@ def _apply_winner_rollover_guard(advantage: float, features: dict[str, float] | 
     gb_now = max(0.0, float(features.get("giveback") or 0.0))
     net_now = float(features.get("net") or 0.0)
     slp_now = float(features.get("slope") or 0.0)
-    if mfe_now >= 0.0020 and gb_now >= 0.35 * mfe_now and net_now > 0.0 and slp_now <= 0.0:
+    if mfe_now < 0.0028 or net_now <= 0.0 or slp_now > 0.0:
+        return advantage
+    ro_frac = day_progressive_rollover_frac(mfe_now)
+    live_obi = float(features.get("live_obi") or 0.0)
+    live_flow = float(features.get("live_flow") or 0.0)
+    if mfe_now >= 0.0040 and live_obi <= -0.30 and live_flow <= -0.30:
+        ro_frac *= 0.80
+    if gb_now >= ro_frac * mfe_now:
         return min(float(advantage), -1e-5)
     return advantage
 
@@ -417,8 +538,19 @@ def _aggregate_informed(
         if is_market_fallback:
             adv = _blended_advantage(informed, base_h=base_h, age_sec=age_sec)
         else:
-            tact = [item for item in informed if int(item["horizon"]) <= DAY_TACTICAL_MAX_HORIZON_SEC] or informed
-            adv = max(float(item["value"]) * float(item.get("rem_fade", 1.0)) for item in tact)
+            mfe_now = max(0.0, float((features or {}).get("mfe") or 0.0))
+            gb_now = max(0.0, float((features or {}).get("giveback") or 0.0))
+            net_now = float((features or {}).get("net") or 0.0)
+            slp_now = float((features or {}).get("slope") or 0.0)
+            ro_frac = day_progressive_rollover_frac(mfe_now)
+            climbing_runner = age_sec > 0.0 and mfe_now >= 0.0030 and net_now > 0.0 and slp_now >= -0.0002 and gb_now < 0.65 * ro_frac * mfe_now
+            if climbing_runner:
+                # Active breakout runner near highs: do not time-choke at 2h; allow extended trend horizons while intact.
+                pool = [item for item in informed if int(item["horizon"]) <= 21600] or informed
+                adv = max(float(item["value"]) * max(float(item.get("rem_fade", 1.0)), 0.65) for item in pool)
+            else:
+                tact = [item for item in informed if int(item["horizon"]) <= DAY_TACTICAL_MAX_HORIZON_SEC] or informed
+                adv = max(float(item["value"]) * float(item.get("rem_fade", 1.0)) for item in tact)
         return _apply_winner_rollover_guard(adv, features)
     return max(float(item["value"]) for item in informed)
 

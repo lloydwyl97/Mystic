@@ -32,20 +32,25 @@ class CompressionBreakoutStrategy:
         if len(bars) < 15:
             return reject_signal(ctx, self.name, "INSUFFICIENT_BARS")
 
-        recent = bars[-10:]
-        highs = [b["high"] for b in recent]
-        lows = [b["low"] for b in recent]
-        range_pct = (max(highs) - min(lows)) / max(ctx.snap.mid, 1e-9)
+        prior_box = bars[-10:-1]
+        cur = max(ctx.snap.mid, 1e-9)
+        highs = [b["high"] for b in prior_box]
+        lows = [b["low"] for b in prior_box]
+        range_pct = (max(highs) - min(lows)) / cur
+        atr_1m_pct = sum((float(b["high"]) - float(b["low"])) for b in prior_box) / (len(prior_box) * cur)
         vol_recent = sum(b["volume"] for b in bars[-3:])
         vol_prior = sum(b["volume"] for b in bars[-8:-3]) or 1.0
-        expansion = vol_recent / vol_prior > 1.4 and range_pct < 0.004
+        vol_ratio = vol_recent / max(vol_prior, 1e-12)
+        broke_up = cur >= max(highs) * 0.9998 and cur > float(bars[-2]["close"])
+        expansion = vol_ratio > 1.35 and range_pct < max(0.0065, 2.4 * atr_1m_pct) and broke_up
 
         if not expansion:
             return reject_signal(ctx, self.name, "NO_COMPRESSION_BREAK")
 
-        structural = 0.0030
+        vol_boost = min(1.75, max(1.0, 0.80 + 0.25 * vol_ratio))
+        structural = min(max(0.0032, range_pct * 1.15 * vol_boost), 0.0150)
 
-        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.70, cap_pct=0.006)
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.80 * vol_boost, cap_pct=0.0150)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,
