@@ -388,11 +388,14 @@ def rank_setup_signal(
 
         micro_feats = _cmf(sig.symbol) or {}
     try:
+        from backend.services.adaptive_learning import scalp_learned_setup
         from backend.services.binance_scalp.config import get_scalp_config
 
+        claim_fired = bool(sig.passed or getattr(sig, "claim_available", False) or expected > 0.0)
+        learned_setup = scalp_learned_setup(sig.setup_name, claim_fired=claim_fired)
         edge, adaptive_view, adaptive_regime = candidate_executable_edge(
             symbol=sig.symbol,
-            setup=sig.setup_name,
+            setup=learned_setup,
             db_path=get_scalp_config().database_path,
             raw_expected_move_pct=expected,
             spread_pct=ctx.snap.spread_pct,

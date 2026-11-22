@@ -9632,13 +9632,46 @@ class PortfolioEngine:
 
                     cursor.execute(
                         """
-                        SELECT DISTINCT symbol FROM paper_trades
+                        SELECT id, symbol, quantity, remaining_position, price FROM paper_trades
                         WHERE side = 'BUY' AND COALESCE(remaining_position, 0) > 0
                           AND timestamp < ?
                         """,
                         (cutoff_iso,),
                     )
-                    paper_open_syms = [row[0] for row in cursor.fetchall()]
+                    open_buy_rows = cursor.fetchall()
+                    paper_open_syms: list[str] = []
+                    seen_orphan_syms: set[str] = set()
+                    for bid, bsym, bqty, brem, bpx in open_buy_rows:
+                        ns = normalize_symbol(bsym)
+                        if ns in open_syms:
+                            continue
+                        rem_v = float(brem or 0.0)
+                        qty_v = float(bqty or 0.0)
+                        px_v = float(bpx or 0.0)
+                        if rem_v > 0.0 and qty_v > 0.0 and px_v > 0.0 and (rem_v * px_v) < 0.10 and rem_v < 0.01 * qty_v:
+                            ns_flat = ns.replace("/", "").replace("-", "").upper()
+                            later_sell = cursor.execute(
+                                """
+                                SELECT 1 FROM paper_trades
+                                WHERE side = 'SELL' AND id > ?
+                                  AND replace(replace(upper(symbol), '/', ''), '-', '') = ?
+                                LIMIT 1
+                                """,
+                                (int(bid), ns_flat),
+                            ).fetchone()
+                            if later_sell is not None:
+                                cursor.execute("UPDATE paper_trades SET remaining_position = 0.0 WHERE id = ?", (int(bid),))
+                                logger.info(
+                                    "FIFO_RECONCILE_SUBSTEP_DUST_RETIRED id=%s symbol=%s rem=%.10f notional=%.6f",
+                                    bid,
+                                    bsym,
+                                    rem_v,
+                                    rem_v * px_v,
+                                )
+                                continue
+                        if bsym not in seen_orphan_syms:
+                            seen_orphan_syms.add(bsym)
+                            paper_open_syms.append(bsym)
 
                     for psym in paper_open_syms:
                         ns = normalize_symbol(psym)

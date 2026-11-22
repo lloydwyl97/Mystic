@@ -107,6 +107,7 @@ def reject_signal(
     confidence: float = 0.0,
     mechanical: bool = True,
     directional_move: float | None = None,
+    directional_cap_pct: float = 0.006,
 ) -> ScalpSetupSignal:
     """Build a failed signal.
 
@@ -135,7 +136,7 @@ def reject_signal(
         passed=False,
         reject_reason=reason,
         setup_context=ctx_map,
-        directional_move_pct=directional_claim_pct(directional_move or 0.0),
+        directional_move_pct=directional_claim_pct(directional_move or 0.0, cap_pct=directional_cap_pct),
         claim_available=directional_move is not None,
     )
 
@@ -153,6 +154,7 @@ def pass_signal(
     limit_buy: float,
     setup_context: dict,
     directional_move_pct: float = 0.0,
+    directional_cap_pct: float = 0.006,
 ) -> ScalpSetupSignal:
     return ScalpSetupSignal(
         symbol=ctx.symbol,
@@ -171,6 +173,6 @@ def pass_signal(
         passed=True,
         reject_reason=None,
         setup_context=setup_context,
-        directional_move_pct=directional_claim_pct(directional_move_pct),
+        directional_move_pct=directional_claim_pct(directional_move_pct, cap_pct=directional_cap_pct),
         claim_available=True,
     )

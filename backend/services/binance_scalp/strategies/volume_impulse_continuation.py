@@ -55,7 +55,15 @@ class VolumeImpulseContinuationStrategy:
             expected_move_pct=expected,
         )
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
+            return reject_signal(
+                ctx,
+                self.name,
+                "TARGET_NOT_REACHABLE",
+                expected_move=expected,
+                impact=impact,
+                directional_move=structural,
+                directional_cap_pct=0.0160,
+            )
 
         mom = ctx.mom
         score = 2.40 + min(0.8, vol_ratio * 0.15) + max(0.0, mom.mid_change_15s) * 3000.0
@@ -68,6 +76,7 @@ class VolumeImpulseContinuationStrategy:
             invalidation_reason="impulse_fails_to_continue",
             expected_move_pct=expected,
             directional_move_pct=structural,
+            directional_cap_pct=0.0160,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"vol_ratio": vol_ratio},

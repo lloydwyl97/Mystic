@@ -706,3 +706,117 @@ def test_breakout_detection_and_progressive_runner_profit_lock(monkeypatch):
     elapsed = time.monotonic() - t_start
     assert day_pos.highest_price == pytest.approx(103.0)
     assert elapsed < 3.0  # Woke in ~1.0s instead of sleeping the full 10s/45s!
+
+
+def test_scalp_directional_claim_unclipped_and_market_population_separated(tmp_path, monkeypatch):
+    """Verify SCALP >60bps directional_move_pct reaches executable_edge, unclaimed rejects stay in __MARKET, and sub-step dust retires."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    import backend.services.adaptive_learning as al
+    from backend.services.binance_scalp.config import get_scalp_config
+    from backend.services.binance_scalp.economics import ScalpEconomics
+    from backend.services.binance_scalp.market_reader import MarketSnapshot
+    from backend.services.binance_scalp.scalp_candidate_ranking import rank_setup_signal
+    from backend.services.binance_scalp.strategies.base import StrategyMarketContext
+    from backend.services.binance_scalp.strategies.breakout_momentum import BreakoutMomentumStrategy
+    from backend.services.binance_scalp.strategies.common import reject_signal
+
+    db = str(tmp_path / "scalp_pop.db")
+    cfg = SimpleNamespace(**{**get_scalp_config().__dict__, "database_path": db})
+    monkeypatch.setattr("backend.services.binance_scalp.config.get_scalp_config", lambda: cfg)
+    monkeypatch.setattr("backend.services.microstructure_engine.compute_features", lambda *_a, **_k: {})
+
+    bars_1m = [{"open": 100.0, "high": 100.55, "low": 99.85, "close": 100.20, "volume": 10.0} for _ in range(5)] + [
+        {"open": 100.20, "high": 100.75, "low": 100.18, "close": 100.70, "volume": 40.0},
+        {"open": 100.70, "high": 101.05, "low": 100.65, "close": 101.00, "volume": 50.0},
+        {"open": 101.00, "high": 101.20, "low": 100.95, "close": 101.15, "volume": 65.0},
+    ]
+    snap = MarketSnapshot(
+        symbol="BTC/USDT",
+        symbol_bus="BTCUSDT",
+        best_bid=101.155,
+        best_ask=101.165,
+        mid=101.16,
+        spread_pct=0.0001,
+        bids=[[101.155, 50.0]],
+        asks=[[101.165, 50.0]],
+        redis_spread_pct=0.0001,
+        order_book_imbalance=0.35,
+        book_source="ws",
+        orderbook_age_sec=0.2,
+    )
+    mom = SimpleNamespace(
+        mid_change_5s=0.0008,
+        mid_change_15s=0.0018,
+        mid_change_30s=0.0035,
+        mid_change_60s=0.0060,
+        bid_change_15s=0.0017,
+        ask_change_15s=0.0018,
+        velocity_bps_per_s=1.2,
+        microprice_pressure=0.0002,
+        insufficient_history=False,
+    )
+    ctx = StrategyMarketContext(symbol="BTC/USDT", snap=snap, bars_1m=bars_1m, mom=mom, notional_usd=125.0, econ=ScalpEconomics.from_env(), config=cfg)
+
+    # 1. Breakout directional_move_pct is NOT clipped back down to 0.006 inside pass_signal / rank_setup_signal
+    sig = BreakoutMomentumStrategy().evaluate(ctx)
+    assert sig.passed is True
+    assert sig.directional_move_pct > 0.006
+    rc_pass = rank_setup_signal(sig, regime="bull_trend", ctx=ctx)
+    assert rc_pass.executable_edge["raw_expected_move_pct"] == pytest.approx(sig.directional_move_pct)
+    assert rc_pass.executable_edge["raw_expected_move_pct"] > 0.006
+
+    # 2. Unclaimed pattern rejects (NO_BREAKOUT) write to BREAKOUT_MOMENTUM__MARKET and never dilute BREAKOUT_MOMENTUM
+    mkt_key = al.scalp_learned_setup("BREAKOUT_MOMENTUM", claim_fired=False)
+    fired_key = al.scalp_learned_setup("BREAKOUT_MOMENTUM", claim_fired=True)
+    assert mkt_key == "BREAKOUT_MOMENTUM__MARKET"
+    assert fired_key == "BREAKOUT_MOMENTUM"
+    for _ in range(40):
+        al.learn_claim_label(db, symbol="BTCUSDT", setup=mkt_key, regime="", strategy_version=al.current_strategy_version(al.SCALP_ENGINE), raw=0.0, gross=-0.0050)
+    for _ in range(15):
+        al.learn_claim_label(db, symbol="BTCUSDT", setup=fired_key, regime="", strategy_version=al.current_strategy_version(al.SCALP_ENGINE), raw=0.0080, gross=0.0040)
+
+    rej_sig = reject_signal(ctx, "breakout_momentum", "NO_BREAKOUT", mechanical=False, score=0.78)
+    rc_rej = rank_setup_signal(rej_sig, regime="bull_trend", ctx=ctx)
+    rc_fired = rank_setup_signal(sig, regime="bull_trend", ctx=ctx)
+    assert rc_rej.adaptive_decision["setup"] == "BREAKOUT_MOMENTUM__MARKET"
+    assert rc_fired.adaptive_decision["setup"] == "BREAKOUT_MOMENTUM"
+    assert rc_fired.executable_edge["calibrated_move_pct"] > 0.0020
+    assert rc_rej.executable_edge["calibrated_move_pct"] < -0.0020
+
+    # 3. FIFO reconcile retires sub-step (<$0.10 & <1% qty) post-SELL dust while keeping real unclosed BUY lots
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    eng_db = tmp_path / "fifo_dust.db"
+    eng = object.__new__(PortfolioEngine)
+    eng.db_path = str(eng_db)
+    eng.open_positions = {}
+    with sqlite3.connect(str(eng_db)) as conn:
+        conn.execute(
+            """CREATE TABLE paper_trades (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   trade_id TEXT, paper_run_id TEXT, mode TEXT, symbol TEXT,
+                   side TEXT, quantity REAL, price REAL, remaining_position REAL,
+                   timestamp TEXT, status TEXT, order_id TEXT
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO paper_trades (trade_id, paper_run_id, mode, symbol, side, quantity, price, remaining_position, timestamp, status)
+               VALUES ('sol_closed', 'r1', 'live', 'SOL/USDT', 'BUY', 3.854229, 71.43, 0.000229, '2026-11-16T02:01:18+00:00', 'executed')"""
+        )
+        conn.execute(
+            """INSERT INTO paper_trades (trade_id, paper_run_id, mode, symbol, side, quantity, price, remaining_position, timestamp, status)
+               VALUES ('sol_sell', 'r1', 'live', 'SOL/USDT', 'SELL', 3.854, 71.55, 0.0, '2026-11-16T02:03:09+00:00', 'executed')"""
+        )
+        conn.execute(
+            """INSERT INTO paper_trades (trade_id, paper_run_id, mode, symbol, side, quantity, price, remaining_position, timestamp, status)
+               VALUES ('eth_real_orphan', 'r1', 'live', 'ETH/USDT', 'BUY', 0.10, 2500.0, 0.10, '2026-11-16T02:05:00+00:00', 'executed')"""
+        )
+        conn.commit()
+    eng._sync_paper_fifo_remaining_to_engine_positions_sync()
+    with sqlite3.connect(str(eng_db)) as conn:
+        sol_rem = conn.execute("SELECT remaining_position FROM paper_trades WHERE trade_id='sol_closed'").fetchone()[0]
+        eth_rem = conn.execute("SELECT remaining_position FROM paper_trades WHERE trade_id='eth_real_orphan'").fetchone()[0]
+    assert sol_rem == pytest.approx(0.0)
+    assert eth_rem == pytest.approx(0.10)  # Real unclosed lot is NEVER zeroed!

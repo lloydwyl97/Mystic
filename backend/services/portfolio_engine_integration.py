@@ -2556,10 +2556,15 @@ class PortfolioEngineIntegration:
         rank_of = {key: position for position, key in enumerate(_rank_order, start=1)}
 
         def _record_scalp_observation(row: dict, norm_key: str, *, signaled: bool, decision_code: str = "", decision_reason: str = "") -> dict:
+            from backend.services.adaptive_learning import scalp_learned_setup
+
             setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
             regime = str(row.get("adaptive_regime") or "") or market_regime_tag(self.engine.db_path, norm_key) or ""
             edge = row.get("executable_edge")
             edge_dict = edge if isinstance(edge, dict) else {}
+            adapt_dec = row.get("adaptive_decision") if isinstance(row.get("adaptive_decision"), dict) else {}
+            claim_fired = bool(row.get("strategy_passed") or float(edge_dict.get("raw_expected_move_pct") or 0.0) > 0.0)
+            learned_setup = str(adapt_dec.get("setup") or scalp_learned_setup(setup_name, claim_fired=claim_fired))
             econ = _policy_economics(edge)
             entry_micro = (econ.get("entry_micro") if isinstance(econ, dict) else None) or edge_dict.get("entry_micro")
             micro_feats = dict(entry_micro) if isinstance(entry_micro, dict) and entry_micro else _scalp_book(norm_key)
@@ -2575,7 +2580,7 @@ class PortfolioEngineIntegration:
                 self.engine.db_path,
                 engine="SCALP_V2",
                 symbol=norm_key,
-                setup=setup_name,
+                setup=learned_setup,
                 regime=regime,
                 ref_price=ref_price,
                 roundtrip_cost=canonical_roundtrip_cost_pct(spread_pct=(float(micro_feats["spread_pct"]) if micro_feats.get("spread_pct") is not None else None)),

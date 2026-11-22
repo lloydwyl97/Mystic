@@ -58,7 +58,15 @@ class CompressionBreakoutStrategy:
             expected_move_pct=expected,
         )
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
+            return reject_signal(
+                ctx,
+                self.name,
+                "TARGET_NOT_REACHABLE",
+                expected_move=expected,
+                impact=impact,
+                directional_move=structural,
+                directional_cap_pct=0.0150,
+            )
 
         score = 2.50 + max(0.0, 1.4 - range_pct * 200.0) * 0.15 + (vol_recent / max(vol_prior, 1e-12)) * 0.08
         return pass_signal(
@@ -70,6 +78,7 @@ class CompressionBreakoutStrategy:
             invalidation_reason="no_follow_through_or_vol_fades",
             expected_move_pct=expected,
             directional_move_pct=structural,
+            directional_cap_pct=0.0150,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"range_pct": range_pct},

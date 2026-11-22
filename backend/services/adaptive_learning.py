@@ -1080,6 +1080,19 @@ def day_geometry_setup(setup: str) -> str:
     return name
 
 
+def scalp_learned_setup(setup: str, *, claim_fired: bool) -> str:
+    """Population key for one SCALP state (genuine pattern claim vs unclaimed market fallback)."""
+    name = str(setup or "").upper()
+    if name.endswith(DAY_MARKET_STATE_SUFFIX):
+        name = name[: -len(DAY_MARKET_STATE_SUFFIX)]
+    return name if claim_fired else f"{name}{DAY_MARKET_STATE_SUFFIX}"
+
+
+def scalp_geometry_setup(setup: str) -> str:
+    """Base SCALP setup family without the learned-population suffix."""
+    return day_geometry_setup(setup)
+
+
 def hold_remaining_metric(unrealized_net: float) -> str:
     """Which continuation posterior the current mark reads. The sign is state, not a gate."""
     return "hold_remaining_up" if float(unrealized_net) > 0.0 else "hold_remaining_down"
@@ -4085,6 +4098,8 @@ __all__ = [
     "scalp_claim_calibration",
     "scalp_decision",
     "scalp_expected_gross",
+    "scalp_geometry_setup",
+    "scalp_learned_setup",
     "seed_day_trade_net",
     "update_linear_model",
     "with_close_lineage",
