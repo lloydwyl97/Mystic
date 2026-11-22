@@ -33,7 +33,7 @@ def main() -> None:
     parser.add_argument("--db", required=True)
     parser.add_argument("--as-of", type=float, default=None)
     parser.add_argument("--install", nargs="*", choices=(DAY_ENGINE, SCALP_ENGINE))
-    parser.add_argument("--how", choices=("best", "blended"))
+    parser.add_argument("--how", choices=("best", "blended", "tactical"))
     parser.add_argument("--apply", action="store_true", help="removed; the pairwise remaining target is not installed")
     args = parser.parse_args()
     if args.apply:
@@ -45,7 +45,7 @@ def main() -> None:
         legacy_oos = (legacy.get("engines") or {}).get(engine, {}).get("oos_learned") or {}
         block = (repaired.get("engines") or {}).get(engine) or {}
         predicts = continuation_predicts(block.get("prediction"))
-        acceptance[engine] = {how: bool(predicts and continuation_accepts((block.get(how) or {}).get("oos") or {}, legacy_oos)) for how in ("best", "blended")}
+        acceptance[engine] = {how: bool(predicts and continuation_accepts((block.get(how) or {}).get("oos") or {}, legacy_oos)) for how in ("best", "blended", "tactical")}
     installed = None
     if args.install is not None:
         if not args.how:

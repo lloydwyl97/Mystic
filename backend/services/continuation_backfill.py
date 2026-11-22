@@ -1226,7 +1226,7 @@ def walk_advantage(db_path: str, *, as_of: float | None = None) -> dict[str, Any
         events.extend((point[0], 1, "decide", (position, point)) for point in path)
     events.sort(key=lambda item: (item[0], item[1], item[2]))
     surface = ContinuationMemory()
-    policies = ("best", "blended")
+    policies = ("best", "blended", "tactical")
     exited: dict[str, dict[str, dict[str, Any]]] = {name: {} for name in policies}
     reasons: dict[str, Counter] = {name: Counter() for name in policies}
     actuals = {position.trade_id: _actual_row(position, bars_cache.get(position.symbol, [])) for position in closed}

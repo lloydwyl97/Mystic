@@ -35,7 +35,9 @@ FEATURE_NAMES = ("net", "mfe", "mae", "giveback", "dist_high", "slope", "age_min
 ADVANTAGE_VERSION = "CONTINUATION_ADVANTAGE_V1"
 SURFACE_MODEL = "continuation_surface"
 DAY_ADVANTAGE_HORIZONS = (900, 1800, 3600, 7200, 14400, 21600, 43200)
+DAY_TACTICAL_MAX_HORIZON_SEC = 7200
 SCALP_ADVANTAGE_HORIZONS = (30, 60, 120, 300, 600, 1200, 1800, 3600)
+VALID_AGGREGATORS = frozenset({"best", "blended", "tactical"})
 
 
 def horizons_for(engine: str) -> tuple[int, ...]:
@@ -228,13 +230,22 @@ class ContinuationMemory:
         return float(lat["mean"]) + _ridge_dot(stats, features, now, engine_id), evidence
 
     def advantage(self, engine: str, symbol: str, setup: str, regime: str, features: dict[str, float] | None, now: float, *, how: str = "best") -> tuple[float, int | None]:
+        engine_id = str(engine or "").upper()
         informed: list[tuple[int, float, float]] = []
-        for horizon in horizons_for(engine):
-            mean, evidence = self.horizon_view(engine, symbol, setup, regime, horizon, features, now)
+        for horizon in horizons_for(engine_id):
+            mean, evidence = self.horizon_view(engine_id, symbol, setup, regime, horizon, features, now)
             if evidence > 0:
                 informed.append((horizon, mean, evidence))
         if not informed:
             return 0.0, None
+        if how == "tactical":
+            is_mkt = (engine_id == "DAY_V2") and str(setup or "").strip().upper().endswith("__MARKET")
+            if is_mkt:
+                weight = sum(item[2] for item in informed)
+                return sum(item[1] * item[2] for item in informed) / weight, max(informed, key=lambda item: item[2])[0]
+            tact_pool = [it for it in informed if int(it[0]) <= DAY_TACTICAL_MAX_HORIZON_SEC] or informed
+            chosen = max(tact_pool, key=lambda item: item[1])
+            return chosen[1], chosen[0]
         if how == "blended":
             weight = sum(item[2] for item in informed)
             return sum(item[1] * item[2] for item in informed) / weight, max(informed, key=lambda item: item[2])[0]
@@ -292,7 +303,124 @@ def installed_aggregator(db_path: str, engine: str) -> str:
     source = row[1] if row else ""
     prefix = "horizon_hold_advantage:"
     how = source[len(prefix) :] if source.startswith(prefix) else ""
-    return how if how in {"best", "blended"} else "best"
+    return how if how in VALID_AGGREGATORS else "best"
+
+
+def set_installed_aggregator(db_path: str, engine: str, how: str) -> bool:
+    """Atomically switch the installed aggregator for ``engine`` and sync checkpoint."""
+    import sqlite3
+
+    from backend.services.adaptive_learning import _invalidate_adaptive_caches
+    from backend.services.continuation_checkpoint import sync_checkpoint_if_present
+
+    if how not in VALID_AGGREGATORS:
+        raise ValueError(f"unsupported continuation aggregator: {how}")
+    engine_id = str(engine or "").upper()
+    version = current_economic_version(engine_id)
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            """
+            UPDATE continuation_learning_meta
+            SET source=?, updated_at=?
+            WHERE engine_id=? AND economic_version=? AND learning_version=?
+            """,
+            (
+                f"horizon_hold_advantage:{how}",
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                engine_id,
+                version,
+                ADVANTAGE_VERSION,
+            ),
+        )
+        updated = cur.rowcount > 0
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    _META_CACHE.clear()
+    _invalidate_adaptive_caches(db_path)
+    if updated:
+        sync_checkpoint_if_present(db_path, engine_id)
+    return updated
+
+
+def _blended_advantage(informed: list[dict[str, Any]], *, base_h: float, age_sec: float) -> float:
+    import statistics as _stats
+
+    hold_weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.15) * float(item.get("rem_fade", 1.0)) for item in informed]
+    hold_adv = sum(float(item["value"]) * w for item, w in zip(informed, hold_weights, strict=True)) / sum(hold_weights)
+    if len(informed) <= 1:
+        return hold_adv
+    inf_4h = [item for item in informed if int(item["horizon"]) <= 14400] or informed
+    ws_4h = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.85) for item in inf_4h]
+    blended_4h = sum(float(item["value"]) * w for item, w in zip(inf_4h, ws_4h, strict=True)) / sum(ws_4h)
+    vals_4h = [float(item["value"]) for item in inf_4h]
+    short_v = next((float(item["value"]) for item in inf_4h if int(item["horizon"]) == int(base_h)), vals_4h[0])
+    min_4h = min(vals_4h)
+    h14400 = next((float(item["value"]) for item in inf_4h if int(item["horizon"]) == 14400), vals_4h[-1])
+    h21600 = next((float(item["value"]) for item in informed if int(item["horizon"]) == 21600), h14400)
+    h43200 = next((float(item["value"]) for item in informed if int(item["horizon"]) == 43200), h21600)
+    downs_4h = [max(vals_4h[: k + 1]) - vals_4h[k] for k in range(len(vals_4h))]
+    down_4h = _stats.stdev(downs_4h) if len(downs_4h) > 1 and max(downs_4h) > min(downs_4h) else 0.0
+    if short_v <= 0.0 or min_4h <= 0.0:
+        term_adv = min(blended_4h, short_v, min_4h)
+        if h14400 < 0.0:
+            term_adv += h14400
+        if len(vals_4h) > 1 and max(vals_4h) > min(vals_4h):
+            term_adv -= 0.15 * _stats.stdev(vals_4h) + 0.15 * down_4h
+    else:
+        if down_4h <= 1e-9 and h21600 >= h14400 and h43200 <= h21600 and h14400 <= 5.0 * short_v:
+            term_adv = blended_4h
+        else:
+            term_adv = min(blended_4h, short_v)
+        term_adv -= 0.15 * down_4h
+        if h43200 > h14400:
+            vals_long = [*vals_4h, h21600, h43200]
+            term_adv -= 0.15 * _stats.stdev(vals_long)
+        elif h21600 < h14400:
+            term_adv -= 0.15 * (h14400 - h21600)
+    term_weight = max(0.0, 1.0 - age_sec / base_h) if base_h > 0.0 else 0.0
+    return term_weight * term_adv + (1.0 - term_weight) * hold_adv
+
+
+def _apply_winner_rollover_guard(advantage: float, features: dict[str, float] | None) -> float:
+    if not features:
+        return advantage
+    mfe_now = max(0.0, float(features.get("mfe") or 0.0))
+    gb_now = max(0.0, float(features.get("giveback") or 0.0))
+    net_now = float(features.get("net") or 0.0)
+    slp_now = float(features.get("slope") or 0.0)
+    if mfe_now >= 0.0020 and gb_now >= 0.35 * mfe_now and net_now > 0.0 and slp_now <= 0.0:
+        return min(float(advantage), -1e-5)
+    return advantage
+
+
+def _aggregate_informed(
+    informed: list[dict[str, Any]],
+    *,
+    engine_id: str,
+    setup: str,
+    features: dict[str, float] | None,
+    age_sec: float,
+    how: str,
+) -> float:
+    base_h = float(min(horizons_for(engine_id)))
+    if how == "blended":
+        adv = _blended_advantage(informed, base_h=base_h, age_sec=age_sec)
+        return _apply_winner_rollover_guard(adv, features)
+    if how == "tactical":
+        is_market_fallback = (engine_id == "DAY_V2") and str(setup or "").strip().upper().endswith("__MARKET")
+        if is_market_fallback:
+            adv = _blended_advantage(informed, base_h=base_h, age_sec=age_sec)
+        else:
+            tact = [item for item in informed if int(item["horizon"]) <= DAY_TACTICAL_MAX_HORIZON_SEC] or informed
+            adv = max(float(item["value"]) * float(item.get("rem_fade", 1.0)) for item in tact)
+        return _apply_winner_rollover_guard(adv, features)
+    return max(float(item["value"]) for item in informed)
 
 
 def surface_trace(
@@ -335,54 +463,14 @@ def surface_trace(
         )
     if not informed:
         return None
-    if how == "blended":
-        base_h = float(min(horizons_for(engine_id)))
-        hold_weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.15) * float(item.get("rem_fade", 1.0)) for item in informed]
-        hold_adv = sum(float(item["value"]) * w for item, w in zip(informed, hold_weights, strict=True)) / sum(hold_weights)
-        if len(informed) > 1:
-            inf_4h = [item for item in informed if int(item["horizon"]) <= 14400] or informed
-            ws_4h = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.85) for item in inf_4h]
-            blended_4h = sum(float(item["value"]) * w for item, w in zip(inf_4h, ws_4h, strict=True)) / sum(ws_4h)
-            vals_4h = [float(item["value"]) for item in inf_4h]
-            short_v = next((float(item["value"]) for item in inf_4h if int(item["horizon"]) == int(base_h)), vals_4h[0])
-            min_4h = min(vals_4h)
-            h14400 = next((float(item["value"]) for item in inf_4h if int(item["horizon"]) == 14400), vals_4h[-1])
-            h21600 = next((float(item["value"]) for item in informed if int(item["horizon"]) == 21600), h14400)
-            h43200 = next((float(item["value"]) for item in informed if int(item["horizon"]) == 43200), h21600)
-            import statistics as _stats
-
-            downs_4h = [max(vals_4h[: k + 1]) - vals_4h[k] for k in range(len(vals_4h))]
-            down_4h = _stats.stdev(downs_4h) if len(downs_4h) > 1 and max(downs_4h) > min(downs_4h) else 0.0
-            if short_v <= 0.0 or min_4h <= 0.0:
-                term_adv = min(blended_4h, short_v, min_4h)
-                if h14400 < 0.0:
-                    term_adv += h14400
-                if len(vals_4h) > 1 and max(vals_4h) > min(vals_4h):
-                    term_adv -= 0.15 * _stats.stdev(vals_4h) + 0.15 * down_4h
-            else:
-                if down_4h <= 1e-9 and h21600 >= h14400 and h43200 <= h21600 and h14400 <= 5.0 * short_v:
-                    term_adv = blended_4h
-                else:
-                    term_adv = min(blended_4h, short_v)
-                term_adv -= 0.15 * down_4h
-                if h43200 > h14400:
-                    vals_long = [*vals_4h, h21600, h43200]
-                    term_adv -= 0.15 * _stats.stdev(vals_long)
-                elif h21600 < h14400:
-                    term_adv -= 0.15 * (h14400 - h21600)
-            term_weight = max(0.0, 1.0 - age_sec / base_h) if base_h > 0.0 else 0.0
-            advantage = term_weight * term_adv + (1.0 - term_weight) * hold_adv
-        else:
-            advantage = hold_adv
-        if features:
-            mfe_now = max(0.0, float(features.get("mfe") or 0.0))
-            gb_now = max(0.0, float(features.get("giveback") or 0.0))
-            net_now = float(features.get("net") or 0.0)
-            slp_now = float(features.get("slope") or 0.0)
-            if mfe_now >= 0.0020 and gb_now >= 0.35 * mfe_now and net_now > 0.0 and slp_now <= 0.0:
-                advantage = min(float(advantage), -1e-5)
-    else:
-        advantage = max(float(item["value"]) for item in informed)
+    advantage = _aggregate_informed(
+        informed,
+        engine_id=engine_id,
+        setup=setup,
+        features=features,
+        age_sec=age_sec,
+        how=how,
+    )
     return {"advantage": float(advantage), "how": how, "horizons": informed, "coordinates": feature_vector(features)}
 
 

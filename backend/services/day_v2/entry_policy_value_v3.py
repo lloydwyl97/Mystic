@@ -274,6 +274,11 @@ CREATE INDEX IF NOT EXISTS idx_ep_v3_obs_cell_avail
 ON entry_policy_v3_observations(engine_id, economic_version, population, directional_regime, label_available_at)
 """
 
+_V3_OBS_EP_IDX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_ep_v3_obs_episode
+ON entry_policy_v3_observations(episode_id)
+"""
+
 _V3_MODELS_DDL = """
 CREATE TABLE IF NOT EXISTS entry_policy_v3_models (
     engine_id TEXT NOT NULL,
@@ -359,6 +364,7 @@ def _stamp(epoch: float) -> str:
 def ensure_v3_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_V3_OBS_DDL)
     conn.execute(_V3_OBS_IDX_DDL)
+    conn.execute(_V3_OBS_EP_IDX_DDL)
     conn.execute(_V3_MODELS_DDL)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "policy_episodes" in tables:

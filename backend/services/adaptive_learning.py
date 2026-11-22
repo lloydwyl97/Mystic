@@ -799,6 +799,16 @@ def _lattice(
     key_n: dict[str, float] = dict.fromkeys(weights, 0.0)
     is_hold_adv = bool(weights) and all(str(m).startswith("hold_adv_") for m in weights)
     is_claim_gross = bool(weights) and set(weights) == {"claim_gross"}
+    is_mkt_query = stp.endswith(DAY_MARKET_STATE_SUFFIX)
+    has_same_pop = False
+    if is_hold_adv and engine_id == DAY_ENGINE:
+        has_same_pop = any(
+            float(weights.get(str(r["metric"]), 0.0)) > 0
+            and float(r["n"] or 0.0) > 0
+            and not _is_forensic_key(engine_id, r["symbol"], r["setup"], r["regime"])
+            and (str(r["setup"] or "").upper().endswith(DAY_MARKET_STATE_SUFFIX) == is_mkt_query)
+            for r in rows
+        )
     if is_hold_adv and engine_id == DAY_ENGINE and len(weights) > 1:
         scaled_weights: dict[str, float] = {}
         for m, w in weights.items():
@@ -813,6 +823,9 @@ def _lattice(
         raw_n = float(row["n"] or 0.0)
         if metric_w <= 0 or raw_n <= 0 or _is_forensic_key(engine_id, row["symbol"], row["setup"], row["regime"]):
             continue
+        if is_hold_adv and engine_id == DAY_ENGINE and has_same_pop:
+            if str(row["setup"] or "").upper().endswith(DAY_MARKET_STATE_SUFFIX) != is_mkt_query:
+                continue
         n = raw_n * _decay_factor(str(row["updated_at"] or ""), moment, engine_id)
         mean = float(row["ewma"])
         var = max(0.0, float(row["m2"] or 0.0)) / raw_n
