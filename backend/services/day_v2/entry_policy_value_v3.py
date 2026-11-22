@@ -1332,18 +1332,71 @@ def apply_resolved_entry_policy_v3_labels(
         ohlcv_idx = load_causal_ohlcv_15m_index(conn, min_epoch=min_dec)
         pending_rows.sort(key=lambda r: (float(r["label_available_at"]), int(r["id"] or 0)))
 
-        # Read snapshot_json & entry_spread for pending episodes
+        # Read snapshot_json, entry_spread, entry_ask, label_taker_fee for pending episodes
         pending_ids = [int(r["id"]) for r in pending_rows]
-        snap_by_id: dict[int, tuple[str, float | None]] = {}
+        snap_by_id: dict[int, tuple[str, float | None, float | None, float | None]] = {}
         chunk = 500
         for start in range(0, len(pending_ids), chunk):
             sub_ids = pending_ids[start : start + chunk]
             ph = ",".join("?" for _ in sub_ids)
             for srow in conn.execute(
-                f"SELECT id, COALESCE(snapshot_json, '{{}}'), entry_spread FROM policy_episodes WHERE id IN ({ph})",
+                f"SELECT id, COALESCE(snapshot_json, '{{}}'), entry_spread, entry_ask, label_taker_fee FROM policy_episodes WHERE id IN ({ph})",
                 sub_ids,
             ).fetchall():
-                snap_by_id[int(srow[0])] = (str(srow[1] or "{}"), _finite_float(srow[2]))
+                snap_by_id[int(srow[0])] = (
+                    str(srow[1] or "{}"),
+                    _finite_float(srow[2]),
+                    _finite_float(srow[3]),
+                    _finite_float(srow[4]),
+                )
+
+        # Causal tactical-contract target alignment for pre-tactical DETECTOR_FIRED counterfactuals:
+        # When DAY_V2's installed aggregator is 'tactical', unfunded DETECTOR_FIRED counterfactuals
+        # recorded prior to the tactical cutover were terminated early under legacy 'blended'.
+        # Re-evaluating them on causal 1m OHLCV bars under 'tactical' (strictly <= cutoff, never
+        # mutating policy_episodes or funded fills) aligns V3 training labels with the live exit policy.
+        tactical_cutover_ts: float | None = None
+        bars_1m_by_sym: dict[str, tuple[list[float], list[tuple[float, float, float, float, float]]]] = {}
+        tactical_post_cache: dict[tuple[str, str, str, int], list[tuple[int, float, float]]] = {}
+        tactical_ridge: dict[str, Any] = {}
+        if "continuation_learning_meta" in tables:
+            from backend.services.adaptive_learning import current_economic_version
+            from backend.services.continuation_surface import (
+                ADVANTAGE_VERSION,
+                DAY_TACTICAL_MAX_HORIZON_SEC,
+                _aggregate_informed,
+                _blank_ridge,
+                _load_ridge,
+                _ridge_dot,
+                horizons_for,
+                metric_name,
+                state_features,
+            )
+
+            m_row = conn.execute(
+                "SELECT learning_version, source, updated_at FROM continuation_learning_meta WHERE engine_id=? AND economic_version=?",
+                (DAY_ENGINE, current_economic_version(DAY_ENGINE)),
+            ).fetchone()
+            if m_row is not None and str(m_row[0] or "") == ADVANTAGE_VERSION and str(m_row[1] or "") == "horizon_hold_advantage:tactical":
+                tactical_cutover_ts = _parse_ts(m_row[2])
+                pre_tact_det = [
+                    float(r["decided_at"])
+                    for r in pending_rows
+                    if classify_population(str(r["setup"] or "")) == POPULATION_DETECTOR_FIRED
+                    and plan[int(r["id"])].get("target_type") != LABEL_REAL_FUNDED_EXECUTION
+                    and (tactical_cutover_ts is None or float(r["decided_at"]) < tactical_cutover_ts)
+                ]
+                if pre_tact_det and "feature_ohlcv" in tables:
+                    from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
+
+                    min_det_t = min(pre_tact_det)
+                    max_det_end = min(cutoff, max(pre_tact_det) + float(DAY_TACTICAL_MAX_HORIZON_SEC) + 120.0)
+                    for sym_u in SYMBOLS:
+                        rb = ohlcv_bars_1m(db_path, sym_u, min_det_t - 60.0, max_det_end)
+                        if rb:
+                            bars_1m_by_sym[sym_u] = ([b[0] + 60.0 for b in rb], rb)
+                    if bars_1m_by_sym:
+                        tactical_ridge = _load_ridge(db_path, DAY_ENGINE)
 
         touched_cells: set[tuple[str, str]] = set()
         applied = 0
@@ -1366,9 +1419,105 @@ def apply_resolved_entry_policy_v3_labels(
                 is_real = p.get("target_type") == LABEL_REAL_FUNDED_EXECUTION
                 n_sib = max(1, len(sym_bar_pop_setups[(sym, bar_b, pop)]))
                 w_fit = 1.0 if is_real else (float(p["specific_weight"]) / float(n_sib))
+                target_val = _finite_float(p.get("target"))
 
-                if p.get("fold") and w_fit > 0.0 and p.get("target") is not None:
-                    snap_raw, ep_spread = snap_by_id.get(rid, ("{}", None))
+                snap_raw, ep_spread, ep_ask, ep_fee = snap_by_id.get(rid, ("{}", None, None, None))
+                if (
+                    not is_real
+                    and pop == POPULATION_DETECTOR_FIRED
+                    and bars_1m_by_sym
+                    and sym in bars_1m_by_sym
+                    and (tactical_cutover_ts is None or dec_t < tactical_cutover_ts)
+                    and ep_ask is not None
+                    and ep_ask > 0.0
+                ):
+                    from backend.services.adaptive_learning import estimate as _al_estimate
+                    from backend.services.exact_policy_capture import realized_policy_net
+
+                    cts_1m, rb_1m = bars_1m_by_sym[sym]
+                    i0 = bisect.bisect_right(cts_1m, dec_t)
+                    if i0 < len(rb_1m) and cts_1m[i0] <= dec_t + 300.0:
+                        hour_bucket = int(dec_t // 3600.0)
+                        ckey_p = (sym, stp_full, reg, hour_bucket)
+                        if ckey_p not in tactical_post_cache:
+                            h_posts: list[tuple[int, float, float]] = []
+                            for hz in horizons_for(DAY_ENGINE):
+                                vw = _al_estimate(db_path, DAY_ENGINE, sym, stp_full, reg, metric_name(hz), now=dec_t, include_engine=True)
+                                ev_w = float(vw.get("level_weights", {}).get("engine") or 0.0)
+                                if ev_w > 0.0:
+                                    h_posts.append((int(hz), float(vw["mean"]), ev_w))
+                            tactical_post_cache[ckey_p] = h_posts
+                        h_posts = tactical_post_cache[ckey_p]
+                        if h_posts:
+                            spr_use = ep_spread if (ep_spread is not None and ep_spread >= 0.0) else 0.0001
+                            fee_use = ep_fee if (ep_fee is not None and ep_fee >= 0.0) else 0.00033
+                            hw = ep_ask
+                            mfe_t = 0.0
+                            mae_t = 0.0
+                            prev_n = realized_policy_net(ep_ask, ep_ask * (1.0 - spr_use), fee_use)
+                            sim_net: float | None = None
+                            sim_exit_ts: float | None = None
+                            exited_by_policy = False
+                            for k_bar in range(i0, len(rb_1m)):
+                                ot_b, _bo, bh_b, bl_b, bc_b = rb_1m[k_bar]
+                                ct_b = ot_b + 60.0
+                                if ct_b > cutoff:
+                                    break
+                                age_s = ct_b - dec_t
+                                bid_hi = bh_b * (1.0 - spr_use * 0.5)
+                                bid_lo = bl_b * (1.0 - spr_use * 0.5)
+                                bid_c = bc_b * (1.0 - spr_use * 0.5)
+                                hw = max(hw, bh_b)
+                                net_c = realized_policy_net(ep_ask, bid_c, fee_use)
+                                mfe_t = max(mfe_t, realized_policy_net(ep_ask, bid_hi, fee_use))
+                                mae_t = max(mae_t, 0.0, -realized_policy_net(ep_ask, bid_lo, fee_use))
+                                sf_t = state_features(
+                                    entry=ep_ask,
+                                    mark=bid_c,
+                                    net=net_c,
+                                    mfe=mfe_t,
+                                    mae=mae_t,
+                                    high_water=hw,
+                                    prev_net=prev_n,
+                                    age_sec=age_s,
+                                )
+                                informed_t: list[dict[str, Any]] = []
+                                for hz, post_mean, ev_w in h_posts:
+                                    rf = max(0.0, 1.0 - age_s / float(hz)) if hz > 0 else 1.0
+                                    p_adj = post_mean * rf if post_mean > 0.0 else post_mean
+                                    rd = _ridge_dot(tactical_ridge.get(str(hz)) or _blank_ridge(), sf_t, ct_b, DAY_ENGINE)
+                                    informed_t.append(
+                                        {
+                                            "horizon": hz,
+                                            "posterior": p_adj,
+                                            "ridge": rd,
+                                            "evidence": ev_w,
+                                            "rem_fade": max(0.10, rf),
+                                            "value": p_adj + rd,
+                                        }
+                                    )
+                                adv_t = _aggregate_informed(
+                                    informed_t,
+                                    engine_id=DAY_ENGINE,
+                                    setup=stp_full,
+                                    features=sf_t,
+                                    age_sec=age_s,
+                                    how="tactical",
+                                )
+                                prev_n = net_c
+                                sim_net = net_c
+                                sim_exit_ts = ct_b
+                                if adv_t < 0.0 or age_s >= float(DAY_TACTICAL_MAX_HORIZON_SEC):
+                                    exited_by_policy = True
+                                    break
+                            if not exited_by_policy and cutoff < dec_t + float(DAY_TACTICAL_MAX_HORIZON_SEC):
+                                # Strictly causal: tactical trajectory has not yet closed by cutoff.
+                                continue
+                            if sim_net is not None and sim_exit_ts is not None and sim_exit_ts <= cutoff:
+                                target_val = float(sim_net)
+                                avail_t = max(avail_t, float(sim_exit_ts))
+
+                if p.get("fold") and w_fit > 0.0 and target_val is not None:
                     try:
                         snap_obj = json.loads(snap_raw)
                     except json.JSONDecodeError:
@@ -1421,7 +1570,7 @@ def apply_resolved_entry_policy_v3_labels(
                             cid,
                             float(p["specific_weight"]),
                             float(w_fit),
-                            float(p["target"]),
+                            float(target_val),
                             str(p["target_type"]),
                             ENTRY_POLICY_V3_FEATURE_VERSION,
                             f_json,
@@ -1446,7 +1595,7 @@ def apply_resolved_entry_policy_v3_labels(
                     WHERE id=? AND COALESCE(entry_policy_v3_learned, 0)=0
                     """,
                     (
-                        p.get("target"),
+                        target_val,
                         p.get("target_type"),
                         float(w_fit),
                         cid,

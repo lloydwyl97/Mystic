@@ -237,6 +237,8 @@ def scalp_executable_edge(
         value_version = VALUE_VERSION
         gap = calibration = 0.0
         final = entry_value - cost
+        if raw <= 0.0 and (pre_micro + micro) <= 0.0:
+            final = min(final, pre_micro + micro)
     else:
         entry_value = None
         final = pre_micro + micro + gap + calibration

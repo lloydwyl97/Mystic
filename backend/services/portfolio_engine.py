@@ -2904,13 +2904,15 @@ class PortfolioEngine:
     # =========================================================================
 
     def _get_default_symbol_constraints(self) -> dict[str, dict]:
-        """Per-symbol order constraints for the DAY top-4 Binance.US universe."""
-        return {
-            "BTCUSDT": {"qty_step": 0.00001, "min_notional": 11.0},
-            "ETHUSDT": {"qty_step": 0.0001, "min_notional": 11.0},
-            "SOLUSDT": {"qty_step": 0.01, "min_notional": 11.0},
-            "XRPUSDT": {"qty_step": 0.1, "min_notional": 11.0},
+        """Per-symbol order constraints for the DAY top-4 Binance.US universe (both API and slash forms)."""
+        base = {
+            "BTCUSDT": {"qty_step": 0.00001, "min_qty": 0.00001, "min_notional": 11.0},
+            "ETHUSDT": {"qty_step": 0.0001, "min_qty": 0.0001, "min_notional": 11.0},
+            "SOLUSDT": {"qty_step": 0.01, "min_qty": 0.01, "min_notional": 11.0},
+            "XRPUSDT": {"qty_step": 0.1, "min_qty": 0.1, "min_notional": 11.0},
         }
+        slash = {f"{k[:-4]}/USDT": dict(v) for k, v in base.items()}
+        return {**base, **slash}
 
     async def initialize_from_canonical_sources(self) -> None:
         """
@@ -12467,7 +12469,9 @@ class PortfolioEngine:
                 self.last_buy_reject_reason = "SYMBOL_OCCUPIED"
                 return None
 
-        # 4. Normalize quantity to exchange constraints
+        # 4. Normalize quantity to exchange constraints (ensure fresh exchange constraints first when initialized)
+        if getattr(self, "_symbol_constraints", None) is not None:
+            await self._ensure_symbol_constraints(norm)
         qty_q, qty_reason, _est_notional = self._normalize_order_amount(symbol=norm, raw_qty=quantity, price=price, side="BUY")
         if qty_reason != "ok":
             logger.info("SCALP_V2_BUY_BLOCKED symbol=%s qty_reason=%s", norm, qty_reason)

@@ -236,3 +236,180 @@ def test_tactical_continuation_age_zero_continuity_rollover_guard_and_checkpoint
         now=T0 + 900.0,
     )
     assert rolled["action"] == "exit"
+
+
+def test_v3_rebuild_causally_aligns_pretactical_detector_counterfactuals(tmp_path):
+    """Pre-tactical choked DETECTOR_FIRED counterfactuals re-evaluate causally on 1m bars without mutating policy_episodes."""
+    import json
+    import sqlite3
+    import time
+
+    from backend.services.day_v2.entry_policy_value_v3 import entry_policy_value_v3, rebuild_entry_policy_value_v3
+    from backend.services.exact_policy_capture import CAPTURE, ensure_capture_schema
+
+    db = str(tmp_path / "v3_tact_align.db")
+    f_zero = cs.state_features(entry=100.0, mark=100.0, net=-0.00066, mfe=0.0, mae=0.0, high_water=100.0, prev_net=-0.00066, age_sec=0.0)
+    for h_s, adv in ((900, 0.0008), (1800, 0.0015), (3600, 0.0012), (7200, 0.0005), (14400, -0.0025)):
+        cs.record_advantage(
+            db,
+            engine="DAY_V2",
+            symbol="BTCUSDT",
+            setup="BREAKOUT_CONTINUATION",
+            regime="btcup_vollo",
+            horizon=h_s,
+            features=f_zero,
+            advantage=adv,
+            weight=12.0,
+            now=T0,
+        )
+
+    conn = sqlite3.connect(db)
+    ensure_capture_schema(conn)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS continuation_learning_meta (
+            engine_id TEXT NOT NULL,
+            economic_version TEXT NOT NULL,
+            learning_version TEXT NOT NULL,
+            source TEXT NOT NULL,
+            anchor_commit TEXT NOT NULL,
+            anchor_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            observations INTEGER NOT NULL,
+            PRIMARY KEY (engine_id, economic_version)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feature_ohlcv (
+            symbol TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL DEFAULT 10.0
+        )
+        """
+    )
+    cutover_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + 20_000.0))
+    conn.execute(
+        "INSERT OR REPLACE INTO continuation_learning_meta VALUES (?, ?, ?, ?, '7c4e990', ?, ?, 100)",
+        ("DAY_V2", al.current_economic_version("DAY_V2"), cs.ADVANTAGE_VERSION, "horizon_hold_advantage:tactical", cutover_iso, cutover_iso),
+    )
+
+    # Insert 1m bars showing a clean breakout rally (+35 bps over 10m, then mild giveback triggering tactical rollover lock-in)
+    dec_t = T0 + 1800.0
+    for m in range(25):
+        bar_open_t = dec_t + m * 60.0
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(bar_open_t))
+        px = 100.0 + min(m, 10) * 0.04 - max(0, m - 10) * 0.018
+        hi = px + 0.01
+        lo = px - 0.01
+        conn.execute(
+            "INSERT INTO feature_ohlcv (symbol, interval, ts, open, high, low, close, volume) VALUES (?, '1m', ?, ?, ?, ?, ?, 10.0)",
+            ("BTCUSDT", ts_str, px, hi, lo, px),
+        )
+
+    # Pre-tactical episode was choked at 90s with -0.0009 (-9 bps)
+    conn.execute(
+        """
+        INSERT INTO policy_episodes (
+            candidate_id, kind, engine_id, symbol, setup, regime, decided_at, entry_ask, entry_bid,
+            entry_spread, roundtrip_cost, snapshot_json, status, exit_bid, exit_at, label_available_at,
+            exit_reason, gross, net, planning_net, label_taker_fee, capture_version, train_eligible, funded
+        ) VALUES (?, 'COUNTERFACTUAL_POLICY_OUTCOME', 'DAY_V2', 'BTCUSDT', 'BREAKOUT_CONTINUATION', 'btcup_vollo',
+                  ?, 100.0, 99.99, 0.0001, 0.00066, ?, 'CLOSED', 99.97, ?, ?, 'LEARNED_CONTINUATION_EXIT',
+                  -0.0003, -0.00096, -0.00096, 0.00033, ?, 1, 0)
+        """,
+        (101, dec_t, json.dumps({"features": {"sma20_dist": 0.008}}), dec_t + 90.0, dec_t + 90.0, CAPTURE),
+    )
+    conn.commit()
+    conn.close()
+
+    # 1. At cutoff = dec_t + 120s (before tactical trajectory closes), strictly causal: 0 episodes folded!
+    early_reb = rebuild_entry_policy_value_v3(db, now=dec_t + 120.0)
+    assert early_reb["applied"] == 0
+
+    # 2. At cutoff = dec_t + 9000s (after tactical trajectory closes), V3 learns the positive tactical outcome
+    late_reb = rebuild_entry_policy_value_v3(db, now=dec_t + 9000.0)
+    assert late_reb["applied"] == 1
+    pred = entry_policy_value_v3(db, "BTCUSDT", "BREAKOUT_CONTINUATION", "btcup_vollo", now=dec_t + 9000.0)
+    assert pred["expected_policy_net"] > 0.0
+
+    # Original policy_episodes.net was NEVER mutated
+    check_conn = sqlite3.connect(db)
+    orig_net = check_conn.execute("SELECT net FROM policy_episodes WHERE candidate_id=101").fetchone()[0]
+    check_conn.close()
+    assert orig_net == pytest.approx(-0.00096)
+
+
+def test_scalp_zero_claim_negative_market_edge_gate_and_same_setup_calibration(tmp_path):
+    """Exact reproduction of live id=4156/4157: zero-claim rejected setup with market_edge <= 0 cannot buy, and negative micro drags entry value."""
+    from backend.services.portfolio_engine import PortfolioEngine
+    from backend.services.scalp_v2 import continuation_value as cv
+    from backend.services.scalp_v2.executable_edge import scalp_executable_edge
+
+    db = str(tmp_path / "scalp_gate.db")
+    ver = al.current_strategy_version("SCALP_V2")
+
+    # Same-setup negative policy_calibration propagates across sibling symbols/regimes without cross-setup engine deadlock
+    for _ in range(8):
+        al.observe(
+            db,
+            engine="SCALP_V2",
+            symbol="ETHUSDT",
+            setup="RANGE_BOUNCE_SCALP",
+            regime="btcup_vollo",
+            metric="policy_calibration",
+            value=-0.0030,
+            strategy_version=ver,
+            now=T0,
+        )
+    cal = al.scalp_claim_calibration(db, "BTCUSDT", "RANGE_BOUNCE_SCALP", "btcup_vollo", now=T0 + 10.0)
+    assert cal["key_policy_calibration"] < 0.0
+    cold_other = al.scalp_claim_calibration(db, "BTCUSDT", "TREND_PULLBACK_MICRO", "btcup_vollo", now=T0 + 10.0)
+    assert cold_other["key_policy_calibration"] == pytest.approx(0.0, abs=1e-12)
+
+    # Zero-claim (strategy_passed=False, NOT_NEAR_SUPPORT) with negative market_edge (-0.24 bps) is blocked even if entry_value > cost
+    view = {
+        "claim_gross_setup": -0.000108,
+        "claim_gross_mean": 0.000656,
+        "claim_capture": 0.0,
+        "micro_residual": -0.000077,
+        "confidence": 0.95,
+        "risk_estimate": 0.0007,
+    }
+    edge = scalp_executable_edge(
+        view,
+        raw_expected_move_pct=0.0,
+        spread_pct=0.000005,
+        impact_pct=0.0,
+        edge_source="STRATEGY_CLAIM",
+        value_of=lambda _ent: 0.000735,
+    )
+    assert edge.market_edge_pct < 0.0
+    assert not edge.eligible
+
+    # Winner at +12 bps net (mfe = 18 bps gross) is NOT prematurely dumped by ro_drag on a 6.5 bps wiggle
+    model = cv.ValueModel()
+    x0 = cv.vector(cv.entry_position_state(0.0006), {"cost": 0.0006}, "BTCUSDT", "ORDERBOOK_TAPE_SCALP", "btcup_vollo")
+    model.fold([(120, x0, 0.0004, T0, 1.0)] * 30, T0)
+    hold_mid = cv.value(
+        "unused",
+        "BTCUSDT",
+        "ORDERBOOK_TAPE_SCALP",
+        "btcup_vollo",
+        {"net": 0.0012, "mfe": 0.0018, "mae": 0.0002, "giveback": 0.00065, "age_min": 2.5},
+        {"calibrated": 0.0008, "adaptive": 0.0002, "cost": 0.0006},
+        model=model,
+    )
+    assert hold_mid["advantage"] > 0.0
+
+    # Default constraints include both slash and non-slash forms
+    pe = PortfolioEngine.__new__(PortfolioEngine)
+    defaults = pe._get_default_symbol_constraints()
+    assert defaults["BTC/USDT"]["qty_step"] == pytest.approx(0.00001)
+    assert defaults["BTCUSDT"]["qty_step"] == pytest.approx(0.00001)
