@@ -1383,6 +1383,7 @@ def apply_resolved_entry_policy_v3_labels(
                 state_features,
             )
             from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
+            from backend.services.day_v2.live_exit_evaluator import catastrophic_threshold_price
             from backend.services.exact_policy_capture import realized_policy_net
 
             eco_ver = current_economic_version(DAY_ENGINE)
@@ -1406,6 +1407,13 @@ def apply_resolved_entry_policy_v3_labels(
                     _sr_c, spr_c, ask_c, fee_c = snap_by_id.get(rid_c, ("{}", None, None, None))
                     if ask_c is None or ask_c <= 0.0:
                         continue
+                    try:
+                        _sj_c = json.loads(_sr_c) if _sr_c else {}
+                    except (TypeError, ValueError):
+                        _sj_c = {}
+                    _atr15_c = _finite_float(_sj_c.get("atr_15m") if isinstance(_sj_c, dict) else None) or 0.0
+                    _anc_c = _finite_float(_sj_c.get("structural_anchor") if isinstance(_sj_c, dict) else None) or 0.0
+                    _cat_px = catastrophic_threshold_price(float(ask_c), _atr15_c, _anc_c) if _atr15_c > 0.0 else 0.0
                     pre_tact_cands.append(
                         {
                             "rid": rid_c,
@@ -1416,6 +1424,7 @@ def apply_resolved_entry_policy_v3_labels(
                             "ep_ask": float(ask_c),
                             "spr": float(spr_c) if (spr_c is not None and spr_c >= 0.0) else 0.0001,
                             "fee": float(fee_c) if (fee_c is not None and fee_c >= 0.0) else 0.00033,
+                            "cat_px": max(0.0, float(_cat_px)),
                         }
                     )
 
@@ -1625,6 +1634,15 @@ def apply_resolved_entry_policy_v3_labels(
                                 net_c = realized_policy_net(ep_ask_v, bid_c, fee_v)
                                 st_ep["mfe_t"] = max(st_ep["mfe_t"], realized_policy_net(ep_ask_v, bid_hi, fee_v))
                                 st_ep["mae_t"] = max(st_ep["mae_t"], 0.0, -realized_policy_net(ep_ask_v, bid_lo, fee_v))
+                                cat_px_v = float(c_ep.get("cat_px") or 0.0)
+                                if cat_px_v > 0.0 and bl_b <= cat_px_v:
+                                    cat_fill = min(bh_b, max(bl_b, cat_px_v)) * (1.0 - spr_v * 0.5)
+                                    st_ep["saw_informed"] = True
+                                    st_ep["sim_net"] = realized_policy_net(ep_ask_v, cat_fill, fee_v)
+                                    st_ep["sim_exit_ts"] = ct_b
+                                    st_ep["exited"] = True
+                                    st_ep["prev_n"] = st_ep["sim_net"]
+                                    continue
 
                                 pck = (c_ep["sym"], c_ep["stp_full"], c_ep["reg"], int(ct_b // 60.0), ev_idx)
                                 if pck not in post_cache:

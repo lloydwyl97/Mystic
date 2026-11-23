@@ -978,3 +978,24 @@ async def test_live_forensic_repairs_trend_hold_market_block_breakout_capture_an
     assert pf_eth.passed is True
     assert pf_eth.protected_limit_price >= 1744.05  # Clears second walked book level!
     assert pf_eth.protected_limit_price <= 1743.90 * 1.0005 + 1e-9
+
+    # 6. Immediate blow-off top failure (-125 bps with mfe=0) exits cleanly instead of riding -330 bps
+    d_blowoff = decide_day_continuation(
+        db,
+        symbol="SOLUSDT",
+        setup="BREAKOUT_CONTINUATION",
+        regime="btcup_volhi",
+        entry_price=77.56,
+        mark=76.59,
+        low=76.55,
+        high=77.56,
+        prev_net=-0.0080,
+        age_sec=180.0,
+        atr_at_entry=0.80,
+        structural_anchor=76.32,
+        target_price=80.03,
+        entry_time=T0,
+        roundtrip_cost=cost,
+        now=T0 + 180.0,
+    )
+    assert d_blowoff["action"] == "exit"

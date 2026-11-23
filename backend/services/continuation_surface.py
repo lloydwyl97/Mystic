@@ -281,7 +281,12 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
     arm_mfe = _min_rollover_mfe(setup, age_m)
     is_trend = str(setup or "").strip().upper() in DAY_TREND_SETUPS
     curr_mae = min(mae_v, max(0.0, -net_v - 0.00066)) if mae_v > 0.0 else max(0.0, -net_v - 0.00066)
-    raw_ft["mae"] = curr_mae if (age_m >= (30.0 if is_trend else 12.0) and mfe_v < 0.0004) else ((0.25 if is_trend else 0.40) * curr_mae)
+    if age_m >= (30.0 if is_trend else 12.0) and mfe_v < 0.0004:
+        raw_ft["mae"] = curr_mae
+    else:
+        grace_mae = min(curr_mae, 0.0075)
+        excess_mae = max(0.0, curr_mae - 0.0075)
+        raw_ft["mae"] = (0.25 if is_trend else 0.40) * grace_mae + 1.5 * excess_mae
     if mfe_v >= arm_mfe and gb_v >= ro_frac * mfe_v:
         raw_ft["mae"] = max(raw_ft["mae"], 2.5 * gb_v)
     vec = feature_vector(raw_ft)
@@ -582,6 +587,9 @@ def _aggregate_informed(
             else:
                 tact = [item for item in informed if int(item["horizon"]) <= DAY_TACTICAL_MAX_HORIZON_SEC] or informed
                 adv = max(float(item["value"]) * float(item.get("rem_fade", 1.0)) for item in tact)
+            slp_now = float((features or {}).get("slope") or 0.0)
+            if age_sec >= 120.0 and mfe_now < 0.0015 and net_now <= -0.0105 and mae_now >= 0.0115 and slp_now <= 0.0:
+                adv = min(float(adv), -1e-5)
         return _apply_winner_rollover_guard(adv, features, setup=stp_u)
     return max(float(item["value"]) for item in informed)
 
