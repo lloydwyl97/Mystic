@@ -32,10 +32,15 @@ class TrendPullbackMicroStrategy:
         if len(bars) < 12:
             return reject_signal(ctx, self.name, "INSUFFICIENT_BARS")
 
-        # simple ema pullback proxy on recent 1m
+        # Require genuine 12m micro-uptrend and block post-blowoff falling-knife rollovers
+        c12 = [b["close"] for b in bars[-12:]]
+        high12 = max(b["high"] for b in bars[-12:])
+        sma12 = sum(c12) / len(c12)
         closes = [b["close"] for b in bars[-8:]]
         ema5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else closes[-1]
-        pullback = ctx.snap.mid < ema5 * 1.0005 and ctx.snap.mid > ema5 * 0.998
+        uptrend = ema5 >= sma12 and c12[-1] >= c12[0] * 0.9995
+        post_blowoff_rollover = high12 > 0 and (high12 - ctx.snap.mid) / high12 > 0.0040 and ctx.snap.mid < ema5
+        pullback = uptrend and not post_blowoff_rollover and ctx.snap.mid < ema5 * 1.0005 and ctx.snap.mid > ema5 * 0.998
 
         mom = ctx.mom
         resume = mom.mid_change_15s > -0.00005  # not strongly down

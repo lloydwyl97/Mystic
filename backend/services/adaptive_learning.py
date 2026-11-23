@@ -1672,6 +1672,9 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
             continue
         if isolate_regime:
             if level == "setup":
+                slope = (slope_info * slope + cov) / (slope_info + var)
+                if w > 0:
+                    center = sb / w if center is None else (ps_reg * center + sb) / (ps_reg + w)
                 continue
             w_r, sb_r, cov_r, var_r = (sum(acc_same_reg[lvl][j] for lvl in LATTICE_LEVELS[i:]) for j in range(4))
             slope = (slope_info * slope + cov_r) / (slope_info + var_r)
@@ -1712,7 +1715,12 @@ def scalp_expected_gross(view: dict[str, Any], raw: float) -> dict[str, float]:
     raw_v = max(0.0, float(raw or 0.0))
     center_v = float(view.get("claim_raw_center") or 0.0)
     slope_mult = 0.12 if ("key_policy_calibration" in view and center_v > 0.0) else 1.0
-    calibrated = setup_mean + slope_mult * capture * (raw_v - center_v)
+    if slope_mult < 1.0 and raw_v > 0.0060:
+        capped_raw = min(raw_v, max(center_v, 0.0060))
+        breakout_excess = max(0.0, raw_v - max(center_v, 0.0060))
+        calibrated = setup_mean + slope_mult * capture * (capped_raw - center_v) + capture * breakout_excess
+    else:
+        calibrated = setup_mean + slope_mult * capture * (raw_v - center_v)
     adaptive = _clamp(float(view.get("claim_gross_mean") or 0.0) - setup_mean, -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX)
     return {
         "capture": capture,

@@ -300,12 +300,12 @@ def test_v3_rebuild_causally_aligns_pretactical_detector_counterfactuals(tmp_pat
         ("DAY_V2", al.current_economic_version("DAY_V2"), cs.ADVANTAGE_VERSION, "horizon_hold_advantage:tactical", cutover_iso, cutover_iso),
     )
 
-    # Insert 1m bars showing a clean breakout rally (+35 bps over 10m, then mild giveback triggering tactical rollover lock-in)
+    # Insert 1m bars showing a clean breakout rally (+45 bps net over 10m, then giveback triggering tactical rollover lock-in)
     dec_t = T0 + 1800.0
     for m in range(25):
         bar_open_t = dec_t + m * 60.0
         ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(bar_open_t))
-        px = 100.0 + min(m, 10) * 0.04 - max(0, m - 10) * 0.018
+        px = 100.0 + min(m, 10) * 0.052 - max(0, m - 10) * 0.022
         hi = px + 0.01
         lo = px - 0.01
         conn.execute(
@@ -820,3 +820,161 @@ def test_scalp_directional_claim_unclipped_and_market_population_separated(tmp_p
         eth_rem = conn.execute("SELECT remaining_position FROM paper_trades WHERE trade_id='eth_real_orphan'").fetchone()[0]
     assert sol_rem == pytest.approx(0.0)
     assert eth_rem == pytest.approx(0.10)  # Real unclosed lot is NEVER zeroed!
+
+
+@pytest.mark.asyncio
+async def test_live_forensic_repairs_trend_hold_market_block_breakout_capture_and_ioc_cushion(tmp_path):
+    """Verify all 5 live profit repairs: DAY trend hold + constrained ridge, SCALP __MARKET block + >60bps capture + rollover guard, and IOC cushion."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from backend.services.binance_scalp.config import get_scalp_config
+    from backend.services.binance_scalp.economics import ScalpEconomics
+    from backend.services.binance_scalp.market_reader import MarketSnapshot
+    from backend.services.binance_scalp.scalp_candidate_ranking import rank_setup_signal
+    from backend.services.binance_scalp.strategies.base import StrategyMarketContext
+    from backend.services.binance_scalp.strategies.common import reject_signal
+    from backend.services.binance_scalp.strategies.trend_pullback_micro import TrendPullbackMicroStrategy
+    from backend.services.protected_limit_execution import ExecutableBook, run_protected_preflight
+
+    db = str(tmp_path / "forensic_repairs.db")
+    install_day_surface(db, how="tactical")
+    cost = canonical_roundtrip_cost_pct()
+    f0 = cs.state_features(entry=71.42, mark=71.42, net=-cost, mfe=0.0, mae=0.0, high_water=71.42, prev_net=None, age_sec=0.0)
+
+    # 1. DAY_V2 BREAKOUT_CONTINUATION with negative short horizons but strong +6h/+12h holds through 4.8m -4 bps breath AND 8m -59 bps pullback
+    sol_profile = {900: -0.0026, 1800: -0.0025, 3600: -0.0026, 7200: -0.0027, 14400: -0.0017, 21600: 0.0061, 43200: 0.0238}
+    for h, adv in sol_profile.items():
+        cs.record_advantage(db, engine="DAY_V2", symbol="SOLUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi", horizon=h, features=f0, advantage=adv, weight=20.0, now=T0)
+
+    # Seed noisy collinear observations that previously made unconstrained OLS slope beta negative
+    st_r = cs._blank_ridge()
+    cs._update_ridge(st_r, {"net": 0.0020, "mfe": 0.0030, "mae": 0.0, "giveback": 0.0005, "dist_high": 0.0005, "slope": 0.0025, "age_min": 5.0}, -0.0040, 3.0, T0, "DAY_V2")
+    cs._update_ridge(st_r, {"net": -0.0005, "mfe": 0.0010, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0011, "slope": -0.0015, "age_min": 10.0}, 0.0030, 3.0, T0 + 60, "DAY_V2")
+    # Positive surge candle must NEVER receive negative dot penalty from noisy slope
+    surge_dot = cs._ridge_dot(st_r, {"net": 0.0040, "mfe": 0.0050, "mae": 0.0, "giveback": 0.0, "dist_high": 0.0, "slope": 0.0035, "age_min": 8.0}, T0 + 120, "DAY_V2", setup="BREAKOUT_CONTINUATION")
+    assert surge_dot >= -1e-9
+
+    # 4.8m +18.5 bps winner with 19.7 bps breath (-4.1 bps slope) holds for +6h/+12h breakout wave
+    dec_4m = decide_day_continuation(
+        db,
+        symbol="SOLUSDT",
+        setup="BREAKOUT_CONTINUATION",
+        regime="btcup_volhi",
+        entry_price=71.42,
+        mark=71.58,
+        low=71.42,
+        high=71.72,
+        prev_net=0.0020,
+        age_sec=291.0,
+        atr_at_entry=0.35,
+        structural_anchor=70.60,
+        target_price=74.00,
+        entry_time=T0,
+        roundtrip_cost=cost,
+        now=T0 + 291.0,
+    )
+    assert dec_4m["action"] == "hold"
+
+    # 7.9m -59 bps minor pullback above structural anchor ALSO holds instead of panic-shaking out
+    dec_dip = decide_day_continuation(
+        db,
+        symbol="SOLUSDT",
+        setup="BREAKOUT_CONTINUATION",
+        regime="btcup_volhi",
+        entry_price=72.20,
+        mark=71.80,
+        low=71.80,
+        high=72.24,
+        prev_net=-0.0040,
+        age_sec=472.0,
+        atr_at_entry=0.56,
+        structural_anchor=70.80,
+        target_price=75.00,
+        entry_time=T0,
+        roundtrip_cost=cost,
+        now=T0 + 472.0,
+    )
+    assert dec_dip["action"] == "hold"
+
+    # 2. SCALP_V2 unclaimed *__MARKET reject is NEVER entry_eligible even if residual/value is positive
+    sc_db = str(tmp_path / "scalp_mkt_guard.db")
+    sc_ver = al.current_strategy_version(al.SCALP_ENGINE)
+    for step in range(25):
+        al.learn_claim_label(sc_db, symbol="SOLUSDT", setup="VWAP_EMA_RECLAIM__MARKET", regime="btcup_volhi", strategy_version=sc_ver, raw=0.0, gross=0.0035, now=T0 + step)
+    cfg = SimpleNamespace(**{**get_scalp_config().__dict__, "database_path": sc_db})
+    snap = MarketSnapshot(
+        symbol="SOL/USDT",
+        symbol_bus="SOLUSDT",
+        best_bid=75.945,
+        best_ask=75.955,
+        mid=75.95,
+        spread_pct=0.00013,
+        bids=[[75.945, 100.0]],
+        asks=[[75.955, 100.0]],
+        redis_spread_pct=0.00013,
+        order_book_imbalance=0.1,
+        book_source="ws",
+        orderbook_age_sec=0.1,
+    )
+    mom = SimpleNamespace(
+        mid_change_5s=0.0,
+        mid_change_15s=0.0001,
+        mid_change_30s=0.0001,
+        mid_change_60s=0.0001,
+        bid_change_15s=0.0001,
+        ask_change_15s=0.0001,
+        velocity_bps_per_s=0.1,
+        microprice_pressure=0.0,
+        insufficient_history=False,
+    )
+    bars_up = [{"open": 75.0 + i * 0.08, "high": 75.1 + i * 0.08, "low": 74.95 + i * 0.08, "close": 75.05 + i * 0.08, "volume": 20.0} for i in range(15)]
+    ctx = StrategyMarketContext(symbol="SOL/USDT", snap=snap, bars_1m=bars_up, mom=mom, notional_usd=100.0, econ=ScalpEconomics.from_env(), config=cfg)
+    with patch("backend.services.binance_scalp.config.get_scalp_config", return_value=cfg), patch("backend.services.microstructure_engine.compute_features", return_value={}):
+        rej = reject_signal(ctx, "vwap_ema_reclaim", "NOT_NEAR_SUPPORT", mechanical=False, score=0.75)
+        rc_mkt = rank_setup_signal(rej, regime="bull_trend", ctx=ctx)
+    assert rc_mkt.adaptive_decision["setup"] == "VWAP_EMA_RECLAIM__MARKET"
+    assert not rc_mkt.entry_eligible
+    assert rc_mkt.hard_block == "NO_EXECUTABLE_NET_EDGE"
+
+    # 3. SCALP_V2 isolate_regime inherits setup capture prior and >60bps breakout claims get un-amputated capture
+    for i, (r_raw, r_gross) in enumerate(((0.0030, 0.0008), (0.0090, 0.0032), (0.0150, 0.0056)) * 6):
+        al.learn_claim_label(sc_db, symbol="BTCUSDT", setup="VOLUME_IMPULSE_CONTINUATION", regime="btcup_vollo", strategy_version=sc_ver, raw=r_raw, gross=r_gross, now=T0 + i)
+    # Flat-raw regime cell on SOL btcup_volhi should inherit positive setup slope instead of 0.0
+    for i in range(5):
+        al.learn_claim_label(sc_db, symbol="SOLUSDT", setup="VOLUME_IMPULSE_CONTINUATION", regime="btcup_volhi", strategy_version=sc_ver, raw=0.0092, gross=0.0010, now=T0 + 50 + i)
+    cal_vic = al.scalp_claim_calibration(sc_db, "SOLUSDT", "VOLUME_IMPULSE_CONTINUATION", "btcup_volhi", now=T0 + 100)
+    assert cal_vic["claim_capture"] > 0.10
+    mv_big = al.scalp_expected_gross(cal_vic, 0.0160)
+    assert mv_big["calibrated"] > cost * 1.5
+
+    # 4. TrendPullbackMicroStrategy rejects post-blowoff falling-knife rollover (-200 bps off 12m high)
+    rollover_bars = [{"open": 1.024 - i * 0.0018, "high": 1.025 - i * 0.0016, "low": 1.022 - i * 0.0018, "close": 1.023 - i * 0.0018, "volume": 50.0} for i in range(12)]
+    xrp_snap = MarketSnapshot(
+        symbol="XRP/USDT",
+        symbol_bus="XRPUSDT",
+        best_bid=1.0049,
+        best_ask=1.0051,
+        mid=1.0050,
+        spread_pct=0.0002,
+        bids=[[1.0049, 5000.0]],
+        asks=[[1.0051, 5000.0]],
+        redis_spread_pct=0.0002,
+        order_book_imbalance=0.0,
+        book_source="ws",
+        orderbook_age_sec=0.1,
+    )
+    xrp_ctx = StrategyMarketContext(symbol="XRP/USDT", snap=xrp_snap, bars_1m=rollover_bars, mom=mom, notional_usd=100.0, econ=ScalpEconomics.from_env(), config=cfg)
+    assert TrendPullbackMicroStrategy().evaluate(xrp_ctx).passed is False
+
+    # 5. Protected IOC preflight adds tick cushion above walked ask levels while staying <= MAX_ORDERBOOK_PRICE_IMPACT_PCT
+    now_b = T0
+    eth_book = ExecutableBook(bids=[[1743.80, 2.0]], asks=[[1743.90, 0.10], [1744.05, 1.0]], last_update_id=1, source_ts=now_b, receive_ts=now_b)
+    with (
+        patch("backend.services.protected_limit_execution._fetch_order_book", AsyncMock(return_value=eth_book)),
+        patch("backend.services.protected_limit_execution.time.time", return_value=now_b + 0.1),
+    ):
+        pf_eth = await run_protected_preflight(symbol="ETH/USDT", side="BUY", quantity=0.1626, reference_price=1743.90, live_capable=True)
+    assert pf_eth.passed is True
+    assert pf_eth.protected_limit_price >= 1744.05  # Clears second walked book level!
+    assert pf_eth.protected_limit_price <= 1743.90 * 1.0005 + 1e-9

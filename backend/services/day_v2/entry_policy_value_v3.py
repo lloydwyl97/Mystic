@@ -1371,6 +1371,7 @@ def apply_resolved_entry_policy_v3_labels(
             from backend.services.continuation_surface import (
                 ADVANTAGE_VERSION,
                 DAY_TACTICAL_MAX_HORIZON_SEC,
+                DAY_TREND_SETUPS,
                 HOLD_ADVANTAGE_METRICS,
                 _aggregate_informed,
                 _blank_ridge,
@@ -1421,7 +1422,7 @@ def apply_resolved_entry_policy_v3_labels(
                 if pre_tact_cands:
                     min_det_t = min(c["dec_t"] for c in pre_tact_cands)
                     max_det_t = max(c["dec_t"] for c in pre_tact_cands)
-                    max_det_end = min(cutoff, max_det_t + float(DAY_TACTICAL_MAX_HORIZON_SEC) + 120.0)
+                    max_det_end = min(cutoff, max_det_t + 43200.0 + 120.0)
                     bars_1m_by_sym: dict[str, tuple[list[float], list[tuple[float, float, float, float, float]]]] = {}
                     for sym_u in SYMBOLS:
                         rb = ohlcv_bars_1m(db_path, sym_u, min_det_t - 60.0, max_det_end)
@@ -1669,7 +1670,7 @@ def apply_resolved_entry_policy_v3_labels(
                                     for hz_i, p_mean, ev_w_i in h_posts_ep:
                                         rf = max(0.0, 1.0 - age_s / float(hz_i)) if hz_i > 0 else 1.0
                                         p_adj = p_mean * rf if p_mean > 0.0 else p_mean
-                                        rd = _ridge_dot(mem_ridge.get(hz_i) or _blank_ridge(), sf_t, ct_b, DAY_ENGINE)
+                                        rd = _ridge_dot(mem_ridge.get(hz_i) or _blank_ridge(), sf_t, ct_b, DAY_ENGINE, setup=c_ep["stp_full"])
                                         informed_t.append(
                                             {
                                                 "horizon": hz_i,
@@ -1688,17 +1689,27 @@ def apply_resolved_entry_policy_v3_labels(
                                         age_sec=age_s,
                                         how="tactical",
                                     )
+                                    if base_setup_name(c_ep["stp_full"]) in DAY_TREND_SETUPS:
+                                        pos_trend_hz = max(
+                                            (float(hz_q) for hz_q, p_m, _ in h_posts_ep if p_m > 0.0 and int(hz_q) <= 43200),
+                                            default=float(DAY_TACTICAL_MAX_HORIZON_SEC),
+                                        )
+                                        ep_max_h = max(float(DAY_TACTICAL_MAX_HORIZON_SEC), pos_trend_hz)
+                                    else:
+                                        ep_max_h = float(DAY_TACTICAL_MAX_HORIZON_SEC)
+                                    st_ep["ep_max_h"] = ep_max_h
                                     st_ep["sim_net"] = net_c
                                     st_ep["sim_exit_ts"] = ct_b
-                                    if adv_t < 0.0 or age_s >= float(DAY_TACTICAL_MAX_HORIZON_SEC):
+                                    if adv_t < 0.0 or age_s >= ep_max_h:
                                         st_ep["exited"] = True
                                 st_ep["prev_n"] = net_c
 
                                 if not st_ep["exited"]:
                                     nxt_i = k_bar + 1
+                                    ep_max_h_nxt = float(st_ep.get("ep_max_h") or DAY_TACTICAL_MAX_HORIZON_SEC)
                                     if nxt_i < len(rb_ep):
                                         nxt_ct = rb_ep[nxt_i][0] + 60.0
-                                        if nxt_ct <= cutoff and (nxt_ct - c_ep["dec_t"]) <= float(DAY_TACTICAL_MAX_HORIZON_SEC) + 120.0:
+                                        if nxt_ct <= cutoff and (nxt_ct - c_ep["dec_t"]) <= ep_max_h_nxt + 120.0:
                                             st_ep["idx"] = nxt_i
                                             heapq.heappush(bar_heap, (nxt_ct, rid_s))
 
@@ -1706,7 +1717,8 @@ def apply_resolved_entry_policy_v3_labels(
                                 if not st_f["saw_informed"]:
                                     continue
                                 dec_f_t = st_f["cand"]["dec_t"]
-                                if not st_f["exited"] and cutoff < dec_f_t + float(DAY_TACTICAL_MAX_HORIZON_SEC):
+                                ep_max_h_fin = float(st_f.get("ep_max_h") or DAY_TACTICAL_MAX_HORIZON_SEC)
+                                if not st_f["exited"] and cutoff < dec_f_t + ep_max_h_fin:
                                     pretactical_outcomes[rid_f] = ("UNRESOLVED_AT_CUTOFF", 0.0, cutoff)
                                 elif st_f["sim_net"] is not None and st_f["sim_exit_ts"] is not None and st_f["sim_exit_ts"] <= cutoff:
                                     pretactical_outcomes[rid_f] = ("RESOLVED", float(st_f["sim_net"]), float(st_f["sim_exit_ts"]))

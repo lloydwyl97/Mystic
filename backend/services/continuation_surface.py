@@ -36,6 +36,7 @@ ADVANTAGE_VERSION = "CONTINUATION_ADVANTAGE_V1"
 SURFACE_MODEL = "continuation_surface"
 DAY_ADVANTAGE_HORIZONS = (900, 1800, 3600, 7200, 14400, 21600, 43200)
 DAY_TACTICAL_MAX_HORIZON_SEC = 7200
+DAY_TREND_SETUPS = frozenset({"BREAKOUT_CONTINUATION", "HTF_TREND_PULLBACK"})
 SCALP_ADVANTAGE_HORIZONS = (30, 60, 120, 300, 600, 1200, 1800, 3600)
 VALID_AGGREGATORS = frozenset({"best", "blended", "tactical"})
 
@@ -253,7 +254,20 @@ def day_progressive_rollover_frac(mfe: float) -> float:
     return 0.16
 
 
-def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: float, engine: str) -> float:
+def _min_rollover_mfe(setup: str, age_min: float) -> float:
+    """Minimum MFE before winner-rollover profit-lock arms.
+
+    During the initial 12m breakout bar formation, trend/breakout setups require
+    85 bps MFE before arming rollover; after 12m they arm at 42 bps so genuine
+    rollovers lock profit while surviving normal intrabar noise.
+    """
+    stp_u = str(setup or "").strip().upper()
+    if stp_u in DAY_TREND_SETUPS:
+        return 0.0042 if age_min >= 12.0 else 0.0085
+    return 0.0028
+
+
+def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: float, engine: str, *, setup: str = "") -> float:
     _decay_ridge(stats, now, engine)
     if float(stats.get("n") or 0.0) <= 0 or features is None:
         return 0.0
@@ -264,29 +278,36 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
     gb_v = max(0.0, float(raw_ft.get("giveback") or 0.0))
     net_v = float(raw_ft.get("net") or 0.0)
     ro_frac = day_progressive_rollover_frac(mfe_v)
+    arm_mfe = _min_rollover_mfe(setup, age_m)
+    is_trend = str(setup or "").strip().upper() in DAY_TREND_SETUPS
     curr_mae = min(mae_v, max(0.0, -net_v - 0.00066)) if mae_v > 0.0 else max(0.0, -net_v - 0.00066)
-    raw_ft["mae"] = curr_mae if (age_m >= 12.0 and mfe_v < 0.0004) else (0.40 * curr_mae)
-    if mfe_v >= 0.0028 and gb_v >= ro_frac * mfe_v:
+    raw_ft["mae"] = curr_mae if (age_m >= (30.0 if is_trend else 12.0) and mfe_v < 0.0004) else ((0.25 if is_trend else 0.40) * curr_mae)
+    if mfe_v >= arm_mfe and gb_v >= ro_frac * mfe_v:
         raw_ft["mae"] = max(raw_ft["mae"], 2.5 * gb_v)
     vec = feature_vector(raw_ft)
-    z = np.asarray(_standardize(stats, vec), dtype=float)
-    ps = float(PRIOR_STRENGTH) / float(max(1, len(horizons_for(engine))))
-    xtx = np.asarray(stats["xtx"], dtype=float) + ps * np.eye(len(FEATURE_NAMES))
-    xty = np.asarray(stats["xty"], dtype=float)
-    try:
-        beta = np.linalg.solve(xtx, xty)
-    except np.linalg.LinAlgError:
-        return 0.0
-    if mfe_v >= 0.0028 and gb_v >= ro_frac * mfe_v and float(beta[0]) < 0.0:
-        peak_vec = list(vec)
-        peak_vec[0] = max(net_v, mfe_v - 0.00066)
-        z[0] = float(_standardize(stats, peak_vec)[0])
-    for idx_f in (0, 1, 5):
-        if float(beta[idx_f]) < 0.0 and float(z[idx_f]) < 0.0:
-            z[idx_f] = 0.0
-    for idx_a in (2, 3, 4):
-        if float(beta[idx_a]) > 0.0:
-            beta[idx_a] = 0.0
+    z = np.clip(np.asarray(_standardize(stats, vec), dtype=float), -4.0, 4.0)
+    base_ps = float(PRIOR_STRENGTH) / float(max(1, len(horizons_for(engine))))
+    ps = max(base_ps, 4.0) if str(engine or "").upper() == "DAY_V2" else base_ps
+    xtx_full = np.asarray(stats["xtx"], dtype=float) + ps * np.eye(len(FEATURE_NAMES))
+    xty_full = np.asarray(stats["xty"], dtype=float)
+    # Active-set sign-constrained Ridge so collinear adverse features (giveback/dist_high)
+    # re-solve cleanly and favorable features (net/mfe/slope) never get negative beta.
+    active = list(range(len(FEATURE_NAMES)))
+    beta = np.zeros(len(FEATURE_NAMES), dtype=float)
+    for _ in range(len(FEATURE_NAMES)):
+        if not active:
+            break
+        try:
+            sub_b = np.linalg.solve(xtx_full[np.ix_(active, active)], xty_full[active])
+        except np.linalg.LinAlgError:
+            return 0.0
+        violated = [idx for pos_i, idx in enumerate(active) if (idx in (0, 1, 5) and float(sub_b[pos_i]) < 0.0) or (idx in (2, 3, 4) and float(sub_b[pos_i]) > 0.0)]
+        if not violated:
+            for pos_i, idx in enumerate(active):
+                beta[idx] = float(sub_b[pos_i])
+            break
+        for v_idx in violated:
+            active.remove(v_idx)
     dot = float(z @ beta)
     return dot if math.isfinite(dot) else 0.0
 
@@ -341,7 +362,7 @@ class ContinuationMemory:
         if evidence <= 0:
             return 0.0, 0.0
         stats = self.ridge.get((engine_id, int(horizon))) or _blank_ridge()
-        return float(lat["mean"]) + _ridge_dot(stats, features, now, engine_id), evidence
+        return float(lat["mean"]) + _ridge_dot(stats, features, now, engine_id, setup=setup), evidence
 
     def advantage(self, engine: str, symbol: str, setup: str, regime: str, features: dict[str, float] | None, now: float, *, how: str = "best") -> tuple[float, int | None]:
         engine_id = str(engine or "").upper()
@@ -353,11 +374,13 @@ class ContinuationMemory:
         if not informed:
             return 0.0, None
         if how == "tactical":
-            is_mkt = (engine_id == "DAY_V2") and str(setup or "").strip().upper().endswith("__MARKET")
+            stp_u = str(setup or "").strip().upper()
+            is_mkt = (engine_id == "DAY_V2") and stp_u.endswith("__MARKET")
             if is_mkt:
                 weight = sum(item[2] for item in informed)
                 return sum(item[1] * item[2] for item in informed) / weight, max(informed, key=lambda item: item[2])[0]
-            tact_pool = [it for it in informed if int(it[0]) <= DAY_TACTICAL_MAX_HORIZON_SEC] or informed
+            max_h = 43200 if (engine_id == "DAY_V2" and stp_u in DAY_TREND_SETUPS) else DAY_TACTICAL_MAX_HORIZON_SEC
+            tact_pool = [it for it in informed if int(it[0]) <= max_h] or informed
             chosen = max(tact_pool, key=lambda item: item[1])
             return chosen[1], chosen[0]
         if how == "blended":
@@ -501,16 +524,20 @@ def _blended_advantage(informed: list[dict[str, Any]], *, base_h: float, age_sec
     return term_weight * term_adv + (1.0 - term_weight) * hold_adv
 
 
-def _apply_winner_rollover_guard(advantage: float, features: dict[str, float] | None) -> float:
+def _apply_winner_rollover_guard(advantage: float, features: dict[str, float] | None, *, setup: str = "") -> float:
     if not features:
         return advantage
     mfe_now = max(0.0, float(features.get("mfe") or 0.0))
     gb_now = max(0.0, float(features.get("giveback") or 0.0))
     net_now = float(features.get("net") or 0.0)
     slp_now = float(features.get("slope") or 0.0)
-    if mfe_now < 0.0028 or net_now <= 0.0 or slp_now > 0.0:
+    age_min = max(0.0, float(features.get("age_min") or 0.0))
+    stp_u = str(setup or "").strip().upper()
+    if mfe_now < _min_rollover_mfe(stp_u, age_min) or net_now <= 0.0 or slp_now > 0.0:
         return advantage
     ro_frac = day_progressive_rollover_frac(mfe_now)
+    if stp_u in DAY_TREND_SETUPS and mfe_now < 0.0090:
+        ro_frac = max(ro_frac, 0.44)
     live_obi = float(features.get("live_obi") or 0.0)
     live_flow = float(features.get("live_flow") or 0.0)
     if mfe_now >= 0.0040 and live_obi <= -0.30 and live_flow <= -0.30:
@@ -530,28 +557,32 @@ def _aggregate_informed(
     how: str,
 ) -> float:
     base_h = float(min(horizons_for(engine_id)))
+    stp_u = str(setup or "").strip().upper()
     if how == "blended":
         adv = _blended_advantage(informed, base_h=base_h, age_sec=age_sec)
-        return _apply_winner_rollover_guard(adv, features)
+        return _apply_winner_rollover_guard(adv, features, setup=stp_u)
     if how == "tactical":
-        is_market_fallback = (engine_id == "DAY_V2") and str(setup or "").strip().upper().endswith("__MARKET")
+        is_market_fallback = (engine_id == "DAY_V2") and stp_u.endswith("__MARKET")
         if is_market_fallback:
             adv = _blended_advantage(informed, base_h=base_h, age_sec=age_sec)
         else:
             mfe_now = max(0.0, float((features or {}).get("mfe") or 0.0))
+            mae_now = max(0.0, float((features or {}).get("mae") or 0.0))
             gb_now = max(0.0, float((features or {}).get("giveback") or 0.0))
             net_now = float((features or {}).get("net") or 0.0)
-            slp_now = float((features or {}).get("slope") or 0.0)
             ro_frac = day_progressive_rollover_frac(mfe_now)
-            climbing_runner = age_sec > 0.0 and mfe_now >= 0.0030 and net_now > 0.0 and slp_now >= -0.0002 and gb_now < 0.65 * ro_frac * mfe_now
-            if climbing_runner:
-                # Active breakout runner near highs: do not time-choke at 2h; allow extended trend horizons while intact.
-                pool = [item for item in informed if int(item["horizon"]) <= 21600] or informed
-                adv = max(float(item["value"]) * max(float(item.get("rem_fade", 1.0)), 0.65) for item in pool)
+            is_trend = (engine_id == "DAY_V2") and (stp_u in DAY_TREND_SETUPS)
+            intact_trend = is_trend and not (mae_now >= 0.0110 and net_now < 0.0)
+            intact_winner = age_sec > 0.0 and mfe_now >= 0.0030 and net_now > 0.0 and gb_now < ro_frac * mfe_now
+            if intact_winner or intact_trend:
+                max_h = 43200 if is_trend else 21600
+                floor_fade = 0.55 if intact_winner else 0.30
+                pool = [item for item in informed if int(item["horizon"]) <= max_h] or informed
+                adv = max(float(item["value"]) * max(float(item.get("rem_fade", 1.0)), floor_fade) for item in pool)
             else:
                 tact = [item for item in informed if int(item["horizon"]) <= DAY_TACTICAL_MAX_HORIZON_SEC] or informed
                 adv = max(float(item["value"]) * float(item.get("rem_fade", 1.0)) for item in tact)
-        return _apply_winner_rollover_guard(adv, features)
+        return _apply_winner_rollover_guard(adv, features, setup=stp_u)
     return max(float(item["value"]) for item in informed)
 
 
@@ -582,7 +613,7 @@ def surface_trace(
         rem_fade = max(0.0, 1.0 - age_sec / fade_horizon) if fade_horizon > 0.0 else 1.0
         if posterior > 0.0:
             posterior = posterior * rem_fade
-        ridge_dot = _ridge_dot(ridge.get(str(horizon)) or _blank_ridge(), features, now, engine_id)
+        ridge_dot = _ridge_dot(ridge.get(str(horizon)) or _blank_ridge(), features, now, engine_id, setup=setup)
         informed.append(
             {
                 "horizon": int(horizon),

@@ -432,7 +432,7 @@ def rank_setup_signal(
         "adaptive_decision": adaptive_view,
         "adaptive_regime": adaptive_regime,
     }
-    if not edge.eligible:
+    if not edge.eligible or str(learned_setup).endswith("__MARKET"):
         return RankedCandidate(
             signal=sig,
             rank_score=round(rank_score, 4),

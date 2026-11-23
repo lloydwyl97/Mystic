@@ -285,6 +285,26 @@ def _walk_book(levels: list[list[float]], qty_needed: float) -> tuple[float, flo
     return avg, filled, fully
 
 
+def _worst_walked_price(levels: list[list[float]], qty_filled: float, *, fallback: float) -> float:
+    """Deepest price level consumed to reach ``qty_filled``."""
+    rem = float(qty_filled)
+    worst = float(fallback)
+    if rem <= 0:
+        return worst
+    for level in levels:
+        if rem <= 1e-15:
+            break
+        if not level or len(level) < 2:
+            continue
+        px = float(level[0])
+        q = float(level[1])
+        if px <= 0 or q <= 0:
+            continue
+        worst = px
+        rem -= min(rem, q)
+    return worst
+
+
 def walk_book_within_impact(
     levels: list[list[float]],
     qty_needed: float,
@@ -639,7 +659,11 @@ async def run_protected_preflight(
                 price_impact_pct=price_impact,
                 max_impact=MAX_ORDERBOOK_PRICE_IMPACT_PCT,
             )
-        protected_limit = min(avg_fill, best_ask * (1.0 + MAX_ORDERBOOK_PRICE_IMPACT_PCT))
+        worst_ask = _worst_walked_price(asks, filled_qty, fallback=avg_fill)
+        protected_limit = min(
+            max(worst_ask, best_ask * (1.0 + 0.5 * MAX_ORDERBOOK_PRICE_IMPACT_PCT)),
+            best_ask * (1.0 + MAX_ORDERBOOK_PRICE_IMPACT_PCT),
+        )
         executable_qty = float(quantity)
     elif side_u == "SELL":
         if chunk_ok:
@@ -718,7 +742,11 @@ async def run_protected_preflight(
                 quantity=quantity,
                 mandatory_exit=True,
             )
-        protected_limit = max(avg_fill, best_bid * (1.0 - impact_cap))
+        worst_bid = _worst_walked_price(bids, executable_qty, fallback=avg_fill)
+        protected_limit = max(
+            min(worst_bid, best_bid * (1.0 - 0.5 * impact_cap)),
+            best_bid * (1.0 - impact_cap),
+        )
     else:
         return _fail(
             ns,
