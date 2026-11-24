@@ -64,7 +64,17 @@ SETUPS = (
 )
 TRENDS = ("up", "down", "flat")
 ENTRY_KEYS = ("calibrated", "adaptive", "micro", "raw_claim", "cost")
-_ENTRY_SOURCES = {"calibrated": "calibrated_move", "adaptive": "adaptive_residual", "micro": "micro_residual", "raw_claim": "raw_claim", "cost": "expected_cost"}
+_ENTRY_SOURCES = {
+    "calibrated": "calibrated_move",
+    "adaptive": "adaptive_residual",
+    "micro": "micro_residual",
+    "raw_claim": "raw_claim",
+    "cost": "expected_cost",
+    "key_policy_calibration": "key_policy_calibration",
+    "uncalibrated_gross": "uncalibrated_gross",
+    "uncalibrated_slope_term": "uncalibrated_slope_term",
+    "setup_gross": "setup_gross",
+}
 # Order book and tape at entry, each scaled to roughly unit range.
 MICRO_KEYS = ("obi", "ofi", "flow", "adverse", "pressure", "spread")
 _MICRO_ENCODE = {
@@ -639,12 +649,18 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     seller_reversal = mfe_v >= 0.0035 and net_v > 0.0 and live_obi <= -0.30 and live_flow <= -0.30
     if seller_reversal:
         ro_frac *= 0.80
+    setup_u = str(setup or "").upper()
+    is_continuation_runner = any(tag in setup_u for tag in ("BREAKOUT_MOMENTUM", "COMPRESSION_BREAKOUT", "VOLUME_IMPULSE_CONTINUATION", "TREND_PULLBACK_MICRO"))
+    min_ro_floor = (0.0015 if seller_reversal else 0.0022) if is_continuation_runner else 0.0
+    ro_thresh = max(ro_frac * mfe_v, min_ro_floor)
+    runner_guard_mult = 0.85 if is_continuation_runner else 0.65
+    min_runner_mfe = 0.0012 if is_continuation_runner else 0.0028
     fade = max(0.0, 1.0 - age / 10.0)
-    if age > 0.0 and mfe_v >= 0.0028 and net_v > 0.0 and gb_v < 0.65 * ro_frac * mfe_v and not seller_reversal:
+    if age > 0.0 and mfe_v >= min_runner_mfe and net_v > 0.0 and gb_v < runner_guard_mult * ro_thresh and not seller_reversal:
         # Active climbing breakout runner: extend continuation horizon past the 10m cliff until price pulls back.
-        runner_fade_floor = 0.55 if (live_obi > 0.20 and live_flow > 0.20 and gb_v < 0.35 * ro_frac * mfe_v) else 0.40
+        runner_fade_floor = 0.55 if (live_obi > 0.20 and live_flow > 0.20 and gb_v < 0.35 * ro_thresh) else 0.42
         fade = max(fade, runner_fade_floor * max(0.0, 1.0 - age / 45.0))
-    ro_drag = (max(0.0, hold_cal_sum) + 0.0012) if (age > 0.0 and mfe_v >= 0.0028 and gb_v >= ro_frac * mfe_v) else 0.0
+    ro_drag = (max(0.0, hold_cal_sum) + 0.0012) if (age > 0.0 and mfe_v >= 0.0028 and gb_v >= ro_thresh) else 0.0
     claim_rem = (cal_sum if age <= 0.0 else hold_cal_sum) * fade - ro_drag
     out: dict[int, float] = {}
     for h, v in per.items():

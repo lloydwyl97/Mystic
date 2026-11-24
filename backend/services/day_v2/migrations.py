@@ -206,24 +206,48 @@ def run_day_v2_migrations(db_path: str) -> dict[str, Any]:
     return results
 
 
-def is_opportunity_consumed(db_path: str, opportunity_id: str) -> bool:
-    """Return True if the opportunity has been consumed (filled) in this session.
+DAY_V2_SAME_SETUP_COOLDOWN_SEC: float = 5400.0
+
+
+def is_opportunity_consumed(
+    db_path: str,
+    opportunity_id: str,
+    symbol: str = "",
+    setup: str = "",
+    as_of: float | None = None,
+) -> bool:
+    """Return True if the opportunity (or the same symbol+setup swing within cooldown) is consumed.
 
     An unreadable record is treated as consumed: re-arming a filled opportunity
     is a duplicate entry, while skipping one bar is not. SQLite is the authoritative durable record — Redis loss cannot re-arm a consumed
     opportunity.
     """
-    if not opportunity_id:
+    if not opportunity_id and not (symbol and setup):
         return False
     try:
         with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT consumed FROM day_v2_opportunity_state WHERE opportunity_id=?",
-                (opportunity_id,),
-            ).fetchone()
-        if row is None:
-            return False
-        return bool(int(row[0]))
+            if opportunity_id:
+                row = conn.execute(
+                    "SELECT consumed FROM day_v2_opportunity_state WHERE opportunity_id=?",
+                    (opportunity_id,),
+                ).fetchone()
+                if row is not None and bool(int(row[0])):
+                    return True
+            if symbol and setup:
+                import time as _time
+
+                sym_norm = str(symbol).upper().replace("/", "").replace("-", "")
+                sym_slash = f"{sym_norm[:-4]}/USDT" if sym_norm.endswith("USDT") and len(sym_norm) > 4 else sym_norm
+                ref_ts = float(as_of) if as_of is not None and float(as_of) > 0.0 else _time.time()
+                recent = conn.execute(
+                    "SELECT MAX(consumed_at) FROM day_v2_opportunity_state WHERE symbol IN (?, ?) AND setup=? AND consumed=1",
+                    (sym_norm, sym_slash, str(setup).upper()),
+                ).fetchone()
+                if recent and recent[0] is not None:
+                    elapsed = ref_ts - float(recent[0])
+                    if 0.0 <= elapsed < DAY_V2_SAME_SETUP_COOLDOWN_SEC:
+                        return True
+        return False
     except Exception as exc:
         logger.warning("is_opportunity_consumed DB error (fail-closed): %s", exc)
         return True

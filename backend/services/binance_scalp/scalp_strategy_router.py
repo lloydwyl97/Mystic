@@ -248,6 +248,8 @@ class ScalpStrategyRouter:
             ctx_map = dict(sig.setup_context or {})
             ctx_map["features"] = feats
             ctx_map["runtime_enabled"] = sig.setup_name in enabled_names
+            ctx_map["mtf_5m_aligned"] = mtf_5m_aligned
+            ctx_map["mtf_15m_aligned"] = mtf_15m_aligned
             from dataclasses import replace as _sig_replace
 
             sig = _sig_replace(sig, setup_context=ctx_map)

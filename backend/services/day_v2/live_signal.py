@@ -412,6 +412,12 @@ def _pack_signal(
     atr_1h = atr_from_bars(bars_1h)
     objective_struct = structural_objective(setup_name, bars_15m, bars_1h, bars_4h)
     ref_price = float(bars_15m[-1]["close"])
+    opp_anchor = anchor
+    if setup_name in (SETUP_VWAP_REVERSION, SETUP_EXHAUSTION_MR, SETUP_HTF_TREND_PULLBACK) and len(bars_15m) >= 20:
+        try:
+            opp_anchor = min(float(b["low"]) for b in bars_15m[-20:])
+        except (KeyError, TypeError, ValueError):
+            opp_anchor = anchor
     return DayV2Signal(
         symbol=symbol,
         setup=setup_name,
@@ -421,7 +427,7 @@ def _pack_signal(
         atr=atr,
         signal_bar_ts=bar_ts,
         h1_bullish=h1_bullish,
-        opportunity_id=_opportunity_id(symbol, setup_name, anchor),
+        opportunity_id=_opportunity_id(symbol, setup_name, opp_anchor),
         atr_1h=atr_1h,
         objective_structural=objective_struct,
         move_potential=move_potential(setup_name, ref_price, atr_1h, objective_struct),

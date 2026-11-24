@@ -999,3 +999,69 @@ async def test_live_forensic_repairs_trend_hold_market_block_breakout_capture_an
         now=T0 + 180.0,
     )
     assert d_blowoff["action"] == "exit"
+
+
+def test_scalp_mtf_conflict_and_runner_hold_plus_day_reentry_churn_20261124(tmp_path):
+    """Verify MTF-5m conflict gross discount, 22bps minimum rollover floor on climbing scalps, and DAY_V2 same-swing re-entry guard."""
+    import time
+
+    from backend.services.day_v2.live_signal import SETUP_VWAP_REVERSION, _pack_signal
+    from backend.services.day_v2.migrations import consume_opportunity, is_opportunity_consumed, run_day_v2_migrations
+    from backend.services.scalp_v2 import continuation_value as cv
+    from backend.services.scalp_v2.executable_edge import scalp_executable_edge
+
+    # 1. Counter-5m-trend marginal scalp (15 bps gross vs 7.0 bps cost) fails to clear cost, while 28 bps surge still clears.
+    view = {"claim_capture": 1.0, "claim_gross_setup": 0.0015}
+    weak_mtf = scalp_executable_edge(
+        view,
+        raw_expected_move_pct=0.0015,
+        spread_pct=0.0001,
+        impact_pct=0.0,
+        edge_source="STRATEGY_CLAIM",
+        value_of=lambda _e: 0.0015,
+        micro_features={"mtf_gross_mult": 0.40},
+    )
+    strong_mtf = scalp_executable_edge(
+        view,
+        raw_expected_move_pct=0.0030,
+        spread_pct=0.0001,
+        impact_pct=0.0,
+        edge_source="STRATEGY_CLAIM",
+        value_of=lambda _e: 0.0028,
+        micro_features={"mtf_gross_mult": 0.40},
+    )
+    assert not weak_mtf.eligible and weak_mtf.final_executable_edge_pct < 0.0
+    assert strong_mtf.eligible and strong_mtf.final_executable_edge_pct > 0.0
+
+    # 2. Profitable scalp at +37.3 bps MFE with only 16.8 bps giveback (< 22 bps ro_thresh) holds instead of firing ro_drag.
+    vm = cv.ValueModel()
+    z0 = cv.vector({"net": 0.001, "mfe": 0.001, "mae": 0.0, "giveback": 0.0, "age_min": 2.0}, {"cost": 0.00068}, "BTCUSDT", "VOLUME_IMPULSE_CONTINUATION", "btcdown_volhi")
+    vm.fold([(300, z0, -0.0002, 20.0, 1000.0)], 1000.0)
+    ent_btc = {"calibrated": 0.0041, "adaptive": -0.0010, "micro": 0.0, "cost": 0.00068}
+    hold_btc = cv.value(
+        "",
+        "BTCUSDT",
+        "VOLUME_IMPULSE_CONTINUATION",
+        "btcdown_volhi",
+        {"net": 0.00136, "mfe": 0.00373, "mae": 0.0005, "giveback": 0.00168, "age_min": 5.38},
+        ent_btc,
+        model=vm,
+    )
+    assert hold_btc is not None and hold_btc["advantage"] > 0.0
+
+    # 3. DAY_V2 VWAP_REVERSION shares opportunity_id across adjacent 15m bars in the same 20-bar swing AND blocks 31m re-entry churn.
+    db = str(tmp_path / "day_churn.db")
+    run_day_v2_migrations(db)
+    base_bars = [{"ts": 1_795_500_000 + i * 900, "open": 0.96, "high": 0.965, "low": 0.9410 if i == 25 else 0.948, "close": 0.95} for i in range(35)]
+    sig1 = _pack_signal("XRPUSDT", SETUP_VWAP_REVERSION, "neutral", 0.9420 * 0.998, 0.955, 0.005, 1_795_508_100, False, base_bars, base_bars[:8], base_bars[:8])
+    bars_next = [
+        *base_bars[2:],
+        {"ts": 1_795_509_000, "open": 0.945, "high": 0.948, "low": 0.9440, "close": 0.946},
+        {"ts": 1_795_509_900, "open": 0.946, "high": 0.949, "low": 0.9445, "close": 0.9475},
+    ]
+    sig2 = _pack_signal("XRPUSDT", SETUP_VWAP_REVERSION, "neutral", 0.9445 * 0.998, 0.955, 0.005, 1_795_509_900, False, bars_next, bars_next[:8], bars_next[:8])
+    assert sig1.opportunity_id == sig2.opportunity_id
+    consume_opportunity(db, sig1.opportunity_id, "XRPUSDT", SETUP_VWAP_REVERSION, trade_id="T_XRP_1")
+    now_consumed = time.time()
+    assert is_opportunity_consumed(db, "DIFFERENT_OPP_ID", "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 1860.0)
+    assert not is_opportunity_consumed(db, "DIFFERENT_OPP_ID", "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 6000.0)

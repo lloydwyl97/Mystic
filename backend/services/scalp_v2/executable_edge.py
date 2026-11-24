@@ -78,6 +78,11 @@ class ExecutableEdge:
     entry_value_pct: float | None = None
     value_version: str = ""
     entry_micro: dict[str, float] = field(default_factory=dict)
+    key_policy_calibration_pct: float = 0.0
+    uncalibrated_gross_pct: float = 0.0
+    uncalibrated_slope_term_pct: float = 0.0
+    setup_gross_pct: float = 0.0
+    mtf_gross_mult: float = 1.0
 
     @property
     def eligible(self) -> bool:
@@ -124,6 +129,11 @@ class ExecutableEdge:
             "entry_value": self.entry_value_pct,
             "value_version": self.value_version,
             "entry_micro": dict(self.entry_micro),
+            "key_policy_calibration": self.key_policy_calibration_pct,
+            "uncalibrated_gross": self.uncalibrated_gross_pct,
+            "uncalibrated_slope_term": self.uncalibrated_slope_term_pct,
+            "setup_gross": self.setup_gross_pct,
+            "mtf_gross_mult": self.mtf_gross_mult,
             "uncertainty": self.uncertainty_pct,
             "backoff_gross": self.calibrated_move_pct - self.state_tilt_pct,
             "learned_expected_gross": self.expected_move_pct,
@@ -214,6 +224,12 @@ def scalp_executable_edge(
     calibration = _f(view.get("policy_calibration"))
     from backend.services.scalp_v2.continuation_value import micro_raw, micro_state
 
+    mtf_mult_raw = _f((micro_features or {}).get("mtf_gross_mult"), 1.0) if isinstance(micro_features, dict) else 1.0
+    mtf_gross_mult = max(0.0, min(1.0, mtf_mult_raw)) if mtf_mult_raw > 0.0 else 1.0
+    key_pol_cal_val = _f(move.get("key_policy_calibration"))
+    uncal_gross_val = _f(move.get("uncalibrated_gross"))
+    uncal_slope_val = _f(move.get("uncalibrated_slope_term"))
+    setup_gross_val = _f(move.get("setup_gross"))
     entry_micro = micro_raw(micro_features)
     entry_value = None
     value_version = ""
@@ -224,16 +240,18 @@ def scalp_executable_edge(
             "micro": micro,
             "raw_claim": raw,
             "cost": cost,
-            "key_policy_calibration": _f(move.get("key_policy_calibration")),
-            "uncalibrated_gross": _f(move.get("uncalibrated_gross")),
-            "uncalibrated_slope_term": _f(move.get("uncalibrated_slope_term")),
-            "setup_gross": _f(move.get("setup_gross")),
+            "key_policy_calibration": key_pol_cal_val,
+            "uncalibrated_gross": uncal_gross_val,
+            "uncalibrated_slope_term": uncal_slope_val,
+            "setup_gross": setup_gross_val,
         }
         entry_value = value_of({**entry, **micro_state(entry_micro)})
     if entry_value is not None and math.isfinite(float(entry_value)):
         from backend.services.scalp_v2.continuation_value import VALUE_VERSION
 
         entry_value = float(entry_value)
+        if mtf_gross_mult < 1.0 and entry_value > 0.0:
+            entry_value *= mtf_gross_mult
         value_version = VALUE_VERSION
         gap = calibration = 0.0
         final = entry_value - cost
@@ -241,7 +259,11 @@ def scalp_executable_edge(
             final = min(final, pre_micro + micro)
     else:
         entry_value = None
-        final = pre_micro + micro + gap + calibration
+        gross_est = pre_micro + micro + gap + calibration + cost
+        if mtf_gross_mult < 1.0 and gross_est > 0.0:
+            final = gross_est * mtf_gross_mult - cost
+        else:
+            final = pre_micro + micro + gap + calibration
     confidence = _f(view.get("confidence"))
     risk = _f(view.get("risk_estimate"))
     return ExecutableEdge(
@@ -274,6 +296,11 @@ def scalp_executable_edge(
         entry_value_pct=entry_value,
         value_version=value_version,
         entry_micro=entry_micro,
+        key_policy_calibration_pct=key_pol_cal_val,
+        uncalibrated_gross_pct=uncal_gross_val,
+        uncalibrated_slope_term_pct=uncal_slope_val,
+        setup_gross_pct=setup_gross_val,
+        mtf_gross_mult=mtf_gross_mult,
     )
 
 

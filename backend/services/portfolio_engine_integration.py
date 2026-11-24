@@ -1936,8 +1936,8 @@ class PortfolioEngineIntegration:
         try:
             from backend.services.day_v2.migrations import is_opportunity_consumed
 
-            if is_opportunity_consumed(db_path, signal.opportunity_id):
-                logger.info("DAY_V2_OPP_CONSUMED symbol=%s opp=%s", symbol, signal.opportunity_id)
+            if is_opportunity_consumed(db_path, signal.opportunity_id, norm, signal.setup, as_of):
+                logger.info("DAY_V2_OPP_CONSUMED symbol=%s setup=%s opp=%s", symbol, signal.setup, signal.opportunity_id)
                 return
         except Exception:
             logger.debug("DAY_V2_OPP_CONSUMED_CHECK_FAILED symbol=%s", symbol, exc_info=True)

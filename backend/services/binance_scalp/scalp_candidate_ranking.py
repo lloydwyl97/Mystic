@@ -387,6 +387,10 @@ def rank_setup_signal(
         from backend.services.microstructure_engine import compute_features as _cmf
 
         micro_feats = _cmf(sig.symbol) or {}
+    sig_ctx = sig.setup_context if isinstance(sig.setup_context, dict) else {}
+    if sig_ctx.get("mtf_5m_aligned") is False:
+        micro_feats = dict(micro_feats)
+        micro_feats["mtf_gross_mult"] = float(os.getenv("SCALP_MTF_5M_CONFLICT_GROSS_MULT", "0.40"))
     try:
         from backend.services.adaptive_learning import scalp_learned_setup
         from backend.services.binance_scalp.config import get_scalp_config
