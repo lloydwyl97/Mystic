@@ -369,3 +369,54 @@ def test_capture_does_not_touch_orders_scalp_or_other_venues():
         assert name not in decision.lower()
     assert "exact_policy_capture" not in scalp
     assert "DOGE" not in capture
+
+
+def test_read_live_exit_micro_rejects_future_and_stale_timestamps(monkeypatch):
+    import json
+
+    from backend.services import continuation_surface
+
+    class _FakeMicroRedis:
+        def __init__(self, book_ts: float, tape_entries: list[tuple[str, dict[str, str]]]) -> None:
+            self._book_ts = book_ts
+            self._tape = tape_entries
+
+        def get(self, key: str) -> str | None:
+            if key == "scalp:ws_depth:XRPUSDT":
+                return json.dumps(
+                    {
+                        "ts": self._book_ts,
+                        "bids": [["1.00", "300"]],
+                        "asks": [["1.01", "100"]],
+                    }
+                )
+            return None
+
+        def xrevrange(self, key: str, count: int = 40):
+            _ = (key, count)
+            return list(self._tape)
+
+    monkeypatch.setattr(continuation_surface, "_LIVE_MICRO_FAIL_UNTIL", 0.0)
+
+    # Future depth + future tape relative to historical/synthetic now_ts=40.0 must be ignored (no lookahead)
+    future_rd = _FakeMicroRedis(
+        book_ts=1_795_565_000.0,
+        tape_entries=[("1-0", {"T": "1795565000000", "q": "100", "p": "1.0", "m": "false"})],
+    )
+    monkeypatch.setattr(continuation_surface, "_LIVE_MICRO_REDIS", future_rd)
+    assert continuation_surface.read_live_exit_micro("XRPUSDT", now_ts=40.0) == {}
+
+    # Valid contemporaneous window [moment - 15s, moment + 2s] computes exact OBI and signed flow
+    valid_rd = _FakeMicroRedis(
+        book_ts=999.0,
+        tape_entries=[
+            ("3-0", {"T": "1005000", "q": "999", "p": "1.0", "m": "true"}),  # +5s future -> skipped
+            ("2-0", {"T": "995000", "q": "300", "p": "1.0", "m": "false"}),  # -5s aggressive buy
+            ("1-0", {"T": "990000", "q": "100", "p": "1.0", "m": "true"}),  # -10s aggressive sell
+            ("0-0", {"T": "970000", "q": "999", "p": "1.0", "m": "true"}),  # -30s stale -> break
+        ],
+    )
+    monkeypatch.setattr(continuation_surface, "_LIVE_MICRO_REDIS", valid_rd)
+    micro = continuation_surface.read_live_exit_micro("XRPUSDT", now_ts=1000.0)
+    assert micro["live_obi"] == pytest.approx(0.5)
+    assert micro["live_flow"] == pytest.approx(0.5)

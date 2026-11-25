@@ -70,3 +70,54 @@ async def test_portfolio_day_v2_cooldown_does_not_block(monkeypatch):
     engine._bar_interval_seconds = 60
     allowed, reason = await engine._can_open_position("SOL/USDT", 100.0, engine_id="DAY_V2")
     assert allowed is True, reason
+
+
+@pytest.mark.asyncio
+async def test_trade_state_store_get_all_symbols_get_status_and_cooldown_endpoint(monkeypatch):
+    from backend.endpoints import performance_endpoints
+    from backend.services import trade_state
+    from backend.services.trade_state import TradeStateEnum
+
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self.hashes: dict[bytes, dict[bytes, bytes]] = {}
+
+        def hset(self, key: str, mapping: dict[str, str]) -> None:
+            self.hashes[key.encode()] = {k.encode(): v.encode() for k, v in mapping.items()}
+
+        def expire(self, key: str, ttl: int) -> None:
+            _ = (key, ttl)
+
+        def hgetall(self, key: str) -> dict[bytes, bytes]:
+            return dict(self.hashes.get(key.encode(), {}))
+
+        def scan_iter(self, match: str = "trade_state:*"):
+            _ = match
+            return iter(self.hashes.keys())
+
+    fake_redis = _FakeRedis()
+    isolated = trade_state.TradeStateStore(redis_client=fake_redis)
+    isolated.on_exit("BTC/USDT", 65000.0, "LEARNED_CONTINUATION_EXIT", engine_id="DAY_V2")
+    isolated.on_exit("XRP/USDT", 1.25, "NET_PROFIT_EXIT", engine_id="")
+    isolated.on_entry_fill("SOL/USDT", 150.0, engine_id="SCALP_V2")
+
+    symbols = isolated.get_all_symbols()
+    assert symbols == ["BTCUSDT:DAY_V2", "SOLUSDT:SCALP_V2", "XRPUSDT"]
+
+    btc_status = isolated.get_status("BTCUSDT:DAY_V2")
+    assert btc_status["state"] == TradeStateEnum.COOLDOWN
+    assert btc_status["mode"] == "DAY_V2"
+    assert btc_status["cooldown_remaining_sec"] > 0
+    assert btc_status["last_exit_reason"] == "LEARNED_CONTINUATION_EXIT"
+    assert isolated.get_state("SOLUSDT", engine_id="SCALP_V2") == TradeStateEnum.IN_TRADE
+
+    monkeypatch.setattr(trade_state, "_store_instance", isolated)
+    monkeypatch.setattr(trade_state, "get_trade_state_store", lambda _rc=None: isolated)
+    monkeypatch.setattr("backend.config.redis_config.get_redis_client", lambda: fake_redis)
+
+    payload = await performance_endpoints.get_scratch_cooldown_status()
+    assert payload["source"] == "trade_state"
+    assert payload["total_active"] == 2
+    assert set(payload["active_cooldowns"].keys()) == {"BTCUSDT:DAY_V2", "XRPUSDT"}
+    assert payload["active_cooldowns"]["BTCUSDT:DAY_V2"]["mode"] == "DAY_V2"
+    assert payload["active_cooldowns"]["XRPUSDT"]["exit_reason"] == "NET_PROFIT_EXIT"

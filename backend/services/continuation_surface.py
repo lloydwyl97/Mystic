@@ -147,7 +147,7 @@ def read_live_exit_micro(symbol: str, *, now_ts: float | None = None) -> dict[st
             ts_b = float(pay.get("ts") or pay.get("fetched_at") or 0.0)
             if ts_b > 1e12:
                 ts_b /= 1000.0
-            if ts_b <= 0.0 or (moment - ts_b) > max_age:
+            if ts_b <= 0.0 or (moment - ts_b) > max_age or (ts_b - moment) > 2.0:
                 continue
             bids = (pay.get("bids") or [])[:5]
             asks = (pay.get("asks") or [])[:5]
@@ -162,9 +162,12 @@ def read_live_exit_micro(symbol: str, *, now_ts: float | None = None) -> dict[st
             buy_q = 0.0
             sell_q = 0.0
             cutoff_ms = (moment - 15.0) * 1000.0
+            max_future_ms = (moment + 2.0) * 1000.0
             for _eid, fields in entries:
                 tms = float(fields.get("T") or fields.get("ts_ms") or 0.0)
-                if 0.0 < tms < cutoff_ms:
+                if tms <= 0.0 or tms > max_future_ms:
+                    continue
+                if tms < cutoff_ms:
                     break
                 qty = float(fields.get("q") or fields.get("qty") or 0.0)
                 px = float(fields.get("p") or fields.get("price") or 0.0)

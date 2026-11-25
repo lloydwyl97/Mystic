@@ -230,31 +230,127 @@ class TradeStateStore:
         except Exception as e:
             logger.warning("on_exit error for %s: %s", symbol, e)
 
+    def _split_symbol_and_engine(self, symbol: str, engine_id: str = "") -> tuple[str, str]:
+        raw = str(symbol or "").strip()
+        eff_engine = str(engine_id or "").strip().upper()
+        if "::" in raw:
+            sym_part, parsed_eng = raw.split("::", 1)
+            if not eff_engine:
+                eff_engine = parsed_eng.strip().upper()
+        elif ":" in raw:
+            sym_part, parsed_eng = raw.split(":", 1)
+            if not eff_engine:
+                eff_engine = parsed_eng.strip().upper()
+        else:
+            sym_part = raw
+        return self._normalize_symbol(sym_part), eff_engine
+
+    def _fetch_state_data_sync(self, norm_symbol: str, engine_id: str = "") -> dict[str, str]:
+        """Sync read of trade-state hash from Redis with local fallback."""
+        if self.redis_client:
+            try:
+                raw_hash = self.redis_client.hgetall(self._get_state_key(norm_symbol, engine_id))
+                if not inspect.isawaitable(raw_hash) and isinstance(raw_hash, dict) and raw_hash:
+                    return self._decode_redis_hash(raw_hash)
+            except Exception as e:
+                logger.debug("Redis hgetall sync fallback for %s: %s", norm_symbol, e)
+        local = self._local_state.get(self._local_key(norm_symbol, engine_id))
+        if isinstance(local, dict) and local:
+            return {str(k): str(v) for k, v in local.items()}
+        return {}
+
+    def get_all_symbols(self) -> list[str]:
+        """Return all tracked symbol[:ENGINE] keys across Redis and local state."""
+        found: set[str] = set()
+        if self.redis_client:
+            try:
+                raw_iter: Any = None
+                if hasattr(self.redis_client, "scan_iter"):
+                    cand = self.redis_client.scan_iter(match="trade_state:*")
+                    if not inspect.isawaitable(cand) and not inspect.isasyncgen(cand):
+                        raw_iter = cand
+                elif hasattr(self.redis_client, "keys"):
+                    cand = self.redis_client.keys("trade_state:*")
+                    if not inspect.isawaitable(cand):
+                        raw_iter = cand
+                if raw_iter is not None:
+                    for raw_key in raw_iter:
+                        key_str = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+                        if not key_str.startswith("trade_state:"):
+                            continue
+                        rest = key_str[len("trade_state:") :]
+                        if not rest:
+                            continue
+                        sym_norm, eng = self._split_symbol_and_engine(rest)
+                        found.add(f"{sym_norm}:{eng}" if eng else sym_norm)
+            except Exception as e:
+                logger.warning("get_all_symbols Redis scan error: %s", e)
+
+        for local_k in list(self._local_state.keys()):
+            if not local_k:
+                continue
+            sym_norm, eng = self._split_symbol_and_engine(local_k)
+            found.add(f"{sym_norm}:{eng}" if eng else sym_norm)
+
+        return sorted(found)
+
+    def get_status(self, symbol: str, engine_id: str = "") -> dict[str, Any]:
+        """Return structured trade/cooldown status for symbol (optionally engine-scoped)."""
+        try:
+            norm, eff_engine = self._split_symbol_and_engine(symbol, engine_id)
+            decoded = self._fetch_state_data_sync(norm, eff_engine)
+            now = time.time()
+            raw_state = decoded.get("state", "IDLE")
+
+            try:
+                cooldown_until = float(decoded.get("cooldown_until", 0) or 0)
+            except (TypeError, ValueError):
+                cooldown_until = 0.0
+
+            remaining = max(0.0, cooldown_until - now)
+            if raw_state == "IN_TRADE":
+                state_enum = TradeStateEnum.IN_TRADE
+            elif raw_state == "COOLDOWN" and remaining > 0:
+                state_enum = TradeStateEnum.COOLDOWN
+            else:
+                state_enum = TradeStateEnum.IDLE
+
+            def _opt_float(val: str | None) -> float | None:
+                if val is None or val == "":
+                    return None
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return None
+
+            return {
+                "symbol": norm,
+                "engine_id": eff_engine or None,
+                "mode": eff_engine or decoded.get("mode") or None,
+                "state": state_enum,
+                "cooldown_until": cooldown_until if cooldown_until > 0 else None,
+                "cooldown_remaining_sec": int(remaining) if state_enum == TradeStateEnum.COOLDOWN else 0,
+                "last_exit_reason": decoded.get("exit_reason") or None,
+                "entry_price": _opt_float(decoded.get("entry_price")),
+                "exit_price": _opt_float(decoded.get("exit_price")),
+            }
+        except Exception as e:
+            logger.warning("get_status error for %s: %s", symbol, e)
+            return {
+                "symbol": str(symbol or ""),
+                "engine_id": engine_id or None,
+                "mode": engine_id or None,
+                "state": TradeStateEnum.IDLE,
+                "cooldown_until": None,
+                "cooldown_remaining_sec": 0,
+                "last_exit_reason": None,
+                "entry_price": None,
+                "exit_price": None,
+            }
+
     def get_state(self, symbol: str, engine_id: str = "") -> TradeStateEnum:
         """Get current state for symbol"""
-        try:
-            if self.redis_client:
-                state_data = self.redis_client.hgetall(self._get_state_key(symbol, engine_id))
-                if state_data:
-                    state = state_data.get("state") or state_data.get(b"state")
-                    if isinstance(state, bytes):
-                        state = state.decode()
-
-                    if state == "IN_TRADE":
-                        return TradeStateEnum.IN_TRADE
-                    elif state == "COOLDOWN":
-                        cooldown_until = state_data.get("cooldown_until") or state_data.get(b"cooldown_until")
-                        if cooldown_until:
-                            if isinstance(cooldown_until, bytes):
-                                cooldown_until = cooldown_until.decode()
-                            if time.time() < float(cooldown_until):
-                                return TradeStateEnum.COOLDOWN
-
-            return TradeStateEnum.IDLE
-
-        except Exception as e:
-            logger.warning("get_state error for %s: %s", symbol, e)
-            return TradeStateEnum.IDLE
+        return self.get_status(symbol, engine_id=engine_id)["state"]
 
 
 # Singleton instance
