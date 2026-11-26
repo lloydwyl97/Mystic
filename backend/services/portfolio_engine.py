@@ -25355,7 +25355,16 @@ class PortfolioEngine:
         try:
             from backend.services.day_decision_state import load_hold_records
 
-            return load_hold_records(str(self.db_path))
+            active_syms = {
+                str(sym)
+                for sym, pos in (getattr(self, "open_positions", None) or {}).items()
+                if str(getattr(pos, "status", "OPEN") or "OPEN").upper() == "OPEN" and float(getattr(pos, "quantity", 0.0) or 0.0) > 0.0
+            }
+            return load_hold_records(
+                str(self.db_path),
+                active_position_symbols=active_syms,
+                max_age_sec=86400.0,
+            )
         except Exception:
             return []
 

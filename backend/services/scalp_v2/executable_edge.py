@@ -420,7 +420,7 @@ def tape_ask_floor(prints: list[Any], *, now: float, window_sec: float) -> float
     an ask the market already traded through. A print at p means the ask was
     at least p when it printed. None when the tape printed nothing in the window.
     """
-    recent = [p for p in prints if _f(getattr(p, "trade_ts", 0.0)) >= now - window_sec and _f(getattr(p, "price", 0.0)) > 0]
+    recent = [p for p in prints if now - window_sec <= _f(getattr(p, "trade_ts", 0.0)) <= now and _f(getattr(p, "price", 0.0)) > 0]
     if not recent:
         return None
     return _f(max(recent, key=lambda p: _f(p.trade_ts)).price)

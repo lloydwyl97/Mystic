@@ -897,11 +897,15 @@ async def test_live_forensic_repairs_trend_hold_market_block_breakout_capture_an
     )
     assert dec_dip["action"] == "hold"
 
-    # 2. SCALP_V2 unclaimed *__MARKET reject is NEVER entry_eligible even if residual/value is positive
+    # 2. SCALP_V2 *__MARKET: genuinely positive executable edge remains eligible without contaminating genuine setup calibration,
+    #    while negative/zero-claim market edge stays blocked (no unconditional __MARKET trade-opinion hard gate).
+    import time as _t
+
+    sc_now = _t.time()
     sc_db = str(tmp_path / "scalp_mkt_guard.db")
     sc_ver = al.current_strategy_version(al.SCALP_ENGINE)
     for step in range(25):
-        al.learn_claim_label(sc_db, symbol="SOLUSDT", setup="VWAP_EMA_RECLAIM__MARKET", regime="btcup_volhi", strategy_version=sc_ver, raw=0.0, gross=0.0035, now=T0 + step)
+        al.learn_claim_label(sc_db, symbol="SOLUSDT", setup="VWAP_EMA_RECLAIM__MARKET", regime="btcup_volhi", strategy_version=sc_ver, raw=0.0, gross=0.0035, now=sc_now - 100.0 + step)
     cfg = SimpleNamespace(**{**get_scalp_config().__dict__, "database_path": sc_db})
     snap = MarketSnapshot(
         symbol="SOL/USDT",
@@ -930,12 +934,39 @@ async def test_live_forensic_repairs_trend_hold_market_block_breakout_capture_an
     )
     bars_up = [{"open": 75.0 + i * 0.08, "high": 75.1 + i * 0.08, "low": 74.95 + i * 0.08, "close": 75.05 + i * 0.08, "volume": 20.0} for i in range(15)]
     ctx = StrategyMarketContext(symbol="SOL/USDT", snap=snap, bars_1m=bars_up, mom=mom, notional_usd=100.0, econ=ScalpEconomics.from_env(), config=cfg)
-    with patch("backend.services.binance_scalp.config.get_scalp_config", return_value=cfg), patch("backend.services.microstructure_engine.compute_features", return_value={}):
+    with (
+        patch("backend.services.binance_scalp.config.get_scalp_config", return_value=cfg),
+        patch("backend.services.microstructure_engine.compute_features", return_value={}),
+        patch("backend.services.binance_scalp.scalp_candidate_ranking._adaptive_regime", return_value="btcup_volhi"),
+        patch("backend.services.binance_scalp.scalp_candidate_ranking._scalp_entry_value", return_value=0.0025),
+    ):
         rej = reject_signal(ctx, "vwap_ema_reclaim", "NOT_NEAR_SUPPORT", mechanical=False, score=0.75)
         rc_mkt = rank_setup_signal(rej, regime="bull_trend", ctx=ctx)
     assert rc_mkt.adaptive_decision["setup"] == "VWAP_EMA_RECLAIM__MARKET"
-    assert not rc_mkt.entry_eligible
-    assert rc_mkt.hard_block == "NO_EXECUTABLE_NET_EDGE"
+    assert rc_mkt.net_edge_after_costs_pct > 0.0
+    assert rc_mkt.entry_eligible is True
+    assert rc_mkt.hard_block is None
+    # Genuine VWAP_EMA_RECLAIM calibration must remain completely uncontaminated by __MARKET labels
+    cal_genuine_clean = al.scalp_claim_calibration(sc_db, "SOLUSDT", "VWAP_EMA_RECLAIM", "btcup_volhi", now=sc_now)
+    assert cal_genuine_clean["n_claim"] == 0.0
+
+    # Zero-claim negative-market-edge __MARKET candidate must still be blocked even if entry_value is positive
+    sc_db_neg = str(tmp_path / "scalp_mkt_neg.db")
+    for step in range(15):
+        al.learn_claim_label(sc_db_neg, symbol="SOLUSDT", setup="VWAP_EMA_RECLAIM__MARKET", regime="btcup_volhi", strategy_version=sc_ver, raw=0.0, gross=-0.0010, now=sc_now - 100.0 + step)
+    cfg_neg = SimpleNamespace(**{**get_scalp_config().__dict__, "database_path": sc_db_neg})
+    ctx_neg = StrategyMarketContext(symbol="SOL/USDT", snap=snap, bars_1m=bars_up, mom=mom, notional_usd=100.0, econ=ScalpEconomics.from_env(), config=cfg_neg)
+    with (
+        patch("backend.services.binance_scalp.config.get_scalp_config", return_value=cfg_neg),
+        patch("backend.services.microstructure_engine.compute_features", return_value={}),
+        patch("backend.services.binance_scalp.scalp_candidate_ranking._adaptive_regime", return_value="btcup_volhi"),
+        patch("backend.services.binance_scalp.scalp_candidate_ranking._scalp_entry_value", return_value=0.0025),
+    ):
+        rej_neg = reject_signal(ctx_neg, "vwap_ema_reclaim", "NOT_NEAR_SUPPORT", mechanical=False, score=0.75)
+        rc_mkt_neg = rank_setup_signal(rej_neg, regime="bull_trend", ctx=ctx_neg)
+    assert rc_mkt_neg.adaptive_decision["setup"] == "VWAP_EMA_RECLAIM__MARKET"
+    assert not rc_mkt_neg.entry_eligible
+    assert rc_mkt_neg.hard_block == "NO_EXECUTABLE_NET_EDGE"
 
     # 3. SCALP_V2 isolate_regime inherits setup capture prior and >60bps breakout claims get un-amputated capture
     for i, (r_raw, r_gross) in enumerate(((0.0030, 0.0008), (0.0090, 0.0032), (0.0150, 0.0056)) * 6):
@@ -1063,5 +1094,20 @@ def test_scalp_mtf_conflict_and_runner_hold_plus_day_reentry_churn_20261124(tmp_
     assert sig1.opportunity_id == sig2.opportunity_id
     consume_opportunity(db, sig1.opportunity_id, "XRPUSDT", SETUP_VWAP_REVERSION, trade_id="T_XRP_1")
     now_consumed = time.time()
-    assert is_opportunity_consumed(db, "DIFFERENT_OPP_ID", "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 1860.0)
-    assert not is_opportunity_consumed(db, "DIFFERENT_OPP_ID", "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 6000.0)
+    assert is_opportunity_consumed(db, sig2.opportunity_id, "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 1860.0)
+    assert not is_opportunity_consumed(db, "DIFFERENT_OPP_ID", "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 1860.0)
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            INSERT INTO day_v2_opportunity_state (
+                opportunity_id, symbol, setup, state, consumed, fill_count,
+                created_at, consumed_at, trade_id, updated_at
+            ) VALUES (?, ?, ?, 'CONSUMED', 1, 1, ?, ?, 'T_FUTURE', ?)
+            """,
+            ("FUTURE_OPP_ID", "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 10000.0, now_consumed + 10000.0, now_consumed + 10000.0),
+        )
+        conn.commit()
+    assert is_opportunity_consumed(db, "DIFFERENT_OPP_ID", "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 1860.0, cooldown_sec=5400.0)
+    assert not is_opportunity_consumed(db, "DIFFERENT_OPP_ID", "XRPUSDT", SETUP_VWAP_REVERSION, now_consumed + 6000.0, cooldown_sec=5400.0)

@@ -388,9 +388,7 @@ def rank_setup_signal(
 
         micro_feats = _cmf(sig.symbol) or {}
     sig_ctx = sig.setup_context if isinstance(sig.setup_context, dict) else {}
-    if sig_ctx.get("mtf_5m_aligned") is False:
-        micro_feats = dict(micro_feats)
-        micro_feats["mtf_gross_mult"] = float(os.getenv("SCALP_MTF_5M_CONFLICT_GROSS_MULT", "0.40"))
+    _ = sig_ctx  # mtf_5m_aligned remains in setup_context telemetry; no hardcoded opinion haircut
     try:
         from backend.services.adaptive_learning import scalp_learned_setup
         from backend.services.binance_scalp.config import get_scalp_config
@@ -436,7 +434,7 @@ def rank_setup_signal(
         "adaptive_decision": adaptive_view,
         "adaptive_regime": adaptive_regime,
     }
-    if not edge.eligible or str(learned_setup).endswith("__MARKET"):
+    if not edge.eligible:
         return RankedCandidate(
             signal=sig,
             rank_score=round(rank_score, 4),

@@ -123,9 +123,17 @@ _LIVE_MICRO_FAIL_UNTIL: float = 0.0
 
 
 def read_live_exit_micro(symbol: str, *, now_ts: float | None = None) -> dict[str, float]:
-    """Zero-REST local Redis read of top-5 orderbook imbalance and 15s aggressive flow."""
+    """Zero-REST local Redis read of top-5 orderbook imbalance and 15s aggressive flow.
+
+    Strict historical causality: when ``now_ts`` is explicitly supplied (historical or
+    synthetic replay), future tolerance is strictly ``0.0s`` (``ts <= moment``). Small
+    ``+2.0s`` exchange clock-skew tolerance applies only to live wall-clock calls
+    (``now_ts is None``).
+    """
     global _LIVE_MICRO_REDIS, _LIVE_MICRO_FAIL_UNTIL
-    moment = float(now_ts if now_ts is not None else time.time())
+    live_wall_clock = now_ts is None
+    moment = float(time.time() if live_wall_clock else now_ts)
+    future_tol_sec = 2.0 if live_wall_clock else 0.0
     if moment < _LIVE_MICRO_FAIL_UNTIL:
         return {}
     sym = _norm_symbol(symbol)
@@ -147,7 +155,7 @@ def read_live_exit_micro(symbol: str, *, now_ts: float | None = None) -> dict[st
             ts_b = float(pay.get("ts") or pay.get("fetched_at") or 0.0)
             if ts_b > 1e12:
                 ts_b /= 1000.0
-            if ts_b <= 0.0 or (moment - ts_b) > max_age or (ts_b - moment) > 2.0:
+            if ts_b <= 0.0 or (moment - ts_b) > max_age or (ts_b - moment) > future_tol_sec:
                 continue
             bids = (pay.get("bids") or [])[:5]
             asks = (pay.get("asks") or [])[:5]
@@ -162,7 +170,7 @@ def read_live_exit_micro(symbol: str, *, now_ts: float | None = None) -> dict[st
             buy_q = 0.0
             sell_q = 0.0
             cutoff_ms = (moment - 15.0) * 1000.0
-            max_future_ms = (moment + 2.0) * 1000.0
+            max_future_ms = (moment + future_tol_sec) * 1000.0
             for _eid, fields in entries:
                 tms = float(fields.get("T") or fields.get("ts_ms") or 0.0)
                 if tms <= 0.0 or tms > max_future_ms:

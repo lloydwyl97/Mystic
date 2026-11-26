@@ -100,3 +100,25 @@ def test_persist_roundtrip(tmp_path):
     assert rows[0]["symbol"] == "ETHUSDT"
     assert rows[0]["category"] == WAITING_FOR_DIP
     assert rows[0]["blocks_live_execution"] is False
+
+
+def test_load_hold_records_filters_closed_positions_and_stale_rows(tmp_path):
+    import sqlite3
+
+    from backend.services.day_decision_state import OPEN_POSITION_HOLD
+
+    db = tmp_path / "holds_filter.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE operational_state (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_ts INTEGER NOT NULL)")
+    conn.commit()
+    conn.close()
+    now = 2_000_000.0
+    persist_hold_record(str(db), build_hold_record(symbol="BTC/USDT", category=OPEN_POSITION_HOLD, reason="OPEN", authority="pe", now=now - 60.0))
+    persist_hold_record(str(db), build_hold_record(symbol="SOL/USDT", category=OPEN_POSITION_HOLD, reason="OPEN", authority="pe", now=now - 60.0))
+    persist_hold_record(str(db), build_hold_record(symbol="DAY_PATH_EV", category=MODEL_HOLD_TELEMETRY, reason="OLD", authority="pe", now=now - 200_000.0))
+    persist_hold_record(str(db), build_hold_record(symbol="ETH/USDT", category=WAITING_FOR_DIP, reason="FRESH", authority="pe", now=now - 30.0))
+
+    # Only BTC/USDT is actually open; SOL/USDT closed and DAY_PATH_EV is stale (>24h)
+    rows = load_hold_records(str(db), active_position_symbols={"BTCUSDT"}, max_age_sec=86400.0, now=now)
+    syms = {r["symbol"] for r in rows}
+    assert syms == {"BTC/USDT", "ETH/USDT"}

@@ -319,7 +319,17 @@ def load_hold_episodes(db_path: str, *, since_ts: float | None = None, symbol: s
         return []
 
 
-def load_hold_records(db_path: str) -> list[dict[str, Any]]:
+def _norm_hold_symbol(symbol: Any) -> str:
+    return str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+
+
+def load_hold_records(
+    db_path: str,
+    *,
+    active_position_symbols: set[str] | None = None,
+    max_age_sec: float | None = None,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
     if not db_path:
         return []
     try:
@@ -331,7 +341,25 @@ def load_hold_records(db_path: str) -> list[dict[str, Any]]:
             return []
         data = json.loads(row[0])
         if isinstance(data, dict):
-            return list(data.values())
+            records = list(data.values())
+            active_norm = {_norm_hold_symbol(s) for s in active_position_symbols} if active_position_symbols is not None else None
+            ref_now = float(now if now is not None else time.time())
+            filtered: list[dict[str, Any]] = []
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                if active_norm is not None and str(rec.get("category") or "") == OPEN_POSITION_HOLD:
+                    if _norm_hold_symbol(rec.get("symbol")) not in active_norm:
+                        continue
+                if max_age_sec is not None:
+                    try:
+                        rec_ts = float(rec.get("timestamp") or 0.0)
+                    except (TypeError, ValueError):
+                        rec_ts = 0.0
+                    if rec_ts > 0.0 and (ref_now - rec_ts) > float(max_age_sec):
+                        continue
+                filtered.append(rec)
+            return filtered
     except Exception:
         logger.debug("load_hold_records failed", exc_info=True)
     return []

@@ -406,11 +406,12 @@ def test_read_live_exit_micro_rejects_future_and_stale_timestamps(monkeypatch):
     monkeypatch.setattr(continuation_surface, "_LIVE_MICRO_REDIS", future_rd)
     assert continuation_surface.read_live_exit_micro("XRPUSDT", now_ts=40.0) == {}
 
-    # Valid contemporaneous window [moment - 15s, moment + 2s] computes exact OBI and signed flow
+    # Valid contemporaneous window [moment - 15s, moment] in historical replay (strict 0.0s future boundary)
     valid_rd = _FakeMicroRedis(
         book_ts=999.0,
         tape_entries=[
-            ("3-0", {"T": "1005000", "q": "999", "p": "1.0", "m": "true"}),  # +5s future -> skipped
+            ("4-0", {"T": "1005000", "q": "999", "p": "1.0", "m": "true"}),  # +5s future -> skipped
+            ("3-0", {"T": "1000500", "q": "999", "p": "1.0", "m": "true"}),  # +0.5s future -> strictly skipped in replay
             ("2-0", {"T": "995000", "q": "300", "p": "1.0", "m": "false"}),  # -5s aggressive buy
             ("1-0", {"T": "990000", "q": "100", "p": "1.0", "m": "true"}),  # -10s aggressive sell
             ("0-0", {"T": "970000", "q": "999", "p": "1.0", "m": "true"}),  # -30s stale -> break
@@ -420,3 +421,17 @@ def test_read_live_exit_micro_rejects_future_and_stale_timestamps(monkeypatch):
     micro = continuation_surface.read_live_exit_micro("XRPUSDT", now_ts=1000.0)
     assert micro["live_obi"] == pytest.approx(0.5)
     assert micro["live_flow"] == pytest.approx(0.5)
+
+    # Historical replay (now_ts supplied) strictly rejects +1.0s future book AND +1.0s future tape
+    skew_rd = _FakeMicroRedis(
+        book_ts=1001.0,
+        tape_entries=[("1-0", {"T": "1001000", "q": "200", "p": "1.0", "m": "false"})],
+    )
+    monkeypatch.setattr(continuation_surface, "_LIVE_MICRO_REDIS", skew_rd)
+    assert continuation_surface.read_live_exit_micro("XRPUSDT", now_ts=1000.0) == {}
+
+    # Live wall-clock call (now_ts=None) tolerates <=2.0s exchange clock skew
+    monkeypatch.setattr(continuation_surface.time, "time", lambda: 1000.0)
+    live_micro = continuation_surface.read_live_exit_micro("XRPUSDT", now_ts=None)
+    assert live_micro["live_obi"] == pytest.approx(0.5)
+    assert live_micro["live_flow"] == pytest.approx(1.0)

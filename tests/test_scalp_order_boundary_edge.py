@@ -68,6 +68,14 @@ def test_tape_floor_is_the_newest_print_in_the_window():
     assert tape_ask_floor([], now=now, window_sec=5.0) is None
 
 
+def test_tape_floor_ignores_future_prints_past_decision_time():
+    now = 1_000.0
+    poisoned = [*_sol_tape(now), TapePrint(trade_ts=now + 0.5, price=119.99, qty=1.0, is_buyer_maker=False)]
+    assert tape_ask_floor(poisoned, now=now, window_sec=5.0) == 104.42
+    only_future = [TapePrint(trade_ts=now + 1.0, price=119.99, qty=1.0, is_buyer_maker=False)]
+    assert tape_ask_floor(only_future, now=now, window_sec=5.0) is None
+
+
 def test_sol_incident_stale_book_alone_passes_but_the_tape_refuses():
     stale_book = edge_at_order_boundary(SOL_EDGE, arm_price=104.36, best_ask=104.36, spread_pct=0.000096, impact_pct=0.000031)
     assert stale_book["eligible"] is True
