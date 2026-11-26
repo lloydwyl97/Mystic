@@ -342,7 +342,7 @@ def read_recent_learning_rows(
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(int(limit))
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=30.0)
         try:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql, params).fetchall()

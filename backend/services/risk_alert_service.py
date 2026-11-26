@@ -382,6 +382,17 @@ class RiskAlertService:
         else:
             return None
 
+    def _dispatch_discord_alert(self, alert: dict[str, Any]) -> None:
+        """Execute or schedule async Discord alert delivery safely from sync context."""
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._send_discord_alert(alert))
+        else:
+            loop.create_task(self._send_discord_alert(alert))
+
     # ----------------------- Alert I/O -----------------------
 
     async def _send_discord_alert(self, alert: dict[str, Any]) -> bool:
@@ -525,7 +536,7 @@ class RiskAlertService:
                 self._store_alert(alert)
                 self._print_alert(alert)
                 if self.discord_enabled:
-                    self._send_discord_alert(alert)
+                    self._dispatch_discord_alert(alert)
 
             # Update last check time
             self.last_check_time = datetime.now(timezone.utc)

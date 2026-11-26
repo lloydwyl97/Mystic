@@ -285,7 +285,7 @@ def ensure_breaker_recovery_columns(conn: sqlite3.Connection) -> bool:
 def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list[str]:
     path = Path(db_path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with sqlite3.connect(path, timeout=30.0) as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS scalp_meta (
@@ -466,7 +466,7 @@ def assert_scalp_sql_only(statement: str) -> None:
 
 def verify_scalp_tables(db_path: str | Path) -> dict[str, int]:
     path = Path(db_path).resolve()
-    with sqlite3.connect(path) as conn:
+    with sqlite3.connect(path, timeout=30.0) as conn:
         out: dict[str, int] = {}
         for table in SCALP_TABLES:
             row = conn.execute(
@@ -479,7 +479,7 @@ def verify_scalp_tables(db_path: str | Path) -> dict[str, int]:
 
 def verify_open_position_constraints(db_path: str | Path) -> dict[str, object]:
     path = Path(db_path).resolve()
-    with sqlite3.connect(path) as conn:
+    with sqlite3.connect(path, timeout=30.0) as conn:
         conn.row_factory = sqlite3.Row
         indexes = [
             {

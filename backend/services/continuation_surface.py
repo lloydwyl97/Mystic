@@ -775,7 +775,7 @@ def install_surface(target_db: str, state_db: str, inventory: dict[str, Any], *,
     from backend.services.adaptive_learning import _connect, _invalidate_adaptive_caches
 
     _connect(target_db).close()
-    src = sqlite3.connect(state_db)
+    src = sqlite3.connect(state_db, timeout=30.0)
     dst = sqlite3.connect(target_db, timeout=30)
     metrics = tuple(metric_name(horizon) for horizon in HOLD_ADVANTAGE_HORIZONS)
     placeholders = ",".join("?" for _ in metrics)

@@ -188,7 +188,7 @@ def run_day_v2_migrations(db_path: str) -> dict[str, Any]:
     """
     results: dict[str, Any] = {}
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
             # Telemetry columns on intents table
             for col, col_def in _PULLBACK_V1_TELEMETRY_COLS:
                 added = _add_column_if_missing(conn, "day_trailing_buy_intents", col, col_def)
@@ -232,7 +232,7 @@ def is_opportunity_consumed(
     if not opportunity_id and not (symbol and setup):
         return False
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
             if opportunity_id:
                 row = conn.execute(
                     "SELECT consumed FROM day_v2_opportunity_state WHERE opportunity_id=?",
@@ -278,7 +278,7 @@ def consume_opportunity(
 
     now = _time.time()
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
             conn.execute(
                 """
                 INSERT INTO day_v2_opportunity_state
@@ -311,7 +311,7 @@ def cancel_old_policy_intents(db_path: str) -> int:
     now = _time.time()
     canceled = 0
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(day_trailing_buy_intents)").fetchall()}
             if "policy_version" not in cols:
                 # Column not yet added — nothing to cancel
@@ -353,7 +353,7 @@ def apply_all_migrations(db_path: str) -> dict[str, Any]:
     logger.info("day_v2.migrations: applying %d migrations to %s", len(_MIGRATIONS), db_path)
     results: dict[str, Any] = {}
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
             for name, fn in _MIGRATIONS:
                 try:
                     result = fn(conn)

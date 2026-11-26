@@ -285,3 +285,50 @@ async def test_generic_breaker_is_never_persisted_so_always_starts_closed():
     confirms it cannot inherit stale cross-restart state at all."""
     cb = CircuitBreaker("fresh-dep")
     assert cb.state == CircuitState.CLOSED
+
+
+def test_persist_circuit_state_works_in_thread_without_event_loop(monkeypatch):
+    """Python 3.12 worker threads have no current event loop; persistence must still write."""
+    import threading
+
+    saved: list[tuple[str, dict]] = []
+
+    async def _fake_set_state(key: str, value: dict) -> None:
+        saved.append((key, value))
+
+    monkeypatch.setattr("backend.services.circuit_breaker_service.set_state", _fake_set_state)
+    tcb = _fresh_breaker()
+    tcb.daily_loss_freeze_active = True
+    err: list[Exception] = []
+
+    def _worker() -> None:
+        try:
+            tcb._persist_circuit_state()
+        except Exception as exc:
+            err.append(exc)
+
+    th = threading.Thread(target=_worker)
+    th.start()
+    th.join(timeout=5.0)
+    assert not err
+    keys = [k for k, _ in saved]
+    assert "risk:circuit_breakers" in keys
+    assert "risk:trading_paused" in keys
+    assert dict(saved)["risk:trading_paused"]["trading_paused"] is True
+
+
+def test_risk_alert_service_dispatch_discord_alert_awaits_coroutine():
+    """Sync check_risks path must actually execute _send_discord_alert, never drop an unawaited coroutine."""
+    from backend.services.risk_alert_service import RiskAlertService
+
+    svc = object.__new__(RiskAlertService)
+    sent: list[dict] = []
+
+    async def _fake_send(alert: dict) -> bool:
+        sent.append(alert)
+        return True
+
+    svc._send_discord_alert = _fake_send  # type: ignore[method-assign]
+    svc._dispatch_discord_alert({"risk_type": "TEST", "level": "HIGH", "message": "ok"})
+    assert len(sent) == 1
+    assert sent[0]["risk_type"] == "TEST"

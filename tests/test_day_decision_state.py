@@ -122,3 +122,33 @@ def test_load_hold_records_filters_closed_positions_and_stale_rows(tmp_path):
     rows = load_hold_records(str(db), active_position_symbols={"BTCUSDT"}, max_age_sec=86400.0, now=now)
     syms = {r["symbol"] for r in rows}
     assert syms == {"BTC/USDT", "ETH/USDT"}
+
+
+def test_portfolio_engine_get_day_decision_holds_keeps_active_positions(tmp_path):
+    import sqlite3
+    import time
+    from types import SimpleNamespace
+
+    from backend.services.day_decision_state import OPEN_POSITION_HOLD
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    db = tmp_path / "pe_holds.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE operational_state (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_ts INTEGER NOT NULL)")
+    conn.commit()
+    conn.close()
+    now = time.time()
+    persist_hold_record(str(db), build_hold_record(symbol="BTC/USDT", category=OPEN_POSITION_HOLD, reason="OPEN", authority="pe", now=now - 10.0))
+    persist_hold_record(str(db), build_hold_record(symbol="ETH/USDT", category=OPEN_POSITION_HOLD, reason="OPEN", authority="pe", now=now - 10.0))
+    persist_hold_record(str(db), build_hold_record(symbol="SOL/USDT", category=OPEN_POSITION_HOLD, reason="OPEN", authority="pe", now=now - 10.0))
+
+    pe = object.__new__(PortfolioEngine)
+    pe.db_path = str(db)
+    pe.open_positions = {
+        "BTC/USDT": SimpleNamespace(status="ACTIVE", quantity=0.004),
+        "ETH/USDT": SimpleNamespace(status="DUST_PENDING", quantity=0.00001),
+    }
+    holds = pe.get_day_decision_holds()
+    assert [h["symbol"] for h in holds] == ["BTC/USDT"]
+    assert not hasattr(PortfolioEngine, "_arm_trailing_buy")
+    assert not hasattr(PortfolioEngine, "poll_trailing_buy_arms")

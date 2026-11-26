@@ -75,7 +75,7 @@ def check_frequency_limit(db_path: str, symbol: str) -> tuple[bool, str]:
     """
     cutoff = time.time() - _WINDOW_SEC
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
             sym_count = _filled_count(conn, symbol, cutoff)
             if sym_count >= _PER_SYMBOL_CAP:
                 return (

@@ -600,30 +600,25 @@ class TradingCircuitBreaker:
 
             # Handle case where we're already in an async context (e.g., FastAPI startup)
             try:
-                loop = asyncio.get_running_loop()
+                asyncio.get_running_loop()
                 # If we're in an async context, defer the loading for later
                 logger.info("[CIRCUIT BREAKER] Async context detected, state loading deferred to first use")
                 return
             except RuntimeError:
-                # No running loop, safe to create one
+                # No running loop, safe to run synchronously
                 pass
 
-            loop = None
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            async def _load_states() -> tuple[Any, Any]:
+                return await get_state("risk:circuit_breakers"), await get_state("risk:trading_paused")
 
             # Load circuit breaker states (with cold-start staleness validation)
-            circuit_data = loop.run_until_complete(get_state("risk:circuit_breakers"))
+            circuit_data, paused_data = asyncio.run(_load_states())
             if circuit_data:
                 self._apply_loaded_circuit_data(circuit_data)
 
             # Load trading paused state (diagnostic only — not authoritative;
             # daily_loss_freeze_active/equity_circuit_breaker_active/account_failsafe_active
             # above are the source of truth after cold-start validation).
-            paused_data = loop.run_until_complete(get_state("risk:trading_paused"))
             if paused_data:
                 logger.info(f"[CIRCUIT BREAKER] Persisted trading_paused snapshot: {paused_data}")
 
@@ -638,14 +633,12 @@ class TradingCircuitBreaker:
 
             # Handle case where we're already in an async context
             try:
-                loop = asyncio.get_running_loop()
+                asyncio.get_running_loop()
                 logger.warning("[CIRCUIT BREAKER] Cannot persist state synchronously in async context")
                 return
             except RuntimeError:
-                # No running loop, safe to create one
+                # No running loop, safe to run synchronously
                 pass
-
-            loop = asyncio.get_event_loop()
 
             # Persist circuit breaker states
             circuit_data = {
@@ -657,7 +650,6 @@ class TradingCircuitBreaker:
                 "last_daily_reset": self.last_daily_reset,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            loop.run_until_complete(set_state("risk:circuit_breakers", circuit_data))
 
             # Always persist current trading_paused truth (true AND false) —
             # previously only written when active, so a resolved condition
@@ -668,7 +660,12 @@ class TradingCircuitBreaker:
                 "pause_reason": "circuit_breaker_active" if any_active else "",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            loop.run_until_complete(set_state("risk:trading_paused", paused_data))
+
+            async def _save_states() -> None:
+                await set_state("risk:circuit_breakers", circuit_data)
+                await set_state("risk:trading_paused", paused_data)
+
+            asyncio.run(_save_states())
 
         except Exception as e:
             logger.warning(f"[CIRCUIT BREAKER] Failed to persist state to SQLite: {e}")

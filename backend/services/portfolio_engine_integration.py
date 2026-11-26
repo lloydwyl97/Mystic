@@ -3626,7 +3626,7 @@ class PortfolioEngineIntegration:
                                 logger.debug("SIGNED_BALANCE_SNAPSHOT_SKIPPED", exc_info=True)
 
                             # Compare with local DB - BUG #41 FIX: Use context manager for proper cleanup
-                            with sqlite3.connect(DATABASE_PATH) as conn:
+                            with sqlite3.connect(DATABASE_PATH, timeout=30.0) as conn:
                                 c = conn.cursor()
 
                                 from backend.services.balance_sync_ownership import load_asset_ownership, material, quantity_drift

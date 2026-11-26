@@ -151,7 +151,7 @@ def _load_native_5m_bars(
     since_str = _epoch_to_dt_str(since_ts)
     until_str = _epoch_to_dt_str(until_ts)
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
             rows = conn.execute(
                 """
                 SELECT ts, open, high, low, close, volume
@@ -188,7 +188,7 @@ def _load_1m_bars(
     since_str = _epoch_to_dt_str(since_ts)
     until_str = _epoch_to_dt_str(until_ts)
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
             rows = conn.execute(
                 """
                 SELECT ts, open, high, low, close, volume

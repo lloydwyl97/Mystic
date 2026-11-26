@@ -11376,7 +11376,7 @@ class PortfolioEngine:
             return
 
         def _sync_backfill():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 try:
@@ -11443,7 +11443,7 @@ class PortfolioEngine:
             "avg_drag_pct_20": 0.0,
             "exit_drag_pct_p75": 0.0,
         }
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         try:
             cursor = conn.cursor()
             cursor.execute(
@@ -18105,7 +18105,7 @@ class PortfolioEngine:
         """Query realized PnL by sleeve from paper_trades."""
         result = {Sleeve.CORE.value: {"realized_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}, Sleeve.ACTIVE.value: {"realized_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}}
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -18135,7 +18135,7 @@ class PortfolioEngine:
     def get_sleeve_cutover(self) -> dict[str, Any] | None:
         """Return the sleeve system cutover marker from operational_state, or None."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 row = conn.execute("SELECT value_json FROM operational_state WHERE key='sleeve_cutover'").fetchone()
                 if row:
@@ -22432,195 +22432,6 @@ class PortfolioEngine:
                     },
                 )
 
-    def _arm_trailing_buy(
-        self,
-        *,
-        symbol: str,
-        quantity: float,
-        price: float,
-        stop_price: float,
-        atr: float,
-        confidence: float,
-        bar_timestamp: int,
-        explainability: TradeExplainability,
-        decision_id: str = "",
-        sleeve: str = "",
-    ) -> dict[str, Any]:
-        """Arm one Trailing Buy. Not a position. Cooldown starts only on fill."""
-        from backend.services.day_trailing_buy import (
-            WAITING_FOR_PULLBACK_REVERSAL,
-            TrailingBuyArm,
-        )
-
-        key = normalize_symbol(symbol)
-        arms = self._trailing_buy_arms
-        existing = arms.get(key)
-        for other in list(arms):
-            if other != key:
-                arms.pop(other, None)
-                logger.info(
-                    "TRAILING_BUY_REPLACE from=%s to=%s status=%s",
-                    other,
-                    key,
-                    WAITING_FOR_PULLBACK_REVERSAL,
-                )
-        arm = TrailingBuyArm(
-            symbol=symbol,
-            decision_epoch=time.time(),
-            initial_ask=float(price),
-            quantity=float(quantity),
-            stop_price=float(stop_price),
-            atr=float(atr),
-            confidence=float(confidence),
-            bar_timestamp=int(bar_timestamp),
-            decision_id=str(decision_id or ""),
-            sleeve=str(sleeve or ""),
-            explainability=explainability,
-        )
-        if existing is not None:
-            prior_low = float(getattr(existing, "lowest_ask", 0.0) or 0.0)
-            if prior_low > 0:
-                arm.lowest_ask = min(float(arm.lowest_ask), prior_low)
-            arm.saw_lower_low = bool(getattr(existing, "saw_lower_low", False))
-        arms[key] = arm
-        logger.info(
-            "TRAILING_BUY_ARMED symbol=%s ask=%.6f trigger=%.6f status=%s decision_id=%s",
-            key,
-            float(arm.initial_ask),
-            float(arm.trigger_ask),
-            WAITING_FOR_PULLBACK_REVERSAL,
-            decision_id,
-        )
-        return {
-            "symbol": symbol,
-            "quantity": float(quantity),
-            "price": float(price),
-            "armed": True,
-            "status": WAITING_FOR_PULLBACK_REVERSAL,
-            "decision_id": str(decision_id or ""),
-            "lowest_ask": float(arm.lowest_ask),
-            "trigger_ask": float(arm.trigger_ask),
-        }
-
-    def _arm_trailing_buy(
-        self,
-        *,
-        symbol: str,
-        quantity: float,
-        price: float,
-        stop_price: float,
-        atr: float,
-        confidence: float,
-        bar_timestamp: int,
-        explainability: TradeExplainability,
-        decision_id: str = "",
-        sleeve: str = "",
-    ) -> dict[str, Any]:
-        """Arm one Trailing Buy. Not a position. Cooldown starts only on fill."""
-        from backend.services.day_trailing_buy import (
-            WAITING_FOR_PULLBACK_REVERSAL,
-            TrailingBuyArm,
-        )
-
-        key = normalize_symbol(symbol)
-        arms = self._trailing_buy_arms
-        existing = arms.get(key)
-        for other in list(arms):
-            if other != key:
-                arms.pop(other, None)
-                logger.info(
-                    "TRAILING_BUY_REPLACE from=%s to=%s status=%s",
-                    other,
-                    key,
-                    WAITING_FOR_PULLBACK_REVERSAL,
-                )
-        arm = TrailingBuyArm(
-            symbol=symbol,
-            decision_epoch=time.time(),
-            initial_ask=float(price),
-            quantity=float(quantity),
-            stop_price=float(stop_price),
-            atr=float(atr),
-            confidence=float(confidence),
-            bar_timestamp=int(bar_timestamp),
-            decision_id=str(decision_id or ""),
-            sleeve=str(sleeve or ""),
-            explainability=explainability,
-        )
-        if existing is not None:
-            prior_low = float(getattr(existing, "lowest_ask", 0.0) or 0.0)
-            if prior_low > 0:
-                arm.lowest_ask = min(float(arm.lowest_ask), prior_low)
-            arm.saw_lower_low = bool(getattr(existing, "saw_lower_low", False))
-        arms[key] = arm
-        logger.info(
-            "TRAILING_BUY_ARMED symbol=%s ask=%.6f trigger=%.6f status=%s decision_id=%s",
-            key,
-            float(arm.initial_ask),
-            float(arm.trigger_ask),
-            WAITING_FOR_PULLBACK_REVERSAL,
-            decision_id,
-        )
-        return {
-            "symbol": symbol,
-            "quantity": float(quantity),
-            "price": float(price),
-            "armed": True,
-            "status": WAITING_FOR_PULLBACK_REVERSAL,
-            "decision_id": str(decision_id or ""),
-            "lowest_ask": float(arm.lowest_ask),
-            "trigger_ask": float(arm.trigger_ask),
-        }
-
-    async def poll_trailing_buy_arms(self, bar_timestamp: int) -> dict[str, Any] | None:
-        """Trail executable asks. Buy on the first confirmed rebound only."""
-        from backend.services.day_trailing_buy import ARM_MAX_SEC, executable_best_ask
-
-        last_fill: dict[str, Any] | None = None
-        now = time.time()
-        for key, arm in list((getattr(self, "_trailing_buy_arms", None) or {}).items()):
-            last = float(self._get_cached_market_price(getattr(arm, "symbol", key)) or 0.0)
-            ask = executable_best_ask(getattr(arm, "symbol", key), last_price=last)
-            if ask <= 0:
-                ask = last
-            state = arm.observe_ask(ask, ts=now)
-            if state == "EXPIRED":
-                self._trailing_buy_arms.pop(key, None)
-                logger.info("TRAILING_BUY_EXPIRED symbol=%s reason=ARM_TTL", key)
-                continue
-            if state != "BUY":
-                continue
-            self._trailing_buy_arms.pop(key, None)
-            result = await self.execute_buy_fifo(
-                symbol=str(getattr(arm, "symbol", key)),
-                quantity=float(arm.quantity),
-                price=float(ask or arm.trigger_ask or arm.initial_ask),
-                stop_price=float(arm.stop_price),
-                atr=float(arm.atr),
-                confidence=float(arm.confidence),
-                bar_timestamp=int(bar_timestamp or arm.bar_timestamp),
-                explainability=arm.explainability,
-                decision_id=str(arm.decision_id or ""),
-                sleeve=str(arm.sleeve or ""),
-            )
-            if result is None:
-                if now - float(arm.decision_epoch) <= float(ARM_MAX_SEC):
-                    self._trailing_buy_arms[key] = arm
-                    logger.info("TRAILING_BUY_FIRE_BLOCKED symbol=%s restored_arm=1", key)
-                continue
-            if isinstance(result, dict) and arm.decision_id:
-                result = dict(result)
-                result["decision_id"] = arm.decision_id
-            last_fill = result
-            logger.info(
-                "TRAILING_BUY_FILLED symbol=%s qty=%.6f ask=%.6f lowest=%.6f",
-                key,
-                float(arm.quantity),
-                float(ask),
-                float(arm.lowest_ask),
-            )
-        return last_fill
-
     async def process_bar_candidates(self, bar_timestamp: int) -> dict[str, Any] | None:
         """
         PHASE 5: At bar close, rank buy-intent candidates and execute up to
@@ -25358,7 +25169,7 @@ class PortfolioEngine:
             active_syms = {
                 str(sym)
                 for sym, pos in (getattr(self, "open_positions", None) or {}).items()
-                if str(getattr(pos, "status", "OPEN") or "OPEN").upper() == "OPEN" and float(getattr(pos, "quantity", 0.0) or 0.0) > 0.0
+                if str(getattr(pos, "status", "ACTIVE") or "ACTIVE").upper() in ("ACTIVE", "OPEN") and float(getattr(pos, "quantity", 0.0) or 0.0) > 0.0
             }
             return load_hold_records(
                 str(self.db_path),
@@ -27378,7 +27189,7 @@ class PortfolioEngine:
         def _sync_get() -> float:
             from backend.services.live_close_integrity import venue_backed_unique_aggregate_sql
 
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cur = conn.cursor()
                 cur.execute(
@@ -27614,7 +27425,7 @@ class PortfolioEngine:
         """Get recent reject records from DB"""
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -27883,7 +27694,7 @@ class PortfolioEngine:
         """Get recent audit records"""
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -27926,7 +27737,7 @@ class PortfolioEngine:
         """Get single audit record by ID"""
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -28110,7 +27921,7 @@ class PortfolioEngine:
         )
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -28616,7 +28427,7 @@ class PortfolioEngine:
         """Get all pending orders"""
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -28819,7 +28630,7 @@ class PortfolioEngine:
         """Get scoreboard for last N days"""
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -29158,7 +28969,7 @@ class PortfolioEngine:
         """Get last executed trade from audit"""
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -29355,7 +29166,7 @@ class PortfolioEngine:
         """Export audit records for last N hours"""
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -29385,7 +29196,7 @@ class PortfolioEngine:
         current_equity = self._total_equity
 
         def _sync_metrics():
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -29559,7 +29370,7 @@ class PortfolioEngine:
         }
 
         def _sync_trades() -> tuple[list[Any], dict[str, int | float]]:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 cur = conn.cursor()
                 cur.execute("PRAGMA table_info(paper_trades)")
