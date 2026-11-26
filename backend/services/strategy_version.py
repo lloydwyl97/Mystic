@@ -62,8 +62,8 @@ EXIT_POLICY_ANCHORS: dict[str, tuple[str, str]] = {
 }
 # Raw exit triggers and their recorded labels that the current exit policy emits.
 CURRENT_EXIT_AUTHORITIES: dict[str, frozenset[str]] = {
-    DAY_ENGINE: frozenset({"DAY_V2_CATASTROPHIC_PROTECTION", "DAY_V2_LEARNED_CONTINUATION", "STOP_LOSS_EXIT", "LEARNED_CONTINUATION_EXIT"}),
-    SCALP_ENGINE: frozenset({"SCALP_V2_CATASTROPHIC_STOP", "SCALP_V2_LEARNED_CONTINUATION", "STOP_LOSS_EXIT", "LEARNED_CONTINUATION_EXIT"}),
+    DAY_ENGINE: frozenset({"DAY_V2_CATASTROPHIC_PROTECTION", "DAY_V2_LEARNED_CONTINUATION", "DAY_V2_VERIFIED_HORIZON_EXIT", "STOP_LOSS_EXIT", "LEARNED_CONTINUATION_EXIT"}),
+    SCALP_ENGINE: frozenset({"SCALP_V2_CATASTROPHIC_STOP", "SCALP_V2_LEARNED_CONTINUATION", "SCALP_V2_VERIFIED_HORIZON_EXIT", "STOP_LOSS_EXIT", "LEARNED_CONTINUATION_EXIT"}),
 }
 # Exit reasons the DAY lifecycle label emits under the current exit policy (no
 # terminal stamped: catastrophic protection or the label censor).

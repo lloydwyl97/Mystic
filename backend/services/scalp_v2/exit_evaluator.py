@@ -58,6 +58,7 @@ SCALP_V2_EXIT_ADVERSE = "SCALP_V2_ADVERSE_STOP"
 SCALP_V2_EXIT_GIVEBACK = "SCALP_V2_GIVEBACK"
 SCALP_V2_EXIT_STALL = "SCALP_V2_STALL"
 SCALP_V2_EXIT_TIME_STOP = "SCALP_V2_TIME_STOP"
+SCALP_V2_EXIT_VERIFIED_HORIZON = "SCALP_V2_VERIFIED_HORIZON_EXIT"
 
 # Reporting labels for paper_trades.exit_reason / exit_type. The raw SCALP_V2_*
 # trigger stays in explainability raw_exit_reason.
@@ -68,6 +69,7 @@ _SCALP_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
     SCALP_V2_EXIT_GIVEBACK: "GIVEBACK_EXIT",
     SCALP_V2_EXIT_STALL: "STALL_EXIT",
     SCALP_V2_EXIT_TIME_STOP: "TIME_STOP_EXIT",
+    SCALP_V2_EXIT_VERIFIED_HORIZON: "SCALP_V2_VERIFIED_HORIZON_EXIT",
     "SCALP_V2_LEARNED_CONTINUATION": "LEARNED_CONTINUATION_EXIT",
 }
 
@@ -165,6 +167,49 @@ def evaluate_scalp_v2_exit(
             lowest_price = min(current_price, entry_price)
 
         sym = symbol or str(getattr(position, "symbol", "") or "")
+
+        # Verified SCALP setups (CAPITULATION_FLUSH_REBOUND, BTC_LEAD_LAG_SCALP)
+        # run their validated 30m horizon + 3.0% catastrophic contract instead of
+        # the continuation surface (whose rollover guard cuts winners early).
+        from backend.services.verified_alpha_signals import (
+            SCALP_VERIFIED_CATASTROPHIC_PCT,
+            SCALP_VERIFIED_MAX_HOLD_MIN,
+            SCALP_VERIFIED_SETUPS,
+        )
+
+        _pos_adapt = getattr(position, "adaptive_decision", None)
+        _pos_setup = str(getattr(position, "entry_thesis", "") or (_pos_adapt.get("setup") if isinstance(_pos_adapt, dict) else "") or "").strip().upper()
+        if _pos_setup in SCALP_VERIFIED_SETUPS:
+            _eff_low_v = min(bar_low, current_price) if bar_low > 0 else current_price
+            if _eff_low_v > 0 and entry_price > 0:
+                _adv_v = (entry_price - _eff_low_v) / entry_price
+                if _adv_v >= SCALP_VERIFIED_CATASTROPHIC_PCT:
+                    logger.warning(
+                        "SCALP_V2_VERIFIED_CATASTROPHIC symbol=%s setup=%s adverse=%.4f%% threshold=%.4f%%",
+                        sym,
+                        _pos_setup,
+                        _adv_v * 100.0,
+                        SCALP_VERIFIED_CATASTROPHIC_PCT * 100.0,
+                    )
+                    return {
+                        "action": "sell",
+                        "reason": SCALP_V2_EXIT_CATASTROPHIC,
+                        "detail": f"verified_adverse={_adv_v * 100:.2f}% >= {SCALP_VERIFIED_CATASTROPHIC_PCT * 100:.2f}%",
+                    }
+            if hold_minutes >= SCALP_VERIFIED_MAX_HOLD_MIN:
+                logger.info(
+                    "SCALP_V2_VERIFIED_HORIZON_EXIT symbol=%s setup=%s hold=%.1fmin net_pnl=%.4f%%",
+                    sym,
+                    _pos_setup,
+                    hold_minutes,
+                    net_pnl_pct * 100.0,
+                )
+                return {
+                    "action": "sell",
+                    "reason": SCALP_V2_EXIT_VERIFIED_HORIZON,
+                    "detail": f"setup={_pos_setup} hold={hold_minutes:.1f}min >= {SCALP_VERIFIED_MAX_HOLD_MIN:.0f}min",
+                }
+            return {"action": "hold", "reason": "SCALP_V2_VERIFIED_HOLD"}
 
         # ──────────────────────────────────────────────────────────────────
         # Role 1: Catastrophic stop — intra-bar adverse move

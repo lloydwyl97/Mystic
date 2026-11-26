@@ -2088,24 +2088,41 @@ class PortfolioEngineIntegration:
         # Capital follows entry_expected_policy_net, the deployed-policy estimate.
         # The continuation terminal is not an input. Cold is the prior 0, so it
         # does not clear the existing executable-net check.
+        from backend.services.adaptive_learning import policy_calibration as _day_policy_cal
         from backend.services.day_v2.entry_policy_value import entry_funding_authorized
+        from backend.services.verified_alpha_signals import DAY_VERIFIED_SETUPS
 
         adapt_gate = cand.get("adaptive") or {}
         if "entry_expected_policy_net" in adapt_gate:
             policy_net = float(adapt_gate.get("entry_expected_policy_net") or 0.0)
         else:
             policy_net = float(adapt_gate.get("expected_net") or 0.0)
-        if not entry_funding_authorized(policy_net):
+        _day_cal_adj = 0.0
+        if str(signal.setup or "").strip().upper() not in DAY_VERIFIED_SETUPS:
+            try:
+                _cal_view = _day_policy_cal(
+                    db_path,
+                    "DAY_V2",
+                    symbol,
+                    str(cand.get("learned_setup") or signal.setup),
+                    str(cand.get("regime_tag") or ""),
+                )
+                _day_cal_adj = min(0.0, float(_cal_view.get("mean") or 0.0))
+            except Exception:
+                _day_cal_adj = 0.0
+        calibrated_policy_net = policy_net + _day_cal_adj
+        if not entry_funding_authorized(calibrated_policy_net):
+            _rej_code = "REJECTED:POLICY_CALIBRATION_NEGATIVE" if (_day_cal_adj < 0.0 and entry_funding_authorized(policy_net)) else "REJECTED:NO_EXECUTABLE_NET_EDGE"
             record_day_decision(
                 db_path,
                 symbol,
-                "REJECTED:NO_EXECUTABLE_NET_EDGE",
+                _rej_code,
                 cycle_ts=as_of,
                 closest=signal.setup,
-                unmet=[f"entry_expected_policy_net={policy_net:.6f}"],
+                unmet=[f"entry_expected_policy_net={policy_net:.6f}", f"policy_calibration={_day_cal_adj:.6f}", f"calibrated_net={calibrated_policy_net:.6f}"],
             )
-            logger.info("DAY_V2_NO_NET_EDGE symbol=%s setup=%s", symbol, signal.setup)
-            _note_exact(db_path, cand, funded=False, reason="NO_EXECUTABLE_NET_EDGE")
+            logger.info("DAY_V2_NO_NET_EDGE symbol=%s setup=%s net=%.6f cal=%.6f", symbol, signal.setup, policy_net, _day_cal_adj)
+            _note_exact(db_path, cand, funded=False, reason=_rej_code.replace("REJECTED:", ""))
             return
         # Engine sizing, then clamped to what the DAY sleeve can still fund
         # (open DAY lots and live reservations included). SCALP capital is never used.
@@ -2331,6 +2348,8 @@ class PortfolioEngineIntegration:
         await _asyncio.sleep(30)  # Allow portfolio engine to fully initialise first
         while True:
             try:
+                await self._process_day_v2_verified_signals()
+                await self._process_scalp_v2_verified_signals()
                 await self._process_scalp_v2_signals()
                 await beat(
                     SCALP_V2_LIVE_LOOP_TASK,
@@ -2353,6 +2372,222 @@ class PortfolioEngineIntegration:
                 await _asyncio.sleep(self._scalp_v2_entry_interval)
             except _asyncio.CancelledError:
                 break
+
+    async def _process_day_v2_verified_signals(self) -> None:
+        """Evaluate and fund verified DAY_V2 BTC lead-lag catch-up signals on 1m bars."""
+        if getattr(self, "engine", None) is None:
+            return
+        try:
+            from backend.services.day_v2.config import DAY_V2_ENABLED
+            from backend.services.day_v2.decision_log import record_day_decision
+            from backend.services.day_v2.live_entry import submit_day_v2_direct_entry
+            from backend.services.day_v2.live_signal import DayV2Signal
+            from backend.services.day_v2.ranking import clamp_to_sleeve
+            from backend.services.two_engine_capital import compute_snapshot, symbol_marks
+            from backend.services.two_engine_claim import claim_symbol, release_claim
+            from backend.services.verified_alpha_signals import (
+                DAY_LEAD_LAG_CATASTROPHIC_PCT,
+                VERIFIED_MAX_CONCURRENT_PER_ENGINE,
+                evaluate_day_verified_signals,
+                is_symbol_on_verified_cooldown,
+            )
+
+            if not DAY_V2_ENABLED:
+                return
+            db_path = str(self.engine.db_path)
+            now_ts = time.time()
+            signals = await asyncio.to_thread(evaluate_day_verified_signals, db_path, now_ts=now_ts)
+            if not signals:
+                return
+
+            already_open = day_v2_held_symbols(self.engine.open_positions)
+            if len(already_open) >= VERIFIED_MAX_CONCURRENT_PER_ENGINE:
+                return
+
+            await self._await_exit_protection()
+            for sig in signals:
+                if len(already_open) >= VERIFIED_MAX_CONCURRENT_PER_ENGINE:
+                    break
+                norm = sig.symbol
+                if norm in already_open:
+                    continue
+                if await asyncio.to_thread(is_symbol_on_verified_cooldown, db_path, "DAY_V2", norm, now_ts=now_ts):
+                    continue
+                ask_price, book_age = await self._resolve_day_executable_price(norm)
+                if ask_price <= 0 or book_age is None or book_age > _DAY_V2_EXECUTABLE_PRICE_STALE_SEC:
+                    logger.warning("DAY_V2_VERIFIED_STALE_ASK symbol=%s ask=%.8f age=%s", norm, ask_price, book_age)
+                    continue
+                atr_val = sig.atr_15m if sig.atr_15m > 0 else ask_price * 0.01
+                qty, _stop_price, _risk = self.engine.calculate_position_size(
+                    symbol=norm,
+                    equity=float(self.engine._total_equity or self.engine.cash_balance or 0),
+                    atr=atr_val,
+                    current_price=ask_price,
+                )
+                snap = compute_snapshot(
+                    db_path,
+                    float(getattr(self.engine, "_total_equity", 0) or 0),
+                    float(getattr(self.engine, "_available_balance", 0) or 0),
+                    getattr(self.engine, "open_positions", None) or {},
+                    prices=symbol_marks(getattr(self.engine, "_position_mark_prices", None)),
+                )
+                day_remaining = float(snap.day.remaining_budget)
+                qty = 0.0 if (float(qty) * ask_price >= 10.0 and day_remaining < 10.0) else clamp_to_sleeve(float(qty), ask_price, day_remaining)
+                notional = float(qty) * float(ask_price)
+                if qty <= 0 or notional < 10.0:
+                    continue
+                can_open, gate_reason = await self.engine._can_open_position(norm, notional, engine_id="DAY_V2")
+                if not can_open:
+                    logger.info("DAY_V2_VERIFIED_BLOCKED symbol=%s reason=%s", norm, gate_reason)
+                    continue
+
+                def _claim_verified_day(_norm: str = norm, _opp: str = sig.opportunity_id, _notl: float = notional):
+                    return claim_symbol(
+                        db_path,
+                        _norm,
+                        "DAY_V2",
+                        _opp,
+                        float(_notl),
+                        positions=getattr(self.engine, "open_positions", None),
+                    )
+
+                cash_lock = getattr(self.engine, "_global_cash_lock", None)
+                if cash_lock is None:
+                    claimed, claim_reason, reservation_id = _claim_verified_day()
+                else:
+                    async with cash_lock:
+                        claimed, claim_reason, reservation_id = _claim_verified_day()
+                if not claimed:
+                    logger.info("DAY_V2_VERIFIED_CLAIM_BLOCKED symbol=%s reason=%s", norm, claim_reason)
+                    continue
+
+                day_sig = DayV2Signal(
+                    symbol=norm,
+                    setup=sig.setup,
+                    regime="verified_lead_lag",
+                    structural_anchor=ask_price * (1.0 - DAY_LEAD_LAG_CATASTROPHIC_PCT),
+                    target_price=ask_price * 1.015,
+                    atr=atr_val,
+                    signal_bar_ts=sig.bar_open_ts,
+                    h1_bullish=True,
+                    opportunity_id=sig.opportunity_id,
+                )
+                logger.warning("DAY_V2_VERIFIED_SIGNAL symbol=%s setup=%s %s ask=%.6f notional=%.2f", norm, sig.setup, sig.detail, ask_price, notional)
+                filled = await submit_day_v2_direct_entry(
+                    self.engine,
+                    signal=day_sig,
+                    ask_price=ask_price,
+                    quantity=qty,
+                    stop_price=day_sig.structural_anchor,
+                    db_symbol=norm.replace("USDT", "-USDT"),
+                    reservation_id=str(reservation_id or ""),
+                    adaptive={"setup": sig.setup, "regime": "verified_lead_lag", "verified_alpha": True, "detail": sig.detail},
+                )
+                if filled:
+                    already_open.add(norm)
+                    record_day_decision(db_path, norm, "FILLED", cycle_ts=now_ts, closest=sig.setup)
+                elif reservation_id:
+                    release_claim(db_path, reservation_id=reservation_id, symbol=norm, engine_id="DAY_V2")
+        except Exception:
+            logger.warning("DAY_V2_VERIFIED_SIGNALS_ERROR", exc_info=True)
+
+    async def _process_scalp_v2_verified_signals(self) -> None:
+        """Evaluate and fund verified SCALP_V2 capitulation/lead-lag signals on 1m bars."""
+        if getattr(self, "engine", None) is None:
+            return
+        try:
+            from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_CONFIRMED
+            from backend.services.binance_scalp.config import get_scalp_config
+            from backend.services.binance_scalp.structural_mode import live_entry_enabled
+            from backend.services.portfolio_engine import SCALP_MAX_OPEN_POSITIONS
+            from backend.services.scalp_v2.decision_log import record_scalp_decision
+            from backend.services.scalp_v2.loss_breaker import check_scalp_loss_breaker
+            from backend.services.scalp_v2.opportunity import arm_opportunity, mark_opportunity
+            from backend.services.two_engine_capital import compute_snapshot, get_capital_shares, scalp_order_notional, symbol_marks
+            from backend.services.verified_alpha_signals import (
+                VERIFIED_MAX_CONCURRENT_PER_ENGINE,
+                evaluate_scalp_verified_signals,
+                is_symbol_on_verified_cooldown,
+            )
+
+            cfg = get_scalp_config()
+            if not live_entry_enabled(cfg.resolved_structural_mode()):
+                return
+            db_path = str(self.engine.db_path)
+            try:
+                scalp_share = get_capital_shares()[1]
+            except ValueError:
+                scalp_share = 0.5
+            principal = float(getattr(self.engine, "principal", 0.0) or 0.0) * scalp_share
+            breaker = check_scalp_loss_breaker(db_path, cfg, principal=principal)
+            if breaker.halt:
+                return
+
+            now_ts = time.time()
+            signals = await asyncio.to_thread(evaluate_scalp_verified_signals, db_path, now_ts=now_ts)
+            if not signals:
+                return
+
+            scalp_held = self.engine._engine_held_count("SCALP_V2")
+            if scalp_held >= VERIFIED_MAX_CONCURRENT_PER_ENGINE:
+                return
+
+            await self._await_exit_protection()
+            for sig in signals:
+                if scalp_held >= VERIFIED_MAX_CONCURRENT_PER_ENGINE:
+                    break
+                norm_key = sig.symbol
+                norm = norm_key[:-4] + "/USDT" if norm_key.endswith("USDT") else norm_key
+                existing = self.engine._find_position("SCALP_V2", norm)
+                if existing is not None and float(getattr(existing, "quantity", 0) or 0) > 0 and str(getattr(existing, "status", "ACTIVE") or "ACTIVE") != "DUST_PENDING":
+                    continue
+                if await asyncio.to_thread(is_symbol_on_verified_cooldown, db_path, "SCALP_V2", norm_key, now_ts=now_ts):
+                    continue
+                ask_price, book_age = await self._resolve_day_executable_price(norm_key)
+                if ask_price <= 0 or book_age is None or book_age > _DAY_V2_EXECUTABLE_PRICE_STALE_SEC:
+                    logger.warning("SCALP_V2_VERIFIED_STALE_ASK symbol=%s ask=%.8f age=%s", norm_key, ask_price, book_age)
+                    continue
+                opp_id, blocked = arm_opportunity(db_path, norm, sig.setup, ask_price, engine_id="SCALP_V2")
+                if blocked:
+                    continue
+                snap_cap = compute_snapshot(
+                    db_path,
+                    float(self.engine._total_equity or 0),
+                    float(self.engine._available_balance or 0),
+                    self.engine.open_positions,
+                    prices=symbol_marks(getattr(self.engine, "_position_mark_prices", None)),
+                )
+                try:
+                    notional = scalp_order_notional(
+                        snap_cap,
+                        slots=SCALP_MAX_OPEN_POSITIONS,
+                        size_mult=1.0,
+                        emergency_max_notional=float(cfg.scalp_live_max_notional or 0.0),
+                    )
+                except ValueError:
+                    notional = 0.0
+                qty = notional / ask_price if ask_price > 0 else 0.0
+                if qty <= 0 or notional < 10.0:
+                    mark_opportunity(db_path, norm, opp_id, "EXPIRED")
+                    continue
+                logger.warning("SCALP_V2_VERIFIED_SIGNAL symbol=%s setup=%s %s ask=%.6f notional=%.2f", norm, sig.setup, sig.detail, ask_price, notional)
+                result = await self.engine.execute_scalp_v2_buy_live(
+                    norm,
+                    qty,
+                    ask_price,
+                    atr=float(sig.atr_15m or 0.0),
+                    setup_name=sig.setup,
+                    opportunity_id=opp_id,
+                    entry_authority=ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
+                    adaptive_decision={"setup": sig.setup, "regime": "verified_alpha", "verified_alpha": True, "detail": sig.detail},
+                )
+                if result is not None:
+                    scalp_held += 1
+                    record_scalp_decision(db_path, norm, "FILLED", sig.setup, cycle_ts=now_ts, detail={"setup": sig.setup, "detail": sig.detail, "opportunity_id": opp_id})
+                else:
+                    mark_opportunity(db_path, norm, opp_id, "EXPIRED")
+        except Exception:
+            logger.warning("SCALP_V2_VERIFIED_SIGNALS_ERROR", exc_info=True)
 
     async def _run_scalp_router(self, call: Callable[[], Any]) -> Any:
         """Run blocking SCALP router work off the event loop.
@@ -2685,6 +2920,30 @@ class PortfolioEngineIntegration:
                     logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:BOOK_STALE", norm)
                     continue
                 setup_name = str((row or {}).get("best_setup") or "SCALP_STRUCTURAL")
+                # Apply live policy_calibration to legacy (non-verified) SCALP setups so
+                # negative realized expectancy self-abstains instead of bleeding cash.
+                from backend.services.adaptive_learning import policy_calibration as _scalp_policy_cal
+                from backend.services.verified_alpha_signals import SCALP_VERIFIED_SETUPS
+
+                if setup_name.strip().upper() not in SCALP_VERIFIED_SETUPS:
+                    _edge_raw = float(((row or {}).get("executable_edge") or {}).get("final_executable_edge_pct") or 0.0)
+                    _reg_str = str(((row or {}).get("adaptive_decision") or {}).get("regime") or (row or {}).get("regime") or "")
+                    _sc_cal_adj = 0.0
+                    try:
+                        _sc_cal_adj = min(0.0, float(_scalp_policy_cal(self.engine.db_path, SCALP_V2_ENGINE, norm_key, setup_name, _reg_str).get("mean") or 0.0))
+                    except Exception:
+                        _sc_cal_adj = 0.0
+                    if (_edge_raw + _sc_cal_adj) <= 0.0 and _sc_cal_adj < 0.0:
+                        record_scalp_decision(
+                            self.engine.db_path,
+                            norm,
+                            "REJECTED:POLICY_CALIBRATION_NEGATIVE",
+                            "POLICY_CALIBRATION_NEGATIVE",
+                            cycle_ts=cycle_ts,
+                            detail=decision_detail(row),
+                        )
+                        logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:POLICY_CALIBRATION_NEGATIVE edge=%.6f cal=%.6f", norm, _edge_raw, _sc_cal_adj)
+                        continue
                 opp_id, blocked = arm_opportunity(self.engine.db_path, norm, setup_name, arm_price, engine_id=SCALP_V2_ENGINE)
                 if blocked:
                     record_scalp_decision(

@@ -63,6 +63,7 @@ _DAY_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
     "DAY_V2_OBJECTIVE_COMPLETE": "NET_PROFIT_EXIT",
     "DAY_V2_LEARNED_CONTINUATION": "LEARNED_CONTINUATION_EXIT",
     "DAY_V2_TIME_EXPIRATION": "TIME_STOP_EXIT",
+    "DAY_V2_VERIFIED_HORIZON_EXIT": "DAY_V2_VERIFIED_HORIZON_EXIT",
 }
 
 
@@ -265,6 +266,47 @@ def evaluate_day_v2_exit(
 
     now = time.time() if now is None else float(now)
     hold_minutes = max(0.0, (now - entry_time) / 60.0) if entry_time > 0 else 0.0
+
+    # Verified alpha setups (e.g. BTC_LEAD_LAG_CATCHUP) use their validated
+    # fixed-horizon + wide-catastrophic contract instead of the inverted
+    # continuation surface.
+    from backend.services.verified_alpha_signals import (
+        DAY_LEAD_LAG_CATASTROPHIC_PCT,
+        DAY_LEAD_LAG_MAX_HOLD_MIN,
+        DAY_VERIFIED_SETUPS,
+    )
+
+    if str(setup or "").strip().upper() in DAY_VERIFIED_SETUPS:
+        effective_low = min(bar_low, current_price) if bar_low > 0 else current_price
+        adverse_move = (entry_price - effective_low) / entry_price if effective_low > 0 else 0.0
+        if adverse_move >= DAY_LEAD_LAG_CATASTROPHIC_PCT:
+            exit_px = entry_price * (1.0 - DAY_LEAD_LAG_CATASTROPHIC_PCT)
+            logger.warning(
+                "DAY_V2_VERIFIED_CATASTROPHIC setup=%s adverse=%.4f%% threshold=%.4f%%",
+                setup,
+                adverse_move * 100.0,
+                DAY_LEAD_LAG_CATASTROPHIC_PCT * 100.0,
+            )
+            return {
+                "action": "sell",
+                "reason": "DAY_V2_CATASTROPHIC_PROTECTION",
+                "exit_price_estimate": exit_px,
+                "detail": f"verified_adverse={adverse_move * 100:.2f}% >= {DAY_LEAD_LAG_CATASTROPHIC_PCT * 100:.2f}%",
+            }
+        if hold_minutes >= DAY_LEAD_LAG_MAX_HOLD_MIN:
+            logger.info(
+                "DAY_V2_VERIFIED_HORIZON_EXIT setup=%s hold=%.1fmin price=%.6f",
+                setup,
+                hold_minutes,
+                current_price,
+            )
+            return {
+                "action": "sell",
+                "reason": "DAY_V2_VERIFIED_HORIZON_EXIT",
+                "exit_price_estimate": current_price,
+                "detail": f"setup={setup} hold={hold_minutes:.1f}min >= {DAY_LEAD_LAG_MAX_HOLD_MIN:.0f}min",
+            }
+        return None
 
     # Role 1: Catastrophic protection — uses the lowest price since entry.
     # Sits outside the structural anchor when that anchor is known, so a quiet
