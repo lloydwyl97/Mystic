@@ -2511,7 +2511,6 @@ class PortfolioEngineIntegration:
             from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_CONFIRMED
             from backend.services.binance_scalp.config import get_scalp_config
             from backend.services.binance_scalp.structural_mode import live_entry_enabled
-            from backend.services.portfolio_engine import SCALP_MAX_OPEN_POSITIONS
             from backend.services.scalp_v2.decision_log import record_scalp_decision
             from backend.services.scalp_v2.loss_breaker import check_scalp_loss_breaker
             from backend.services.scalp_v2.opportunity import arm_opportunity, mark_opportunity
@@ -2573,7 +2572,7 @@ class PortfolioEngineIntegration:
                 try:
                     notional = scalp_order_notional(
                         snap_cap,
-                        slots=SCALP_MAX_OPEN_POSITIONS,
+                        slots=VERIFIED_MAX_CONCURRENT_PER_ENGINE,
                         size_mult=1.0,
                         emergency_max_notional=float(cfg.scalp_live_max_notional or 0.0),
                     )
