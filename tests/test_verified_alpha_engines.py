@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from backend.services.day_v2.live_exit_evaluator import day_v2_recorded_exit_reason, evaluate_day_v2_exit
 from backend.services.portfolio_engine import ExitType, strategy_exit_type
+from backend.services.scalp_v2.executable_edge import edge_at_order_boundary
 from backend.services.scalp_v2.exit_evaluator import (
     SCALP_V2_EXIT_CATASTROPHIC,
     SCALP_V2_EXIT_VERIFIED_HORIZON,
@@ -23,6 +24,8 @@ from backend.services.verified_alpha_signals import (
     evaluate_day_verified_signals,
     evaluate_scalp_verified_signals,
     is_symbol_on_verified_cooldown,
+    verified_alpha_only_enabled,
+    verified_scalp_executable_edge,
 )
 
 
@@ -282,3 +285,24 @@ def test_verified_cooldown_is_engine_scoped_and_restart_safe(tmp_path: Path) -> 
     assert is_symbol_on_verified_cooldown(str(db), "DAY_V2", "ETHUSDT", now_ts=t_trade + 600.0) is True
     assert is_symbol_on_verified_cooldown(str(db), "DAY_V2", "ETHUSDT", now_ts=t_trade + 1805.0) is False
     assert is_symbol_on_verified_cooldown(str(db), "SCALP_V2", "ETHUSDT", now_ts=t_trade + 600.0) is False
+
+
+def test_verified_scalp_executable_edge_passes_normal_boundary_and_rejects_runaway_drift() -> None:
+    edge = verified_scalp_executable_edge()
+    ok = edge_at_order_boundary(edge, arm_price=1660.0, best_ask=1660.5, spread_pct=0.0002, impact_pct=0.0)
+    assert ok is not None
+    assert ok["eligible"] is True
+
+    # Runaway +60 bps ask jump consumes the +20.7 bps gross expectancy -> blocked cleanly
+    chased = edge_at_order_boundary(edge, arm_price=1660.0, best_ask=1670.0, spread_pct=0.0002, impact_pct=0.0)
+    assert chased is not None
+    assert chased["eligible"] is False
+
+
+def test_verified_alpha_only_flag_defaults_true_and_respects_env(monkeypatch) -> None:
+    monkeypatch.delenv("MYSTIC_VERIFIED_ALPHA_ONLY", raising=False)
+    assert verified_alpha_only_enabled() is True
+    monkeypatch.setenv("MYSTIC_VERIFIED_ALPHA_ONLY", "false")
+    assert verified_alpha_only_enabled() is False
+    monkeypatch.setenv("MYSTIC_VERIFIED_ALPHA_ONLY", "1")
+    assert verified_alpha_only_enabled() is True

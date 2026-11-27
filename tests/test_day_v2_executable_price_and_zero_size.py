@@ -226,6 +226,7 @@ def day_cycle(monkeypatch):
     required_open = float(((ENTRY_BAR // 900) * 900) - 900)
     bars = [{"ts_epoch": required_open - 900 * i} for i in range(59, -1, -1)]
 
+    monkeypatch.setenv("MYSTIC_VERIFIED_ALPHA_ONLY", "false")
     monkeypatch.setattr(day_v2_config, "DAY_V2_ENABLED", True)
     monkeypatch.setattr(day_v2_config, "DAY_V2_UNIVERSE", SYMBOLS)
     monkeypatch.setattr("backend.services.candle_contract.load_closed_bars", lambda *_a, **_k: bars)

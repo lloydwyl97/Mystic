@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -45,6 +46,9 @@ DAY_LEAD_LAG_CATASTROPHIC_PCT = 0.025
 
 SCALP_VERIFIED_MAX_HOLD_MIN = 30.0
 SCALP_VERIFIED_CATASTROPHIC_PCT = 0.030
+# Validated 113-day SCALP net expectancy (+14.1 bps net / +20.7 bps gross at 6.6 bps cost)
+SCALP_VERIFIED_EXPECTED_NET_PCT = 0.00141
+SCALP_VERIFIED_BASELINE_COST_PCT = 0.00066
 
 # Verified entry thresholds
 DAY_BTC_15M_MIN_RET = 0.0060
@@ -351,6 +355,26 @@ def is_symbol_on_verified_cooldown(
     return last_ts > 0.0 and (moment - last_ts) < float(cooldown_sec)
 
 
+def verified_alpha_only_enabled() -> bool:
+    """True when legacy (non-verified) DAY_V2/SCALP_V2 entries are disabled (default on)."""
+    raw = str(os.getenv("MYSTIC_VERIFIED_ALPHA_ONLY", "true") or "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def verified_scalp_executable_edge() -> dict[str, float]:
+    """Canonical executable_edge payload for verified SCALP_V2 order-boundary checks.
+
+    Uses the 113-day validated net expectancy (+14.1 bps at 6.6 bps baseline cost)
+    so ``edge_at_order_boundary`` permits normal fills while still rejecting
+    entries if live spread/impact or ask drift consumes the validated edge.
+    """
+    return {
+        "final_executable_edge_pct": SCALP_VERIFIED_EXPECTED_NET_PCT,
+        "live_cost_pct": SCALP_VERIFIED_BASELINE_COST_PCT,
+        "expected_move_pct": SCALP_VERIFIED_EXPECTED_NET_PCT + SCALP_VERIFIED_BASELINE_COST_PCT,
+    }
+
+
 __all__ = [
     "ALL_VERIFIED_SETUPS",
     "ALT_UNIVERSE",
@@ -363,8 +387,10 @@ __all__ = [
     "SCALP_ALT_5M_MIN_LAG",
     "SCALP_BTC_5M_MIN_RET",
     "SCALP_CRASH_60M_MAX_RET",
+    "SCALP_VERIFIED_BASELINE_COST_PCT",
     "SCALP_VERIFIED_CAPITULATION_SETUP",
     "SCALP_VERIFIED_CATASTROPHIC_PCT",
+    "SCALP_VERIFIED_EXPECTED_NET_PCT",
     "SCALP_VERIFIED_LEAD_LAG_SETUP",
     "SCALP_VERIFIED_MAX_HOLD_MIN",
     "SCALP_VERIFIED_SETUPS",
@@ -374,4 +400,6 @@ __all__ = [
     "evaluate_day_verified_signals",
     "evaluate_scalp_verified_signals",
     "is_symbol_on_verified_cooldown",
+    "verified_alpha_only_enabled",
+    "verified_scalp_executable_edge",
 ]

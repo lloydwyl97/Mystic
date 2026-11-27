@@ -2090,7 +2090,7 @@ class PortfolioEngineIntegration:
         # does not clear the existing executable-net check.
         from backend.services.adaptive_learning import policy_calibration as _day_policy_cal
         from backend.services.day_v2.entry_policy_value import entry_funding_authorized
-        from backend.services.verified_alpha_signals import DAY_VERIFIED_SETUPS
+        from backend.services.verified_alpha_signals import DAY_VERIFIED_SETUPS, verified_alpha_only_enabled
 
         adapt_gate = cand.get("adaptive") or {}
         if "entry_expected_policy_net" in adapt_gate:
@@ -2099,6 +2099,18 @@ class PortfolioEngineIntegration:
             policy_net = float(adapt_gate.get("expected_net") or 0.0)
         _day_cal_adj = 0.0
         if str(signal.setup or "").strip().upper() not in DAY_VERIFIED_SETUPS:
+            if verified_alpha_only_enabled():
+                record_day_decision(
+                    db_path,
+                    symbol,
+                    "REJECTED:LEGACY_SETUP_DISABLED",
+                    cycle_ts=as_of,
+                    closest=signal.setup,
+                    unmet=["verified_alpha_only=true"],
+                )
+                logger.info("DAY_V2_LEGACY_DISABLED symbol=%s setup=%s", symbol, signal.setup)
+                _note_exact(db_path, cand, funded=False, reason="LEGACY_SETUP_DISABLED")
+                return
             try:
                 _cal_view = _day_policy_cal(
                     db_path,
@@ -2508,6 +2520,7 @@ class PortfolioEngineIntegration:
                 VERIFIED_MAX_CONCURRENT_PER_ENGINE,
                 evaluate_scalp_verified_signals,
                 is_symbol_on_verified_cooldown,
+                verified_scalp_executable_edge,
             )
 
             cfg = get_scalp_config()
@@ -2579,12 +2592,25 @@ class PortfolioEngineIntegration:
                     setup_name=sig.setup,
                     opportunity_id=opp_id,
                     entry_authority=ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
-                    adaptive_decision={"setup": sig.setup, "regime": "verified_alpha", "verified_alpha": True, "detail": sig.detail},
+                    adaptive_decision={
+                        "setup": sig.setup,
+                        "regime": "verified_alpha",
+                        "verified_alpha": True,
+                        "detail": sig.detail,
+                        "executable_edge": verified_scalp_executable_edge(),
+                    },
                 )
                 if result is not None:
                     scalp_held += 1
                     record_scalp_decision(db_path, norm, "FILLED", sig.setup, cycle_ts=now_ts, detail={"setup": sig.setup, "detail": sig.detail, "opportunity_id": opp_id})
                 else:
+                    logger.warning(
+                        "SCALP_V2_VERIFIED_REJECTED symbol=%s setup=%s reason=%s opp=%s",
+                        norm,
+                        sig.setup,
+                        getattr(self.engine, "last_buy_reject_reason", ""),
+                        opp_id,
+                    )
                     mark_opportunity(db_path, norm, opp_id, "EXPIRED")
         except Exception:
             logger.warning("SCALP_V2_VERIFIED_SIGNALS_ERROR", exc_info=True)
@@ -2920,12 +2946,23 @@ class PortfolioEngineIntegration:
                     logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:BOOK_STALE", norm)
                     continue
                 setup_name = str((row or {}).get("best_setup") or "SCALP_STRUCTURAL")
-                # Apply live policy_calibration to legacy (non-verified) SCALP setups so
-                # negative realized expectancy self-abstains instead of bleeding cash.
+                # Apply verified-alpha-only gate (or live policy_calibration fallback) to legacy
+                # SCALP setups so negative-expectancy legacy setups cannot bleed cash.
                 from backend.services.adaptive_learning import policy_calibration as _scalp_policy_cal
-                from backend.services.verified_alpha_signals import SCALP_VERIFIED_SETUPS
+                from backend.services.verified_alpha_signals import SCALP_VERIFIED_SETUPS, verified_alpha_only_enabled
 
                 if setup_name.strip().upper() not in SCALP_VERIFIED_SETUPS:
+                    if verified_alpha_only_enabled():
+                        record_scalp_decision(
+                            self.engine.db_path,
+                            norm,
+                            "REJECTED:LEGACY_SETUP_DISABLED",
+                            "LEGACY_SETUP_DISABLED",
+                            cycle_ts=cycle_ts,
+                            detail=decision_detail(row),
+                        )
+                        logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:LEGACY_SETUP_DISABLED setup=%s", norm, setup_name)
+                        continue
                     _edge_raw = float(((row or {}).get("executable_edge") or {}).get("final_executable_edge_pct") or 0.0)
                     _reg_str = str(((row or {}).get("adaptive_decision") or {}).get("regime") or (row or {}).get("regime") or "")
                     _sc_cal_adj = 0.0
